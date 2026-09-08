@@ -1,0 +1,20 @@
+[package]
+name = "omabeam-capture"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native Wayland capture and region selection for OmaBeam"
+
+[dependencies]
+anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+rustix = { version = "1", features = ["event"] }
+tempfile = "3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[dev-dependencies]
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["server"] }

@@ -1,0 +1,11 @@
+/target
+.DS_Store
+/dist
+/omarchy-plugin/native
+**/*.rs.bk
+.idea
+.vscode
+*.swp
+
+__pycache__/
+.venv/
