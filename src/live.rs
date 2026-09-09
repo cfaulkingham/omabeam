@@ -3,6 +3,7 @@
 mod config;
 mod http;
 mod state;
+pub(crate) mod status;
 #[cfg(test)]
 mod tests;
 
@@ -17,7 +18,6 @@ pub use state::StreamStats;
 use std::{
     io::Read,
     net::{IpAddr, TcpListener},
-    path::PathBuf,
     process::{Command, Stdio},
     sync::{
         Arc,
@@ -194,10 +194,8 @@ fn run_session(session: LiveSession) -> Result<()> {
 pub fn spawn_daemon(source: &LiveSource, config: &LiveConfig) -> Result<String> {
     ensure!(current_status().is_none(), "Already sharing live.");
     let exe = std::env::current_exe().context("failed to find omabeam")?;
-    let dir = status_dir();
-    std::fs::create_dir_all(&dir)?;
-    let log_path = dir.join("live.log");
-    let log = std::fs::File::create(&log_path).context("failed to open live-share log")?;
+    let log = status::open_live_log().context("failed to open live-share log")?;
+    let log_path = status::log_path()?;
     let mut cmd = Command::new(exe);
     cmd.args(config.to_cli_args())
         .arg("--live")
@@ -317,6 +315,7 @@ impl LiveSession {
     fn status(&self) -> LiveStatus {
         LiveStatus {
             pid: std::process::id(),
+            starttime: status::self_starttime(),
             url: self.url.clone(),
             title: self.title.clone(),
             stats: self.frames.stats(),
@@ -400,102 +399,58 @@ fn capture_loop(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveStatus {
     pub pid: u32,
+    #[serde(default)]
+    pub starttime: u64,
     pub url: String,
     pub title: String,
     #[serde(flatten)]
     pub stats: StreamStats,
 }
 
-pub fn status_dir() -> PathBuf {
-    runtime_dir().join("omabeam")
-}
-pub fn status_path() -> PathBuf {
-    status_dir().join("live.json")
-}
-fn runtime_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
-        return dir.into();
-    }
-    // A stable per-user fallback lets --status/--stop reach another process.
-    use std::os::unix::fs::MetadataExt;
-    let uid = std::env::var_os("HOME")
-        .and_then(|p| std::fs::metadata(p).ok())
-        .map(|m| m.uid());
-    PathBuf::from("/tmp").join(format!("omabeam-user-{}", uid.unwrap_or(u32::MAX)))
-}
-
-pub fn write_live_status(status: &LiveStatus) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let dir = status_dir();
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    let tmp = dir.join(format!("live-{}.json.tmp", status.pid));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    use std::io::Write;
-    file.write_all(&serde_json::to_vec(status)?)?;
-    std::fs::rename(tmp, status_path())?;
-    Ok(())
-}
+pub use status::{
+    current_status, latest_status, latest_status_report, pid_alive, status_dir, status_path,
+    stop_live_process, write_live_status,
+};
 
 pub fn clear_live_status() {
-    let _ = std::fs::remove_file(status_path());
+    status::clear_live_status();
 }
+
 fn clear_own_status(url: &str) {
-    if read_status().is_some_and(|s| s.pid == std::process::id() && s.url == url) {
+    if current_status().is_some_and(|s| s.pid == std::process::id() && s.url == url) {
         clear_live_status();
     }
 }
-fn read_status() -> Option<LiveStatus> {
-    serde_json::from_slice(&std::fs::read(status_path()).ok()?).ok()
-}
-pub fn current_status() -> Option<LiveStatus> {
-    read_status().filter(|s| pid_alive(s.pid))
-}
-/// Retain an ended session's explanation after its diagnostic server exits.
-pub fn latest_status() -> Option<LiveStatus> {
-    read_status().filter(|s| s.stats.state == "ended" || pid_alive(s.pid))
-}
-pub fn pid_alive(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stdin(Stdio::null())
+pub fn copy_text(text: &str) -> bool {
+    let mut child = match Command::new("/usr/bin/wl-copy")
+        .arg("--")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-pub fn stop_live_process() -> bool {
-    let Some(status) = current_status() else {
-        clear_live_status();
-        return false;
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", std::env::var_os("HOME").unwrap_or_default())
+        .env(
+            "XDG_RUNTIME_DIR",
+            std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default(),
+        )
+        .env(
+            "WAYLAND_DISPLAY",
+            std::env::var_os("WAYLAND_DISPLAY").unwrap_or_default(),
+        )
+        .env("LANG", "C")
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
     };
-    let _ = Command::new("kill")
-        .args(["-TERM", &status.pid.to_string()])
-        .status();
-    for _ in 0..20 {
-        if !pid_alive(status.pid) {
-            break;
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    if pid_alive(status.pid) {
-        let _ = Command::new("kill")
-            .args(["-KILL", &status.pid.to_string()])
-            .status();
-    }
-    clear_live_status();
-    true
+    let write = child
+        .stdin
+        .take()
+        .and_then(|mut stdin| std::io::Write::write_all(&mut stdin, text.as_bytes()).ok());
+    matches!(child.wait(), Ok(status) if status.success()) && write.is_some()
 }
+
 pub fn lan_ip() -> Option<String> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("1.1.1.1:80").ok()?;

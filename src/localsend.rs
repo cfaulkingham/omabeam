@@ -293,56 +293,50 @@ pub fn ensure_share_url(url: &str) -> Result<()> {
 
 pub fn parse_share_url(url: &str) -> Option<ShareUrl> {
     let url = url.trim();
-    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        ("http", rest)
-    } else {
-        return None;
-    };
-    if rest.contains(' ') || rest.contains('\\') || rest.contains('@') {
+    if url.len() > crate::live::status::MAX_URL_BYTES || url.contains([' ', '\\', '@', '\0']) {
         return None;
     }
-    let (hostport, path) = match rest.find('/') {
-        Some(index) => (&rest[..index], &rest[index..]),
-        None => (rest, "/"),
-    };
-    if hostport.is_empty() || !path.starts_with('/') {
-        return None;
-    }
+    let rest = url.strip_prefix("http://")?;
+    let (hostport, path) = rest.split_once('/')?;
+    let path = format!("/{path}");
     let (host, port) = if let Some(inner) = hostport.strip_prefix('[') {
         let end = inner.find(']')?;
         let host = &inner[..end];
-        let rest = &inner[end + 1..];
-        let port = if rest.is_empty() {
-            None
-        } else {
-            Some(rest.strip_prefix(':')?)
-        };
+        let port = inner[end + 1..].strip_prefix(':')?;
         (host, port)
     } else {
-        match hostport.rsplit_once(':') {
-            Some((host, port)) if !host.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-                (host, Some(port))
-            }
-            _ => (hostport, None),
-        }
+        hostport.rsplit_once(':')?
     };
     if host.is_empty() {
         return None;
     }
-    if let Some(port) = port {
-        let port: u16 = port.parse().ok()?;
-        if !(1..=65535).contains(&port) {
-            return None;
-        }
+    let port: u16 = port.parse().ok()?;
+    if !(1..=65535).contains(&port) {
+        return None;
+    }
+    let ip: std::net::IpAddr = host.parse().ok()?;
+    if !allowed_share_ip(ip) {
+        return None;
+    }
+    let token = path.strip_prefix("/s/")?.strip_suffix('/')?;
+    if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
     }
     Some(ShareUrl {
-        scheme,
+        scheme: "http",
         host: host.to_string(),
-        port: port.and_then(|port| port.parse().ok()),
-        path: path.to_string(),
+        port: Some(port),
+        path,
     })
+}
+
+fn allowed_share_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,7 +363,6 @@ pub fn spawn_window(url: &str) -> Result<()> {
     let exe = std::env::current_exe().context("failed to find omabeam")?;
     let mut cmd = Command::new(exe);
     cmd.arg("--send-link")
-        .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -468,6 +461,7 @@ mod tests {
     fn live(url: &str, state: &str) -> LiveStatus {
         LiveStatus {
             pid: 7,
+            starttime: 1,
             url: url.into(),
             title: "Terminal".into(),
             stats: StreamStats {
@@ -479,23 +473,30 @@ mod tests {
 
     #[test]
     fn share_urls_reject_credentials_and_odd_schemes() {
-        assert!(parse_share_url("http://192.168.1.24:9847/s/abc/").is_some());
-        assert!(parse_share_url("https://example.com/s/test/").is_some());
+        let url = "http://192.168.1.24:9847/s/0123456789abcdef0123456789abcdef/";
+        assert!(parse_share_url(url).is_some());
+        assert!(
+            parse_share_url("https://example.com/s/0123456789abcdef0123456789abcdef/").is_none()
+        );
         assert_eq!(
-            parse_share_url("http://[::1]:9847/s/test/")
+            parse_share_url("http://[::1]:9847/s/0123456789abcdef0123456789abcdef/")
                 .unwrap()
                 .display_host(),
             "[::1]:9847"
+        );
+        assert!(
+            parse_share_url("http://8.8.8.8:9847/s/0123456789abcdef0123456789abcdef/").is_none()
         );
         assert!(parse_share_url("file:///tmp/test").is_none());
         assert!(parse_share_url("http://user:pass@host/").is_none());
         assert!(parse_share_url("http://host:0/").is_none());
         assert!(parse_share_url("http://host/has a space").is_none());
+        assert!(parse_share_url("http://192.168.1.24:9847/s/abc/").is_none());
     }
 
     #[test]
     fn resolve_link_prefers_an_explicit_url_and_live_status() {
-        let url = "http://192.168.1.24:9847/s/abc/";
+        let url = "http://192.168.1.24:9847/s/0123456789abcdef0123456789abcdef/";
         assert_eq!(resolve_link(Some(url), None).unwrap(), url);
         assert_eq!(resolve_link(None, Some(&live(url, "live"))).unwrap(), url);
         assert!(
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn text_offer_uses_localsend_message_conventions() {
-        let url = "http://192.168.1.24:9847/s/abc/";
+        let url = "http://192.168.1.24:9847/s/0123456789abcdef0123456789abcdef/";
         let file = text_file(url);
         assert_eq!(file.file_name, "Message.txt");
         assert_eq!(file.file_type, "text/plain");
@@ -646,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn sends_a_share_link_over_localsend_http() {
         let peer = start_peer(true).await;
-        let url = "http://192.168.1.24:9847/s/abc/";
+        let url = "http://192.168.1.24:9847/s/0123456789abcdef0123456789abcdef/";
         send_text(
             &test_sender(),
             &test_device(peer.port),
@@ -665,7 +666,7 @@ mod tests {
         let error = send_text(
             &test_sender(),
             &test_device(peer.port),
-            "http://192.168.1.24:9847/s/abc/",
+            "http://192.168.1.24:9847/s/0123456789abcdef0123456789abcdef/",
             CancellationToken::new(),
         )
         .await

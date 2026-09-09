@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import qs.Commons
 import qs.Ui as Shell
 import "Session.js" as Session
@@ -23,12 +24,12 @@ Shell.Panel {
   readonly property var barIdentity: hostWidget || root
   readonly property bool sessionOn: session.state === "live"
   readonly property bool sessionProblem: statusError !== "" || session.state === "ended"
-  readonly property string sessionSummary: statusError ? "OmaBeam · status unavailable"
+  readonly property string sessionSummary: Session.plain(statusError ? "OmaBeam · status unavailable"
     : !ready ? "OmaBeam · checking status"
     : sessionOn ? "Sharing " + session.title + (session.viewers === null ? ""
       : " · " + session.viewers + (session.viewers === 1 ? " viewer" : " viewers"))
     : session.state === "ended" ? "Share ended · " + (session.error || session.title)
-    : "OmaBeam · choose a window, screen, or area"
+    : "OmaBeam · choose a window, screen, or area")
   readonly property string omabeamBin: decodeURIComponent(String(Qt.resolvedUrl("omabeam")).replace(/^file:\/\//, ""))
 
   function open() {
@@ -107,16 +108,26 @@ Shell.Panel {
   }
   function copyUrl() {
     if (!content.canShare || copyCommand.pending) return
+    if (!Session.parseShareUrl(session.url)) return
     copiedUrl = session.url
-    copyCommand.start(["wl-copy", "--", copiedUrl])
+    copyCommand.clearEnvironment = true
+    copyCommand.environment = {
+      PATH: "/usr/bin:/bin",
+      HOME: Quickshell.env("HOME") || "",
+      XDG_RUNTIME_DIR: Quickshell.env("XDG_RUNTIME_DIR") || "",
+      WAYLAND_DISPLAY: Quickshell.env("WAYLAND_DISPLAY") || "",
+      LANG: "C"
+    }
+    copyCommand.start(["/usr/bin/wl-copy", "--"], copiedUrl)
   }
   function openViewer() {
-    if (!content.canShare) return
+    if (!content.canShare || !Session.parseShareUrl(session.url)) return
     if (!Qt.openUrlExternally(session.url)) showFeedback("Could not open your browser. Copy the link instead.", true)
   }
   function sendNearby() {
     if (!content.canShare || sendCommand.pending) return
-    sendCommand.start([omabeamBin, "--send-link", session.url])
+    if (!Session.parseShareUrl(session.url)) return
+    sendCommand.start([omabeamBin, "--send-link"])
   }
   function stopLive() {
     if (!sessionOn || stopPending) return
@@ -168,6 +179,7 @@ Shell.Panel {
   Command {
     id: copyCommand
     objectName: "copyCommand"
+    maxBytes: 256
     onCompleted: function(code, exitStatus, output) {
       if (!root.sessionOn || root.session.url !== root.copiedUrl) return
       root.showFeedback(code === 0 && exitStatus === 0 ? "Share link copied." : "Could not copy the link. Check your clipboard.", code !== 0 || exitStatus !== 0)
@@ -180,6 +192,8 @@ Shell.Panel {
   Command {
     id: sendCommand
     objectName: "sendCommand"
+    collectOutput: false
+    timeoutMs: 0
     onStarted: { sendCommand.deadline.stop(); root.close() }
     onCompleted: function(code, exitStatus, output) {
       if (code !== 0 || exitStatus !== 0) {
@@ -193,7 +207,9 @@ Shell.Panel {
   Command {
     id: pickerCommand
     objectName: "pickerCommand"
-    // The picker stays running until dismissed; only its startup is timed.
+    collectOutput: false
+    timeoutMs: 0
+    // The picker stays running until dismissed; do not buffer its stdout.
     onStarted: { pickerCommand.deadline.stop(); root.close() }
     onCompleted: function(code, exitStatus, output) {
       if (code !== 0 || exitStatus !== 0) {

@@ -68,9 +68,13 @@ concurrent clients to 64 and bounds request/response time. Pausing disconnects
 that viewer. Capture failure clears the image and exposes diagnostics for
 30 seconds before the background process exits.
 
-State and logs live under `$XDG_RUNTIME_DIR/omabeam/`. Incomplete session files
-are rejected. Ended-session details remain until a new share or `--stop`.
-Hyprland queries use its command socket directly.
+State and logs live under `$XDG_RUNTIME_DIR/omabeam/`. The directory is created
+0700; files are 0600, opened `O_NOFOLLOW`, and capped. `XDG_RUNTIME_DIR` is
+required (no `/tmp` fallback). Incomplete or oversized session files are
+rejected. Ended-session details remain until a new share or `--stop`.
+Hyprland queries use its command socket directly. `--stop` signals only a
+process whose pidfd still matches the recorded start time, uid, and `--live`
+or `--demo` command.
 
 ```bash
 target/debug/omabeam --hypr monitors

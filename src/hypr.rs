@@ -207,22 +207,31 @@ pub fn dispatch_lua(expr: &str) -> Result<()> {
 
 pub fn hide_picker() {
     let selector = picker_selector();
-    let _ = dispatch_lua(&clear_screen_mask_lua(&selector));
-    let _ = dispatch_lua(&format!(
-        r#"hl.dsp.window.resize({{ x = 1, y = 1, relative = false, window = "{selector}" }})"#
-    ));
-    let _ = dispatch_lua(&format!(
-        r#"hl.dsp.window.move({{ x = -5000, y = -5000, relative = false, window = "{selector}" }})"#
-    ));
-    let _ = dispatch_lua(&hide_picker_lua(&selector));
+    if let Some(expr) = clear_screen_mask_lua(&selector) {
+        let _ = dispatch_lua(&expr);
+    }
+    dispatch_window(
+        &selector,
+        r#"hl.dsp.window.resize({ x = 1, y = 1, relative = false, window = {window} })"#,
+    );
+    dispatch_window(
+        &selector,
+        r#"hl.dsp.window.move({ x = -5000, y = -5000, relative = false, window = {window} })"#,
+    );
+    if let Some(expr) = hide_picker_lua(&selector) {
+        let _ = dispatch_lua(&expr);
+    }
     hide_omabeam_overlay();
 }
 
 pub fn show_picker() {
     let selector = picker_selector();
-    let workspace = current_regular_workspace();
+    let Some(window) = lua_window_selector(&selector) else {
+        return;
+    };
+    let workspace = lua_quote(&current_regular_workspace()).unwrap_or_else(|| r#""1""#.into());
     let _ = dispatch_lua(&format!(
-        r#"hl.dsp.window.move({{ workspace = "{workspace}", window = "{selector}" }})"#
+        "hl.dsp.window.move({{ workspace = {workspace}, window = {window} }})"
     ));
     hide_omabeam_overlay();
 }
@@ -247,7 +256,7 @@ pub fn activate_existing_picker() -> bool {
         }
         restore_picker();
     } else {
-        let _ = dispatch_lua(&format!(r#"hl.dsp.focus({{ window = "{selector}" }})"#));
+        dispatch_window(&selector, r#"hl.dsp.focus({ window = {window} })"#);
     }
     true
 }
@@ -266,14 +275,42 @@ fn picker_selector() -> String {
 }
 
 fn address_selector(client: &Client) -> Option<String> {
-    if client.address.is_empty() || client.address == "0" || client.address == "0x0" {
+    let addr = parse_address(&client.address)?;
+    Some(format!("address:0x{addr:x}"))
+}
+
+fn lua_quote(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 128 || value.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return None;
     }
-    if client.address.starts_with("0x") || client.address.starts_with("0X") {
-        Some(format!("address:{}", client.address))
-    } else {
-        Some(format!("address:0x{}", client.address))
+    let mut out = String::from("\"");
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            _ => out.push(ch),
+        }
     }
+    out.push('"');
+    Some(out)
+}
+
+fn lua_window_selector(selector: &str) -> Option<String> {
+    if selector == "class:omabeam" {
+        return Some(r#""class:omabeam""#.into());
+    }
+    let hex = selector.strip_prefix("address:0x")?;
+    if hex.is_empty() || hex.len() > 16 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(format!(r#""address:0x{hex}""#))
+}
+
+fn dispatch_window(selector: &str, template: &str) {
+    let Some(window) = lua_window_selector(selector) else {
+        return;
+    };
+    let _ = dispatch_lua(&template.replace("{window}", &window));
 }
 
 fn current_regular_workspace() -> String {
@@ -308,16 +345,18 @@ fn omabeam_overlay_visible(snapshot: &Snapshot) -> bool {
         .any(|monitor| monitor.special_workspace.name.contains("omabeam"))
 }
 
-pub fn hide_picker_lua(selector: &str) -> String {
-    format!(
-        r#"hl.dsp.window.move({{ workspace = "special:omabeam", follow = false, window = "{selector}" }})"#
-    )
+pub fn hide_picker_lua(selector: &str) -> Option<String> {
+    let window = lua_window_selector(selector)?;
+    Some(format!(
+        r#"hl.dsp.window.move({{ workspace = "special:omabeam", follow = false, window = {window} }})"#
+    ))
 }
 
-fn clear_screen_mask_lua(selector: &str) -> String {
-    format!(
-        r#"hl.dsp.window.set_prop({{ prop = "no_screen_share", value = "0", window = "{selector}" }})"#
-    )
+fn clear_screen_mask_lua(selector: &str) -> Option<String> {
+    let window = lua_window_selector(selector)?;
+    Some(format!(
+        r#"hl.dsp.window.set_prop({{ prop = "no_screen_share", value = "0", window = {window} }})"#
+    ))
 }
 
 pub fn release_live_focus() {
@@ -340,12 +379,11 @@ pub fn release_live_focus() {
 pub fn restore_picker() {
     show_picker();
     let selector = picker_selector();
-    let _ = dispatch_lua(&format!(
-        r#"hl.dsp.window.resize({{ x = 980, y = 680, relative = false, window = "{selector}" }})"#
-    ));
-    let _ = dispatch_lua(&format!(
-        r#"hl.dsp.window.center({{ window = "{selector}" }})"#
-    ));
+    dispatch_window(
+        &selector,
+        r#"hl.dsp.window.resize({ x = 980, y = 680, relative = false, window = {window} })"#,
+    );
+    dispatch_window(&selector, r#"hl.dsp.window.center({ window = {window} })"#);
 }
 
 pub fn parse_address(value: &str) -> Option<u64> {
@@ -683,10 +721,16 @@ mod tests {
 
     #[test]
     fn hide_picker_lua_stays_off_the_output() {
-        let expr = hide_picker_lua("class:omabeam");
+        let expr = hide_picker_lua("class:omabeam").unwrap();
         assert!(expr.contains("follow = false"), "{expr}");
         assert!(expr.contains(r#"workspace = "special:omabeam""#), "{expr}");
         assert!(!expr.contains("follow = true"), "{expr}");
+        assert!(hide_picker_lua(r#"address:0xabc"; os.execute(1)"#).is_none());
+        assert_eq!(
+            lua_window_selector("address:0xabc"),
+            Some(r#""address:0xabc""#.into())
+        );
+        assert_eq!(lua_quote(r#"1"; evil"#).as_deref(), Some(r#""1\"; evil""#));
     }
 
     #[test]

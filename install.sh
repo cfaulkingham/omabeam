@@ -5,6 +5,7 @@
 #   3. copy and enable the Omarchy bar widget
 #
 # Safe to re-run. Does not change the portal picker or open the firewall.
+# --remove-desktop removes only the marked Hyprland blocks this script wrote.
 
 set -euo pipefail
 
@@ -16,17 +17,19 @@ BINDINGS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
 SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 BIN="$PLUGIN_DIR/omarchy-plugin/omabeam"
 BIND_KEYS="SUPER + SHIFT + T"
-MARKER="omabeam (install.sh)"
+USAGE="Usage: ./install.sh [--backend-only|--remove-desktop]"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
 BACKEND_ONLY=false
+REMOVE_DESKTOP=false
 case "${1:-}" in
   --backend-only) BACKEND_ONLY=true ;;
+  --remove-desktop) REMOVE_DESKTOP=true ;;
   "") ;;
-  *) echo "Usage: ./install.sh [--backend-only]" >&2; exit 2 ;;
+  *) echo "$USAGE" >&2; exit 2 ;;
 esac
-[[ $# -le 1 ]] || { echo "Usage: ./install.sh [--backend-only]" >&2; exit 2; }
+[[ $# -le 1 ]] || { echo "$USAGE" >&2; exit 2; }
 [[ $(uname -s) == Linux ]] || { echo "OmaBeam installation requires Linux with Omarchy / Hyprland." >&2; exit 1; }
 
 need() {
@@ -44,18 +47,173 @@ plugin_on_bar() {
   ' "$SHELL_JSON" >/dev/null 2>&1
 }
 
-ensure_lua_snippet() {
-  local file="$1"
-  local needle="$2"
-  local snippet="$3"
+edit_hypr() {
+  local action=$1
+  python3 - "$HYPRLAND_LUA" "$BINDINGS_LUA" "$BIN" "$action" "$BIND_KEYS" <<'PY'
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
 
-  if grep -Fq "$needle" "$file"; then
-    echo "  already present in $file"
-    return 0
-  fi
+hypr_path, bind_path, binary, action, bind_keys = sys.argv[1:6]
+MAX = 1_048_576
+WINDOW = """-- omabeam (install.sh)
+o.window("omabeam", {
+  float = true,
+  center = true,
+  focus_on_activate = false,
+  animation = "popin",
+  size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },
+  max_size = { 980, 560 },
+})
+"""
+BIND = (
+    "-- omabeam (install.sh)\n"
+    f'o.bind({json.dumps(bind_keys)}, "OmaBeam", {{ launch = {json.dumps(binary)} }})\n'
+)
+WINDOW_RE = re.compile(
+    r"-- omabeam \(install.sh\)\n"
+    r'o\.window\("omabeam", \{.*?\}\)\n?',
+    re.S,
+)
+BIND_RE = re.compile(
+    r"-- omabeam \(install.sh\)\n"
+    r'o\.bind\("SUPER \+ SHIFT \+ T", "OmaBeam", \{ launch = .*? \}\)\n?',
+)
+flags = (
+    os.O_RDONLY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_NONBLOCK", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
 
-  printf '\n%s\n' "$snippet" >>"$file"
-  echo "  appended to $file"
+
+def read_file(path):
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SystemExit(f"install.sh: refusing {path}: not a regular file")
+        if info.st_size > MAX:
+            raise SystemExit(f"install.sh: refusing {path}: too large")
+        os.set_blocking(fd, True)
+        data = b""
+        while len(data) <= MAX:
+            chunk = os.read(fd, min(65536, MAX + 1 - len(data)))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > MAX:
+            raise SystemExit(f"install.sh: refusing {path}: too large")
+        return data.decode()
+    finally:
+        os.close(fd)
+
+
+def atomic_write(path, text):
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".omabeam.", dir=directory)
+    try:
+        os.fchmod(fd, stat.S_IMODE(os.stat(path).st_mode))
+        payload = text.encode()
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp, path)
+        tmp = None
+        dirfd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dirfd)
+        finally:
+            os.close(dirfd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+hypr = read_file(hypr_path)
+bind = read_file(bind_path)
+original = (hypr, bind)
+
+if action == "remove":
+    hypr, bind = WINDOW_RE.sub("", hypr), BIND_RE.sub("", bind)
+    if (hypr, bind) == original:
+        print("  no OmaBeam Hyprland blocks to remove")
+        raise SystemExit(0)
+else:
+    if WINDOW_RE.search(hypr):
+        hypr = WINDOW_RE.sub(WINDOW, hypr, count=1)
+        print("  updated window rule")
+    elif 'o.window("omabeam"' in hypr:
+        print("  window rule present (left unchanged)")
+    else:
+        hypr = hypr.rstrip() + "\n\n" + WINDOW
+        print("  appended window rule")
+    if bind_keys in bind and "OmaBeam" not in bind:
+        print(f"  {bind_keys} is already used; not replacing it", file=sys.stderr)
+    elif BIND_RE.search(bind):
+        bind = BIND_RE.sub(BIND, bind, count=1)
+        print("  updated key bind")
+    elif "OmaBeam" in bind:
+        print("  key bind present (left unchanged)")
+    else:
+        bind = bind.rstrip() + "\n\n" + BIND
+        print("  appended key bind")
+
+if (hypr, bind) == original:
+    raise SystemExit(0)
+
+try:
+    atomic_write(hypr_path, hypr)
+    atomic_write(bind_path, bind)
+except BaseException:
+    atomic_write(hypr_path, original[0])
+    atomic_write(bind_path, original[1])
+    raise
+
+def restore():
+    atomic_write(hypr_path, original[0])
+    atomic_write(bind_path, original[1])
+
+if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+    print("==> skipping reload (OmaBeam is not installed)")
+    raise SystemExit(0)
+version = subprocess.run([binary, "--hypr", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+if version.returncode != 0:
+    print("==> skipping reload (the current Hyprland session is not reachable)")
+    raise SystemExit(0)
+print("==> reloading Hyprland")
+reload = subprocess.run([binary, "--hypr", "reload"], capture_output=True, text=True)
+if reload.returncode != 0:
+    restore()
+    raise SystemExit("install.sh: hyprctl reload failed; previous configuration restored")
+errors = subprocess.run([binary, "--hypr", "configerrors"], capture_output=True, text=True)
+try:
+    payload = json.loads(errors.stdout or "[]")
+    bad = [item for item in payload if isinstance(item, str) and item]
+except json.JSONDecodeError:
+    restore()
+    raise SystemExit("install.sh: could not read Hyprland configerrors; previous configuration restored")
+if bad:
+    restore()
+    sys.stderr.write("install.sh: Hyprland configuration errors; previous configuration restored:\n")
+    sys.stderr.write("\n".join(bad) + "\n")
+    raise SystemExit(1)
+if action == "remove":
+    print("  removed OmaBeam Hyprland blocks")
+PY
 }
 
 echo "==> checking tools"
@@ -63,6 +221,20 @@ echo "==> checking tools"
   echo "install.sh: plugin manifest missing: $ROOT/manifest.json" >&2
   exit 1
 }
+
+if $REMOVE_DESKTOP; then
+  need python3
+  [[ -f $HYPRLAND_LUA && -f $BINDINGS_LUA ]] || {
+    echo "install.sh: expected Omarchy Hyprland config in ~/.config/hypr/" >&2
+    exit 1
+  }
+  echo "==> removing Hyprland blocks marked -- omabeam (install.sh)"
+  edit_hypr remove
+  echo "OmaBeam Hyprland blocks removed. The plugin files remain until:"
+  echo "  omarchy plugin remove $PLUGIN_ID"
+  exit 0
+fi
+
 if ! $BACKEND_ONLY; then
   for tool in wl-copy rsync jq python3 omarchy omarchy-shell; do need "$tool"; done
   [[ -f $HYPRLAND_LUA && -f $BINDINGS_LUA ]] || {
@@ -122,96 +294,11 @@ if plugin_on_bar; then
 else
   omarchy plugin enable "$PLUGIN_ID" --section right
 fi
-# rescanPlugins does not drop Qt's compiled QML; the running shell will
-# keep serving the previous widget until the process restarts with an
-# empty disk cache.
-QMLCACHE="${XDG_CACHE_HOME:-$HOME/.cache}/quickshell/qmlcache"
-rm -rf "$QMLCACHE"
 echo "==> restarting Omarchy shell so $PLUGIN_ID reloads"
 omarchy restart shell
 
-echo "==> Hyprland window rule"
-WINDOW_RULE="$(cat <<EOF
--- $MARKER
-o.window("omabeam", {
-  float = true,
-  center = true,
-  focus_on_activate = false,
-  animation = "popin",
-  size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },
-  max_size = { 980, 560 },
-})
-EOF
-)"
-if grep -Fq 'o.window("omabeam"' "$HYPRLAND_LUA"; then
-  python3 - "$HYPRLAND_LUA" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text()
-new = """-- omabeam (install.sh)
-o.window("omabeam", {
-  float = true,
-  center = true,
-  focus_on_activate = false,
-  animation = "popin",
-  size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },
-  max_size = { 980, 560 },
-})
-"""
-pattern = re.compile(
-    r"-- omabeam \(install.sh\)\n"
-    r'o\.window\("omabeam", \{.*?\}\)\n?',
-    re.S,
-)
-if pattern.search(text):
-    path.write_text(pattern.sub(new, text, count=1))
-    print("  updated window rule")
-else:
-    print("  present (left unchanged)")
-PY
-else
-  ensure_lua_snippet "$HYPRLAND_LUA" 'o.window("omabeam"' "$WINDOW_RULE"
-fi
-
-echo "==> Hyprland bind $BIND_KEYS"
-if grep -Fq "$BIND_KEYS" "$BINDINGS_LUA" && ! grep -Fq 'OmaBeam' "$BINDINGS_LUA"; then
-  echo "  $BIND_KEYS is already used in $BINDINGS_LUA; not replacing it" >&2
-else
-  if grep -Fq -- "-- $MARKER" "$BINDINGS_LUA"; then
-    python3 - "$BINDINGS_LUA" "$BIN" <<'PY'
-from pathlib import Path
-import json
-import re
-import sys
-path = Path(sys.argv[1])
-text = path.read_text()
-pattern = r'(-- omabeam \(install.sh\)\n)o\.bind\("SUPER \+ SHIFT \+ T", "OmaBeam", \{ launch = .*? \}\)'
-replacement = '-- omabeam (install.sh)\no.bind("SUPER + SHIFT + T", "OmaBeam", { launch = ' + json.dumps(sys.argv[2]) + ' })'
-path.write_text(re.sub(pattern, lambda _: replacement, text))
-PY
-  fi
-  ensure_lua_snippet "$BINDINGS_LUA" 'OmaBeam' "$(cat <<EOF
--- $MARKER
-o.bind("$BIND_KEYS", "OmaBeam", { launch = "$BIN" })
-EOF
-)"
-fi
-
-if "$BIN" --hypr version >/dev/null 2>&1; then
-  echo "==> reloading Hyprland"
-  "$BIN" --hypr reload
-  errors="$("$BIN" --hypr configerrors)"
-  if ! jq -e '[.[] | select(type == "string" and . != "")] | length == 0' <<<"$errors" >/dev/null; then
-    echo "install.sh: Hyprland configuration errors:" >&2
-    jq -r '.[] | select(type == "string" and . != "")' <<<"$errors" >&2
-    exit 1
-  fi
-else
-  echo "==> skipping reload (the current Hyprland session is not reachable)"
-fi
+echo "==> Hyprland window rule and bind $BIND_KEYS"
+edit_hypr apply
 
 echo
 echo "OmaBeam installed."
@@ -220,4 +307,5 @@ echo "  plugin:  $PLUGIN_DIR"
 echo "  launch:  $BIND_KEYS  or  $BIN"
 echo
 echo "Optional: set custom_picker_binary = $BIN in ~/.config/hypr/xdph.conf"
-echo "Optional: sudo ufw allow from 192.168.0.0/16 to any port 9847 proto tcp comment OmaBeam"
+echo "To allow LAN viewers through a firewall, open TCP 9847 from your local subnet."
+echo "Remove desktop bindings with: ./install.sh --remove-desktop"

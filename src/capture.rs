@@ -102,7 +102,7 @@ fn png_image(request: &CaptureRequest) -> Result<Vec<u8>> {
 
 fn copy_image(request: &CaptureRequest) -> Result<()> {
     let png = png_image(request)?;
-    let mut child = Command::new("wl-copy")
+    let mut child = Command::new("/usr/bin/wl-copy")
         .args(["--type", "image/png"])
         .stdin(Stdio::piped())
         .spawn()

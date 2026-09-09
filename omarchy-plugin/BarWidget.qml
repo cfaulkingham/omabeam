@@ -1,6 +1,7 @@
 import QtQuick
 import qs.Commons
 import qs.Ui as Shell
+import "Session.js" as Session
 
 Shell.BarWidget {
   id: root
@@ -66,7 +67,7 @@ Shell.BarWidget {
     text: "󰍹"
     active: root.sessionOn
     dimmed: !root.sessionOn
-    tooltipText: root.sessionSummary
+    tooltipText: Session.plain(root.sessionSummary)
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton || buttonCode === Qt.LeftButton) {
         root.toggle()

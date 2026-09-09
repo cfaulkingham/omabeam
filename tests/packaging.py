@@ -148,6 +148,7 @@ path.chmod(0o755)
         self.assertTrue((installed / "omarchy-plugin/native/bin/omabeam").is_file())
         self.assertTrue((installed / "RELEASING.md").is_file())
         self.assertIn(str(installed / "omarchy-plugin/omabeam"), (hypr / "bindings.lua").read_text())
+        self.assertIn("json.dumps", Path(ROOT / "install.sh").read_text())  # launch path is quoted
         before = [(hypr / name).read_text() for name in ("hyprland.lua", "bindings.lua")]
         # Copied runtime-only installs can rerun without Cargo/source present.
         (tools / "cargo").unlink()
@@ -158,6 +159,10 @@ path.chmod(0o755)
         self.assertIn("Git-managed", install(self.source, success=False).stderr)
         install(installed)
         self.assertEqual((installed / ".git/sentinel").read_text(), "keep")
+        install(installed, "--remove-desktop")
+        bindings = (hypr / "bindings.lua").read_text()
+        self.assertNotIn("OmaBeam", bindings)
+        self.assertNotIn("omabeam (install.sh)", (hypr / "hyprland.lua").read_text())
 
 
 if __name__ == "__main__":

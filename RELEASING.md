@@ -101,6 +101,9 @@ omarchy plugin remove io.github.cfaulkingham.omabeam
 ```
 
 The plugin-local binary is removed with the plugin. If you used the full
-installer, remove the blocks marked `-- omabeam (install.sh)` from
-`hyprland.lua` and `bindings.lua`. Screenshots and any firewall or portal
-settings you configured separately are left in place.
+installer, run `./install.sh --remove-desktop` first (or delete the blocks
+marked `-- omabeam (install.sh)` from `hyprland.lua` and `bindings.lua`).
+Stop the share before removing the plugin; a detached live process can outlive
+the checkout. Screenshots and any firewall or portal settings you configured
+separately are left in place. Session files live in `$XDG_RUNTIME_DIR/omabeam/`
+and vanish at logout.

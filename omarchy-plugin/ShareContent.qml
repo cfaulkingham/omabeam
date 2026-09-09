@@ -100,6 +100,7 @@ Item {
         spacing: 3 * root.unit
         Text {
           text: "OmaBeam"
+          textFormat: Text.PlainText
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: root.bodySize
@@ -125,6 +126,7 @@ Item {
           id: badge
           anchors.centerIn: parent
           text: root.stopping ? "STOPPING" : root.uncertain ? "CHECK" : root.live ? "● LIVE" : "ENDED"
+          textFormat: Text.PlainText
           color: root.urgent
           font.family: root.fontFamily
           font.pixelSize: root.captionSize * 0.85
@@ -171,6 +173,7 @@ Item {
               Text {
                 Layout.fillWidth: true
                 text: root.live ? "SHARING NOW" : root.ended ? "LAST SHARED" : "YOUR NEXT SHARE"
+                textFormat: Text.PlainText
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: root.captionSize * 0.85
@@ -180,6 +183,7 @@ Item {
               Text {
                 visible: root.live || root.ended
                 text: Session.sourceKind(root.session)
+                textFormat: Text.PlainText
                 color: root.muted
                 font.family: root.fontFamily
                 font.pixelSize: root.captionSize
@@ -231,6 +235,7 @@ Item {
               spacing: 5 * root.unit
               Text {
                 text: metric.modelData.value
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: root.bodySize * 1.8
@@ -239,6 +244,7 @@ Item {
               Text {
                 width: parent.width
                 text: metric.modelData.label
+                textFormat: Text.PlainText
                 wrapMode: Text.Wrap
                 color: root.muted
                 font.family: root.fontFamily
@@ -266,6 +272,7 @@ Item {
             width: parent.width
             text: root.session.url ? "Copy the link or send it to a nearby OmaSend or LocalSend device. They can watch in their browser."
               : "The share is running, but its link could not be read. You can still stop it below."
+            textFormat: Text.PlainText
             wrapMode: Text.Wrap
             color: root.muted
             font.family: root.fontFamily
@@ -404,6 +411,7 @@ Item {
         width: parent.width
         topPadding: 5 * root.unit
         text: "↑↓ actions    ↵ select    esc close"
+        textFormat: Text.PlainText
         color: root.muted
         font.family: root.fontFamily
         font.pixelSize: root.captionSize * 0.85

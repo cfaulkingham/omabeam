@@ -54,17 +54,24 @@ def fixtures(path):
             "Process": '''import QtQuick
 QtObject {
   property bool running: false
+  property bool stdinEnabled: false
+  property bool clearEnvironment: false
+  property var environment: ({})
   property var command: []
   property var stdout: null
+  property var stderr: null
+  property string output: ""
   signal started()
   signal exited(int code, int exitStatus)
   function signal(number) { running = false }
-  function finish(code, exitStatus, output) {
-    if (stdout) { stdout.text = output; stdout.streamFinished() }
+  function write(data) {}
+  function finish(code, exitStatus, payload) {
+    this.output = payload
     running = false
     exited(code, exitStatus)
   }
 }''',
+            "SplitParser": 'import QtQuick\nQtObject { property string splitMarker: ""; signal read(string chunk) }',
             "StdioCollector": 'import QtQuick\nQtObject { property bool waitForEnd: true; property string text: ""; signal streamFinished() }',
         },
         "qs/Commons": {
@@ -158,10 +165,15 @@ def model_tests():
       function assert(value) { if (!value) throw new Error("Session model assertion failed") }
       assert(elapsed(null) === "—" && elapsed(59) === "0:59" && elapsed(60) === "1:00")
       assert(elapsed(3600) === "1:00:00" && elapsed(36001) === "10:00:01")
-      assert(linkHost("http://[::1]:9847/s/test/") === "[::1]:9847")
-      assert(linkHost("https://example.com/s/test/") === "example.com")
+      const token = "0123456789abcdef0123456789abcdef"
+      assert(linkHost("http://[::1]:9847/s/" + token + "/") === "[::1]:9847")
+      assert(linkHost("http://192.168.1.24:9847/s/" + token + "/") === "192.168.1.24:9847")
+      assert(linkHost("https://example.com/s/" + token + "/") === "")
+      assert(linkHost("http://8.8.8.8:9847/s/" + token + "/") === "")
+      assert(plain("<img src=x>", 80) === "img src=x")
       for (const url of ["file:///tmp/test", "javascript:alert(1)", "http://user:pass@host/",
-          "http://host:99999/", "http://host:0/", "http://host/has a space"])
+          "http://host:99999/", "http://host:0/", "http://host/has a space",
+          "http://192.168.1.24:9847/s/abc/"])
         assert(linkHost(url) === "")
       for (const data of [null, [], {}, {pid: -1}, {pid: "12"}, {pid: 1.5}, {pid: 1}, {pid: 1, state: "paused"}]) {
         let rejected = false
@@ -210,13 +222,13 @@ def controller_tests(app, imports):
     finish("status", LIVE)
     expect('subject.sessionOn && subject.session.viewers === 2')
     call('subject.sendNearby(); subject.sendNearby();')
-    check(engine, commands["send"], 'subject.command[0].indexOf("omabeam") >= 0 && subject.command[1] === "--send-link" && subject.command[2] === %s && subject.pending' % json.dumps(LIVE["url"]))
+    check(engine, commands["send"], 'subject.command[0].indexOf("omabeam") >= 0 && subject.command[1] === "--send-link" && subject.command.length === 2 && subject.pending')
     run(engine, commands["send"], 'subject.started();')
     expect('!subject.opened')
     finish("send")
     finish("status", LIVE)
     call('subject.open(); subject.copyUrl(); subject.copyUrl();')
-    check(engine, commands["copy"], 'subject.command[0] === "wl-copy" && subject.pending')
+    check(engine, commands["copy"], 'subject.command[0] === "/usr/bin/wl-copy" && subject.command[1] === "--" && subject.command.length === 2 && subject.pending')
     expect('subject.feedback !== "Share link copied."')
     finish("copy", code=1)
     expect('subject.feedbackError && subject.feedback.indexOf("Could not copy") === 0')
@@ -271,6 +283,12 @@ def controller_tests(app, imports):
     call('subject.refresh();')
     finish("status", dict(LIVE, url="file:///etc/passwd"))
     expect('subject.sessionOn && subject.session.url === ""')
+    call('subject.refresh();')
+    finish("status", dict(LIVE, url="https://example.com/s/0123456789abcdef0123456789abcdef/"))
+    expect('subject.sessionOn && subject.session.url === ""')
+    call('subject.refresh();')
+    finish("status", dict(LIVE, title="x" * 201))
+    expect('subject.sessionOn && subject.statusError !== "" && subject.session.title.indexOf("Terminal") === 0')
     call('subject.refresh();')
     finish("status", code=1, status=1)
     expect('subject.sessionOn && subject.statusError !== ""')

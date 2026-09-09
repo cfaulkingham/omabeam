@@ -60,7 +60,7 @@ impl OmaBeam {
         );
         let local = self.live_config.bind.is_loopback();
         let access_changed = cx.listener(|this, index: &usize, _, cx| {
-            this.live_config.bind = if *index == 0 { "0.0.0.0" } else { "127.0.0.1" }
+            this.live_config.bind = if *index == 0 { "127.0.0.1" } else { "0.0.0.0" }
                 .parse()
                 .unwrap();
             cx.notify();
@@ -78,11 +78,11 @@ impl OmaBeam {
                 cx,
             ),
             vec![
-                MenuItem::new("Local network")
-                    .checked(!local)
-                    .disabled(self.busy),
                 MenuItem::new("This computer")
                     .checked(local)
+                    .disabled(self.busy),
+                MenuItem::new("Local network")
+                    .checked(!local)
                     .disabled(self.busy),
             ],
             move |index, window, cx| access_changed(&index, window, cx),

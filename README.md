@@ -51,6 +51,35 @@ See [Installation and releases](RELEASING.md) for Git-managed installs,
 bundles, updates, and removal. Run `./install.sh --backend-only` inside a
 plugin checkout to build the app without changing desktop configuration.
 
+## Removing
+
+Stop an active share from the bar (or `omabeam --stop`), then:
+
+```bash
+omarchy plugin remove io.github.cfaulkingham.omabeam
+```
+
+That removes the plugin checkout, including the plugin-local binary. It does
+**not** stop a share that is already running (the live process is detached),
+and it does not edit Hyprland.
+
+If you ran the full `./install.sh` (not `--backend-only`), also run
+`./install.sh --remove-desktop` from a copy of the plugin **before** removing
+it, or delete the blocks marked `-- omabeam (install.sh)` from
+`hyprland.lua` and `bindings.lua`. Then reload Hyprland.
+
+Left on disk after removal:
+
+- `$XDG_RUNTIME_DIR/omabeam/` — `live.json` and `live.log` for the current
+  session. These go away at logout. There is no `/tmp` fallback.
+- Screenshots under `$OMARCHY_SCREENSHOT_DIR/omabeam`, `$XDG_PICTURES_DIR/omabeam`,
+  or `~/Pictures/omabeam/`
+- Firewall or `xdph.conf` portal-picker lines you added yourself
+
+A detached live process keeps serving until you stop it or it loses its
+source. Stop sharing before `omarchy plugin remove` if you can still run
+`omabeam --stop`.
+
 ## Share your screen
 
 1. Open OmaBeam from the bar or **Super + Shift + T**.
@@ -64,13 +93,15 @@ it. If the compositor cannot capture it separately, select an area explicitly.
 A lost source ends the share and clears the viewer image.
 
 Defaults: 15 FPS, JPEG quality 55, native logical width, cursor off, and
-local-network access on TCP **9847**. Presets offer Balanced, Crisp text, and
-Smooth motion. Advanced exposes individual settings.
+**this computer** only (TCP **9847** on 127.0.0.1). Presets offer Balanced,
+Crisp text, and Smooth motion. Advanced exposes individual settings, including
+**Local network** (0.0.0.0) when you want LAN viewers.
 
 Links use a fresh random token and plain HTTP. Anyone with the link who can
-reach the host can view the share. Choose **This computer** for local access,
-or forward that port over SSH. If a firewall blocks LAN viewers, allow TCP
-9847 from your intended local subnet.
+reach the host can view the share. Keep **This computer** unless you intend
+that. Forward the port over SSH for remote viewing. If you switch to local
+network and a firewall blocks viewers, allow TCP 9847 from your intended
+subnet only.
 
 The viewer reads the host's Omarchy palette when opened; reload it after a
 theme change. Capture slows to about one frame per second when nobody watches.

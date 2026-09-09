@@ -48,22 +48,22 @@ fn run() -> anyhow::Result<()> {
     }
     if args.first().is_some_and(|arg| arg == "--status") {
         anyhow::ensure!(args.len() == 1, "unexpected command argument");
-        match omabeam::live::latest_status() {
-            Some(status) => {
+        match omabeam::live::latest_status_report() {
+            Ok(Some(status)) => {
                 println!("{}", serde_json::to_string(&status).unwrap_or_default());
             }
-            None => {
+            Ok(None) => {
                 std::process::exit(1);
+            }
+            Err(_) => {
+                std::process::exit(2);
             }
         }
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "--send-link") {
-        anyhow::ensure!(args.len() <= 2, "unexpected command argument");
-        let url = omabeam::localsend::resolve_link(
-            args.get(1).map(String::as_str),
-            omabeam::live::current_status().as_ref(),
-        )?;
+        anyhow::ensure!(args.len() == 1, "unexpected command argument");
+        let url = omabeam::localsend::resolve_link(None, omabeam::live::current_status().as_ref())?;
         omabeam::app::open_send_link(url);
         return Ok(());
     }
@@ -86,10 +86,7 @@ fn run() -> anyhow::Result<()> {
                 );
                 omabeam::live::stop_live_process();
             } else {
-                let copied = std::process::Command::new("wl-copy")
-                    .args(["--", &status.url])
-                    .status()
-                    .is_ok_and(|result| result.success());
+                let copied = omabeam::live::copy_text(&status.url);
                 if omabeam::localsend::spawn_window(&status.url).is_ok() {
                     return Ok(());
                 }
@@ -98,7 +95,7 @@ fn run() -> anyhow::Result<()> {
                 } else {
                     "A live share is already running. Use the OmaBeam bar icon to send its URL, manage it, or stop it."
                 };
-                let _ = std::process::Command::new("notify-send")
+                let _ = std::process::Command::new("/usr/bin/notify-send")
                     .args(["OmaBeam", message])
                     .status();
                 return Ok(());

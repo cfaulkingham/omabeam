@@ -110,10 +110,9 @@ Usage:
                          Same as --picker, with restore-token enabled
   omabeam --status     Print live-share JSON if a share is running
   omabeam --stop       End the running live share
-  omabeam --send-link [URL]
-                         Send the live-share URL to a nearby OmaSend or
-                         LocalSend device. Uses the running share when URL
-                         is omitted.
+  omabeam --send-link    Send the running live-share URL to a nearby OmaSend
+                         or LocalSend device. The URL is read from the
+                         session file, not from argv.
   omabeam --hypr COMMAND
                          Query Hyprland JSON: clients, monitors, workspaces,
                          activeworkspace, activewindow, version, configerrors;
@@ -129,7 +128,7 @@ Live options (also apply when opening the picker):
   --quality N           JPEG quality 1–95 (default 55)
   --width N             Limit encoded width (default logical resolution)
   --cursor              Include cursor
-  --bind ADDRESS        Default 0.0.0.0 for LAN; use 127.0.0.1 for local access
+  --bind ADDRESS        Default 127.0.0.1; use 0.0.0.0 for local-network viewers
   --port N              Default 9847; 0 chooses an available port
   --                    Treat remaining source arguments literally
 
@@ -910,7 +909,7 @@ fn friendly_error(raw: &str) -> String {
 }
 
 fn desktop_notify(message: &str) {
-    let _ = std::process::Command::new("notify-send")
+    let _ = std::process::Command::new("/usr/bin/notify-send")
         .args(["OmaBeam", message])
         .status();
 }

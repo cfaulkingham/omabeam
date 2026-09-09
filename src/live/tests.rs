@@ -40,6 +40,11 @@ fn exchange(frames: &Arc<FrameState>, request: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn default_bind_is_loopback() {
+    assert!(LiveConfig::default().bind.is_loopback());
+}
+
+#[test]
 fn options_validate_and_round_trip_through_daemon_arguments() {
     let (config, rest) = LiveConfig::parse_args(&args(&[
         "--fps",
