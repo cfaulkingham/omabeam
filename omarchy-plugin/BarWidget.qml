@@ -64,10 +64,18 @@ Shell.BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍹"
     active: root.sessionOn
     dimmed: !root.sessionOn
     tooltipText: Session.plain(root.sessionSummary)
+    iconComponent: Component {
+      Item {
+        OmabeamIcon {
+          anchors.centerIn: parent
+          iconSize: Style.space(14)
+          color: button.foreground
+        }
+      }
+    }
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.RightButton || buttonCode === Qt.LeftButton) {
         root.toggle()

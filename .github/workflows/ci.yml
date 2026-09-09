@@ -18,7 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libegl1 libopengl0 libxkbcommon0 fonts-dejavu-core
       - run: python -m pip install 'PySide6-Essentials>=6.8,<6.11'
-      - run: pyside6-qmllint omarchy-plugin/ShareContent.qml omarchy-plugin/ShareButton.qml
+      - run: pyside6-qmllint omarchy-plugin/ShareContent.qml omarchy-plugin/ShareButton.qml omarchy-plugin/OmabeamIcon.qml
       - run: python tests/omarchy_ui.py --screenshots target/omarchy-qa
   test:
     runs-on: ubuntu-latest

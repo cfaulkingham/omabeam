@@ -78,21 +78,10 @@ Item {
         Layout.preferredHeight: 38 * root.unit
         radius: root.cornerRadius
         color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.1)
-        Grid {
+        OmabeamIcon {
           anchors.centerIn: parent
-          columns: 2
-          spacing: 3 * root.unit
-          Repeater {
-            model: 4
-            Rectangle {
-              required property int index
-              width: 7 * root.unit
-              height: width
-              radius: root.unit
-              color: root.accent
-              opacity: index === 3 ? 0.35 : 1
-            }
-          }
+          iconSize: 17 * root.unit
+          color: root.accent
         }
       }
       ColumnLayout {

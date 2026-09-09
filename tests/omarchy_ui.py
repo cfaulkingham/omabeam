@@ -140,6 +140,8 @@ Item {
   property bool active: false
   property bool dimmed: false
   property string tooltipText: ""
+  property color foreground: "#d6deeb"
+  property Component iconComponent: null
   signal pressed(int buttonCode)
   implicitWidth: 24
   implicitHeight: 24
