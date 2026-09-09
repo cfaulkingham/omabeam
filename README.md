@@ -1,3 +1,5 @@
+![OmaBeam — Your screen. One simple link. Screen sharing for Omarchy and Hyprland.](docs/assets/omabeam-marketing.png)
+
 # OmaBeam
 
 **Share a window, screen, or area. Watch in any browser.**
