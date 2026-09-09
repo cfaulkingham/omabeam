@@ -40,8 +40,8 @@ fn exchange(frames: &Arc<FrameState>, request: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn default_bind_is_loopback() {
-    assert!(LiveConfig::default().bind.is_loopback());
+fn default_bind_is_local_network() {
+    assert!(LiveConfig::default().bind.is_unspecified());
 }
 
 #[test]

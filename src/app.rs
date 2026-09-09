@@ -128,7 +128,7 @@ Live options (also apply when opening the picker):
   --quality N           JPEG quality 1–95 (default 55)
   --width N             Limit encoded width (default logical resolution)
   --cursor              Include cursor
-  --bind ADDRESS        Default 127.0.0.1; use 0.0.0.0 for local-network viewers
+  --bind ADDRESS        Default 0.0.0.0 (local network); 127.0.0.1 for this computer only
   --port N              Default 9847; 0 chooses an available port
   --                    Treat remaining source arguments literally
 

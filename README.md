@@ -84,7 +84,7 @@ source. Stop sharing before `omarchy plugin remove` if you can still run
 
 1. Open OmaBeam from the bar or **Super + Shift + T**.
 2. Choose **Window**, **Screen**, or **Area**, then check the preview.
-3. Set quality, cursor visibility, and who can connect.
+3. Set quality and cursor visibility.
 4. Select **Start sharing**. The picker closes and copies the browser link.
 5. Open the link on another computer, or use **Send nearby** in the bar panel.
 
@@ -93,15 +93,13 @@ it. If the compositor cannot capture it separately, select an area explicitly.
 A lost source ends the share and clears the viewer image.
 
 Defaults: 15 FPS, JPEG quality 55, native logical width, cursor off, and
-**this computer** only (TCP **9847** on 127.0.0.1). Presets offer Balanced,
-Crisp text, and Smooth motion. Advanced exposes individual settings, including
-**Local network** (0.0.0.0) when you want LAN viewers.
+local network (TCP **9847** on 0.0.0.0). Presets offer Balanced, Crisp text,
+and Smooth motion. Advanced exposes individual settings.
 
-Links use a fresh random token and plain HTTP. Anyone with the link who can
-reach the host can view the share. Keep **This computer** unless you intend
-that. Forward the port over SSH for remote viewing. If you switch to local
-network and a firewall blocks viewers, allow TCP 9847 from your intended
-subnet only.
+Links use a fresh random token and plain HTTP. Anyone on the local network
+with the link can view the share. If a firewall blocks viewers, allow TCP 9847
+from your intended subnet only. Use `--bind 127.0.0.1` to keep the stream on
+this computer, or forward the port over SSH for remote viewing.
 
 The viewer reads the host's Omarchy palette when opened; reload it after a
 theme change. Capture slows to about one frame per second when nobody watches.

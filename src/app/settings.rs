@@ -58,35 +58,6 @@ impl OmaBeam {
                 .collect(),
             move |index, window, cx| preset_changed(&index, window, cx),
         );
-        let local = self.live_config.bind.is_loopback();
-        let access_changed = cx.listener(|this, index: &usize, _, cx| {
-            this.live_config.bind = if *index == 0 { "127.0.0.1" } else { "0.0.0.0" }
-                .parse()
-                .unwrap();
-            cx.notify();
-        });
-        let access = menu(
-            "access-menu",
-            dropdown(
-                "access",
-                if local {
-                    "This computer"
-                } else {
-                    "Local network"
-                },
-                self.busy,
-                cx,
-            ),
-            vec![
-                MenuItem::new("This computer")
-                    .checked(local)
-                    .disabled(self.busy),
-                MenuItem::new("Local network")
-                    .checked(!local)
-                    .disabled(self.busy),
-            ],
-            move |index, window, cx| access_changed(&index, window, cx),
-        );
         let cursor_changed = cx.listener(|this, value: &bool, _, cx| {
             if !this.busy {
                 this.live_config.cursor = *value;
@@ -104,7 +75,6 @@ impl OmaBeam {
                     .items_end()
                     .gap_3()
                     .child(field("Quality", quality, cx))
-                    .child(field("Available to", access, cx))
                     .child(
                         div().pb_1().child(
                             switch("stream-cursor", "Show cursor", self.live_config.cursor, cx)

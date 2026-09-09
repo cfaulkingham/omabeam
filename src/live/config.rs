@@ -21,7 +21,7 @@ impl Default for LiveConfig {
             quality: 55,
             max_width: None,
             cursor: false,
-            bind: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: super::LIVE_PORT,
         }
     }
