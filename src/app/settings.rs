@@ -71,33 +71,48 @@ impl OmaBeam {
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
-                    .items_end()
-                    .gap_3()
-                    .child(field("Quality", quality, cx))
+                    .flex_col()
+                    .gap_1()
                     .child(
-                        div().pb_1().child(
-                            switch("stream-cursor", "Show cursor", self.live_config.cursor, cx)
+                        div()
+                            .text_xs()
+                            .text_color(cx.omarchy().secondary)
+                            .child("Quality"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_start()
+                            .gap_3()
+                            .child(div().w(px(160.)).child(quality))
+                            .child(
+                                switch(
+                                    "stream-cursor",
+                                    "Show cursor",
+                                    self.live_config.cursor,
+                                    cx,
+                                )
                                 .on_change(move |value, _, window, cx| {
                                     cursor_changed(&value, window, cx)
                                 }),
-                        ),
-                    )
-                    .child(
-                        button(
-                            "advanced",
-                            if self.show_advanced {
-                                "▾ Advanced"
-                            } else {
-                                "▸ Advanced"
-                            },
-                            ButtonVariant::Outline,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_advanced = !this.show_advanced;
-                            cx.notify();
-                        })),
+                            )
+                            .child(
+                                button(
+                                    "advanced",
+                                    if self.show_advanced {
+                                        "▾ Advanced"
+                                    } else {
+                                        "▸ Advanced"
+                                    },
+                                    ButtonVariant::Outline,
+                                    cx,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_advanced = !this.show_advanced;
+                                    cx.notify();
+                                })),
+                            ),
                     ),
             )
             .when(self.show_advanced, |root| {
@@ -180,10 +195,11 @@ pub(super) fn dropdown(
     disabled: bool,
     cx: &gpui_kit::App,
 ) -> gpui_omarchy::Button {
-    button(id, label, ButtonVariant::Secondary, cx)
+    button(id, label, ButtonVariant::Outline, cx)
         .disabled(disabled)
         .w_full()
         .justify_between()
+        .bg(cx.omarchy().normal_fill())
         .child(icon(IconName::ChevronDown).size(px(14.)))
 }
 
