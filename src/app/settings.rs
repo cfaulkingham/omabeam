@@ -196,8 +196,8 @@ pub(super) fn field(
         .flex()
         .flex_col()
         .gap_1()
-        .min_w(px(145.))
-        .flex_1()
+        .w(px(180.))
+        .flex_none()
         .child(
             div()
                 .text_xs()
