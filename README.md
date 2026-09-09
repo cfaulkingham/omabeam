@@ -6,8 +6,6 @@
 
 OmaBeam is a screen-sharing plugin for Omarchy and Hyprland. Choose a source,
 preview what others will see, and share a browser link over your local network.
-The native picker, browser viewer, nearby-device window, and Omarchy bar panel
-share the same four-tile mark and Omarchy colors.
 
 ## Features
 
