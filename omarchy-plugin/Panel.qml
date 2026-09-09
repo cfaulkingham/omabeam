@@ -43,7 +43,10 @@ Shell.Panel {
   }
   function toggle() { root.opened ? root.close() : root.open() }
   function setCenterHoverRevealSuppressed(value) {
-    if (root.bar && "centerHoverRevealSuppressed" in root.bar) root.bar.centerHoverRevealSuppressed = value
+    if (root.bar && typeof root.bar.setCenterHoverRevealSuppressed === "function")
+      root.bar.setCenterHoverRevealSuppressed(value)
+    else if (root.bar && "centerHoverRevealSuppressed" in root.bar)
+      root.bar.centerHoverRevealSuppressed = value
   }
   function switchPanel(direction) {
     if (root.bar && typeof root.bar.switchPanelFrom === "function")
