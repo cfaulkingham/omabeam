@@ -40,7 +40,7 @@ impl OmaBeam {
             StreamPreset::ALL[*index].apply(&mut this.live_config);
             cx.notify();
         });
-        let quality = menu(
+        let preset_menu = menu(
             "quality-menu",
             dropdown(
                 "quality",
@@ -71,49 +71,52 @@ impl OmaBeam {
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_1()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(cx.omarchy().secondary)
-                            .child("Quality"),
+                            .text_sm()
+                            .font_weight(gpui_kit::FontWeight::MEDIUM)
+                            .child("Stream settings"),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .items_start()
-                            .gap_3()
-                            .child(div().w(px(160.)).child(quality))
+                        button("advanced", "Advanced", ButtonVariant::Secondary, cx)
+                            .px(px(4.))
+                            .gap(px(4.))
+                            .text_color(cx.omarchy().secondary)
                             .child(
-                                switch(
-                                    "stream-cursor",
-                                    "Show cursor",
-                                    self.live_config.cursor,
-                                    cx,
-                                )
+                                icon(if self.show_advanced {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .size(px(18.)),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.show_advanced = !this.show_advanced;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_start()
+                    .gap_3()
+                    .px_3()
+                    .child(field("Preset", preset_menu, cx))
+                    .child(field(
+                        "Cursor",
+                        div().h(px(28.)).flex().items_center().child(
+                            switch("stream-cursor", "Show cursor", self.live_config.cursor, cx)
                                 .on_change(move |value, _, window, cx| {
                                     cursor_changed(&value, window, cx)
                                 }),
-                            )
-                            .child(
-                                button(
-                                    "advanced",
-                                    if self.show_advanced {
-                                        "▾ Advanced"
-                                    } else {
-                                        "▸ Advanced"
-                                    },
-                                    ButtonVariant::Outline,
-                                    cx,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_advanced = !this.show_advanced;
-                                    cx.notify();
-                                })),
-                            ),
-                    ),
+                        ),
+                        cx,
+                    )),
             )
             .when(self.show_advanced, |root| {
                 root.child(self.render_advanced(cx))
@@ -179,6 +182,8 @@ impl OmaBeam {
             move |index, window, cx| changed(&index, window, cx),
         );
         div().flex().flex_col().gap_2().p_3().bg(cx.omarchy().inset)
+            .border_1()
+            .border_color(cx.omarchy().divider())
             .child(div().flex().flex_wrap().gap_3()
                 .child(field("Frame rate", fps_menu, cx))
                 .child(field("JPEG quality", jpeg_menu, cx))
