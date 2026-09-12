@@ -76,6 +76,30 @@ impl OmaBeam {
                 cx.notify();
             }
         });
+        let webrtc = self.live_config.webrtc;
+        let transport_changed = cx.listener(|this, index: &usize, _, cx| {
+            this.live_config.webrtc = *index == 1;
+            cx.notify();
+        });
+        let transport_menu = menu(
+            "transport-menu",
+            dropdown(
+                "transport",
+                if webrtc { "H.264 / WebRTC" } else { "JPEG" },
+                self.busy,
+                cx,
+            ),
+            ["JPEG", "H.264 / WebRTC"]
+                .iter()
+                .enumerate()
+                .map(|(i, label)| {
+                    MenuItem::new(*label)
+                        .checked(webrtc == (i == 1))
+                        .disabled(self.busy)
+                })
+                .collect(),
+            move |index, window, cx| transport_changed(&index, window, cx),
+        );
         div()
             .flex()
             .flex_col()
@@ -119,6 +143,7 @@ impl OmaBeam {
                     .gap_3()
                     .px_3()
                     .child(field("Preset", preset_menu, cx))
+                    .child(field("Video transport", transport_menu, cx))
                     .child(field(
                         "Cursor",
                         div().h(px(28.)).flex().items_center().child(
@@ -212,6 +237,30 @@ impl OmaBeam {
                 .collect(),
             move |index, window, cx| changed(&index, window, cx),
         );
+        let bitrates = [2_000_000, 4_000_000, 8_000_000, 16_000_000];
+        let bitrate = self.live_config.h264_bitrate;
+        let changed = cx.listener(move |this, index: &usize, _, cx| {
+            this.live_config.h264_bitrate = bitrates[*index];
+            cx.notify();
+        });
+        let bitrate_menu = menu(
+            "bitrate-menu",
+            dropdown(
+                "bitrate",
+                format!("{} Mbit/s", bitrate as f64 / 1_000_000.0),
+                self.busy,
+                cx,
+            ),
+            bitrates
+                .iter()
+                .map(|v| {
+                    MenuItem::new(format!("{} Mbit/s", v / 1_000_000))
+                        .checked(*v == bitrate)
+                        .disabled(self.busy)
+                })
+                .collect(),
+            move |index, window, cx| changed(&index, window, cx),
+        );
         div().flex().flex_col().gap_2().p_3().bg(cx.omarchy().inset)
             .border_1()
             .border_color(cx.omarchy().divider())
@@ -219,7 +268,10 @@ impl OmaBeam {
                 .child(field("Frame rate", fps_menu, cx))
                 .child(field("JPEG quality", jpeg_menu, cx))
                 .child(field("Maximum width", width_menu, cx))
-                .child(field("Pixel detail", pixel_menu, cx)))
+                .child(field("Pixel detail", pixel_menu, cx))
+                .when(self.live_config.webrtc, |row| row.child(field("H.264 target bitrate", bitrate_menu, cx))))
+            .when(self.live_config.webrtc, |root| root.child(div().text_xs().text_color(cx.omarchy().secondary)
+                .child("H.264 uses a software encoder and a separate UDP connection. Viewers fall back to JPEG when needed. Preview and snapshots use JPEG.")))
             .child(div().text_xs().text_color(cx.omarchy().secondary)
                 .child("Native pixels preserve fine text on scaled displays and use more bandwidth. Maximum width still applies."))
             .child(div().text_xs().text_color(cx.omarchy().secondary).child(if self.live_config.bind.is_loopback() {

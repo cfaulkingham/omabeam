@@ -58,6 +58,11 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
         "1280",
         "--cursor",
         "--native-pixels",
+        "--webrtc",
+        "--webrtc-port",
+        "0",
+        "--h264-bitrate",
+        "8000000",
         "--bind",
         "::1",
         "--port",
@@ -66,7 +71,9 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
     .unwrap();
     assert_eq!(rest, args(&["--live", "output", "DP-1"]));
     assert_eq!(config.fps, 30);
-    assert!(config.cursor);
+    assert!(config.cursor && config.webrtc);
+    assert_eq!(config.h264_bitrate, 8_000_000);
+    assert_eq!(config.webrtc_port, 0);
     assert_eq!(config.pixel_mode, omabeam_capture::PixelMode::Native);
     assert_eq!(
         LiveConfig::parse_args(&config.to_cli_args()).unwrap().0,
@@ -81,6 +88,9 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
         vec!["--bind", "invalid"],
         vec!["--fps"],
         vec!["--wat"],
+        vec!["--webrtc-port", "65536"],
+        vec!["--h264-bitrate", "0"],
+        vec!["--h264-bitrate", "50000001"],
     ] {
         assert!(LiveConfig::parse_args(&args(&input)).is_err(), "{input:?}");
     }
@@ -408,4 +418,32 @@ fn streams_a_jpeg_from_the_active_monitor() {
             .starts_with(&[0xff, 0xd8])
     );
     session.stop();
+}
+
+#[test]
+fn rtc_only_capture_encodes_jpeg_on_demand_and_clears_pixels_on_source_loss() {
+    let frames = FrameState::new("RTC source".into());
+    let config = LiveConfig {
+        webrtc: true,
+        max_width: Some(321),
+        ..Default::default()
+    };
+    publish_frame(
+        &frames,
+        omabeam_capture::demo_frame(1),
+        &config,
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert!(frames.inner.lock().unwrap().jpeg.is_empty());
+    assert_eq!(frames.stats().diagnostics.encode_ms.samples, 0);
+    let (jpeg, generation, encoded_at) = frames.jpeg_frame().unwrap();
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+    assert_eq!(generation, 1);
+    assert_eq!(frames.stats().diagnostics.encode_ms.samples, 1);
+    assert!(Arc::ptr_eq(&jpeg, &frames.jpeg_frame().unwrap().0));
+    assert_eq!(frames.jpeg_frame().unwrap().2, encoded_at);
+    frames.fail("selected window closed".into());
+    assert!(frames.jpeg_frame().unwrap().0.is_empty());
+    assert!(frames.inner.lock().unwrap().raw.is_none());
 }

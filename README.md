@@ -82,7 +82,7 @@ source. Stop sharing before `omarchy plugin remove` if you can still run
 
 1. Open OmaBeam from the bar or **Super + Shift + T**.
 2. Choose **Window**, **Screen**, or **Area**, then check the preview.
-3. Set quality and cursor visibility.
+3. Set quality, video transport, and cursor visibility.
 4. Select **Start sharing**. The picker closes and copies the browser link.
 5. Open the link on another computer, or use **Send nearby** in the bar panel.
 
@@ -97,16 +97,40 @@ and Smooth motion. Advanced exposes individual settings.
 Crisp text uses native captured pixels at JPEG quality 90, preserving fine
 detail on HiDPI displays. Balanced and Smooth motion use logical pixels.
 Advanced → Pixel detail lets you choose either mode; Maximum width caps the
-encoded image in that mode. Preview uses the same settings as the stream.
+encoded image in that mode. Preview uses the same pixel grid and width cap as the stream.
 Native pixels can increase CPU use and bandwidth. PNG screenshots always
 keep capture resolution.
 
 Open **Stream diagnostics** in the browser viewer to see captured and encoded
 sizes, capture/encode timing, outgoing bandwidth, and delivery counters for
-each viewer connection. The main FPS value counts encoded frames on the host.
+each JPEG viewer connection. The main FPS value counts captured frames published on the host.
 Sent frames measure socket writes; they do not measure browser playback or
 end-to-end latency. Capture wait includes waiting for screen changes, so a
 static source can report 0 FPS without a problem.
+
+Choose **Video transport → H.264 / WebRTC** for optional compressed video.
+JPEG remains the default. WebRTC uses a built-in OpenH264 software encoder
+with a 4 Mbit/s target; Advanced lets you adjust the target bitrate. There is
+no hardware acceleration yet. The browser automatically falls back to JPEG
+if H.264 negotiation or playback fails, and offers **Retry H.264**. Click
+**Video: Auto** to select JPEG manually. Pause releases the connection.
+
+H.264 uses 4:2:0 color, which can soften fine colored text. Preview and browser
+snapshots remain JPEG; PNG screenshots are unchanged. Odd image dimensions
+are padded by one pixel for H.264. Unsupported sizes fall back to JPEG without
+silently lowering the selected resolution. WebRTC diagnostics show the
+encoder, connected peers, bandwidth, and this browser's decoded codec/FPS.
+Decode and jitter-buffer times do not measure end-to-end latency.
+
+WebRTC needs UDP **9848** as well as the HTTP port. `--webrtc-port` changes
+the UDP port; `0` selects an available one. Media uses encrypted DTLS-SRTP;
+the page, signaling, and JPEG fallback still use plain HTTP. This mode uses
+local host candidates only, with no external STUN/TURN servers. A TCP-only
+SSH tunnel uses JPEG fallback. Up to eight WebRTC viewers can connect.
+
+```bash
+omabeam --webrtc --fps 30 --width 1280 --h264-bitrate 4000000
+```
 
 Links use a fresh random token and plain HTTP. Anyone on the local network
 with the link can view the share. If a firewall blocks viewers, allow TCP 9847

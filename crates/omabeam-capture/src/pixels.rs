@@ -225,6 +225,15 @@ impl CapturedFrame {
         mode: PixelMode,
     ) -> Result<(Vec<u8>, u32, u32)> {
         ensure!((1..=95).contains(&quality), "invalid JPEG quality");
+        let rgb = self.stream_rgb(max_width, mode)?;
+        let (width, height) = rgb.dimensions();
+        let mut bytes = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
+            .encode_image(&rgb)?;
+        Ok((bytes, width, height))
+    }
+
+    pub fn stream_dimensions(&self, max_width: Option<u32>, mode: PixelMode) -> Result<(u32, u32)> {
         let (base_width, base_height) = match mode {
             PixelMode::Logical => (self.logical_width, self.logical_height),
             PixelMode::Native => self.image.dimensions(),
@@ -237,6 +246,12 @@ impl CapturedFrame {
         let width = max_width.map_or(base_width, |w| w.min(base_width));
         let height =
             (u64::from(base_height) * u64::from(width) / u64::from(base_width)).max(1) as u32;
+        Ok((width, height))
+    }
+
+    /// Shared scaling and alpha compositing for JPEG and H.264 encoders.
+    pub fn stream_rgb(&self, max_width: Option<u32>, mode: PixelMode) -> Result<image::RgbImage> {
+        let (width, height) = self.stream_dimensions(max_width, mode)?;
         let image = if self.image.dimensions() == (width, height) {
             std::borrow::Cow::Borrowed(&self.image)
         } else {
@@ -256,10 +271,7 @@ impl CapturedFrame {
                 ((p[2] as u16 * p[3] as u16) / 255) as u8,
             ])
         });
-        let mut bytes = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, quality)
-            .encode_image(&rgb)?;
-        Ok((bytes, width, height))
+        Ok(rgb)
     }
 }
 

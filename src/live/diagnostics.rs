@@ -78,10 +78,10 @@ impl Default for FrameMeasurement {
 }
 
 #[derive(Default)]
-struct Timings(VecDeque<(Instant, f64)>);
+pub(super) struct Timings(VecDeque<(Instant, f64)>);
 
 impl Timings {
-    fn record(&mut self, now: Instant, elapsed: Duration) {
+    pub(super) fn record(&mut self, now: Instant, elapsed: Duration) {
         self.0.push_back((now, elapsed.as_secs_f64() * 1000.0));
         while self.0.len() > MAX_TIMINGS
             || self
@@ -93,7 +93,7 @@ impl Timings {
         }
     }
 
-    fn stats(&self, now: Instant) -> TimingStats {
+    pub(super) fn stats(&self, now: Instant) -> TimingStats {
         let mut values: Vec<_> = self
             .0
             .iter()
@@ -117,20 +117,20 @@ struct Bucket {
     frames: u64,
 }
 
-struct Rate {
+pub(super) struct Rate {
     started: Instant,
     buckets: VecDeque<Bucket>,
 }
 
 impl Rate {
-    fn new(now: Instant) -> Self {
+    pub(super) fn new(now: Instant) -> Self {
         Self {
             started: now,
             buckets: VecDeque::new(),
         }
     }
 
-    fn record(&mut self, now: Instant, bytes: u64, frames: u64) {
+    pub(super) fn record(&mut self, now: Instant, bytes: u64, frames: u64) {
         while self
             .buckets
             .front()
@@ -154,7 +154,7 @@ impl Rate {
         bucket.frames += frames;
     }
 
-    fn values(&self, now: Instant) -> (f64, f64) {
+    pub(super) fn values(&self, now: Instant) -> (f64, f64) {
         let (bytes, frames) = self
             .buckets
             .iter()
@@ -245,9 +245,16 @@ impl DiagnosticsState {
 
     pub fn publish(&mut self, now: Instant, jpeg_bytes: usize, measurement: FrameMeasurement) {
         self.capture_wait.record(now, measurement.capture_wait);
-        self.encode.record(now, measurement.encode);
+        if jpeg_bytes > 0 {
+            self.encode.record(now, measurement.encode);
+        }
         self.jpeg_bytes = jpeg_bytes;
         self.latest = measurement;
+    }
+
+    pub fn jpeg_encoded(&mut self, now: Instant, bytes: usize, elapsed: Duration) {
+        self.jpeg_bytes = bytes;
+        self.encode.record(now, elapsed);
     }
 
     pub fn add_viewer(&mut self, now: Instant) -> u64 {

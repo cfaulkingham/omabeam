@@ -3,7 +3,7 @@
 ## Build and run
 
 Use a current stable Rust toolchain with edition 2024 support. Linux builds
-need a C/C++ toolchain, Clang, CMake, pkg-config, Fontconfig, FreeType, Wayland,
+need a C/C++ toolchain, Clang, CMake, NASM (x86 H.264 assembly), pkg-config, Fontconfig, FreeType, Wayland,
 libxkbcommon, libxcb, and OpenSSL development libraries. CI lists the Ubuntu
 package names.
 
@@ -21,7 +21,7 @@ cargo run --locked -- --demo-picker
 ```
 
 `--demo` sends generated frames over localhost through the real encoder and
-HTTP server. `--demo-picker` uses synthetic sources with sharing disabled.
+HTTP/WebRTC server. `--demo-picker` uses synthetic sources with sharing disabled.
 
 ## Source layout
 
@@ -29,6 +29,7 @@ HTTP server. `--demo-picker` uses synthetic sources with sharing disabled.
 | --- | --- |
 | `src/app/` | Picker, preview worker, branding, settings, nearby-device UI |
 | `src/live/` | Browser viewer, HTTP delivery, stream settings and state |
+| `src/live/webrtc.rs`, `src/live/webrtc/encoder.rs` | LAN ICE/DTLS/RTP peers and shared software H.264 encoder |
 | `src/localsend.rs` | Discovery and viewer-link sending |
 | `src/hypr/` and `src/hypr.rs` | Hyprland IPC and picker positioning |
 | `src/portal.rs` | Portal selection and stdout protocol |
@@ -91,14 +92,14 @@ target/debug/omabeam --live region DP-1 20 30 400 300 --fps 15
 
 The token-protected `/s/TOKEN/stats` response retains the original stream
 fields and adds `diagnostics` plus `clients` for active stream connections.
-`--status` and `live.json` include the aggregate `diagnostics` object only,
+`--status` and `live.json` include aggregate `diagnostics` and optional `webrtc` objects,
 keeping the status file within its 8192-byte limit. Old status files without
 diagnostics remain readable. No IP addresses or device identifiers are stored
 in the viewer counters; IDs identify connections within the current session.
 
-- `fps` counts frames published after encoding, not frames displayed remotely.
+- `fps` counts captured frames published to the stream, not frames displayed remotely.
 - `native_pixels`, `capture_width/height`, `logical_width/height`, and
-  `jpeg_bytes` describe the latest encoded frame. Existing `width/height`
+  `jpeg_bytes` describe the latest capture and its cached JPEG (zero until requested in RTC-only mode). Existing `width/height`
   describe the actual stream dimensions after the width cap.
 - `capture_wait_ms` times successful calls to the capturer, including waiting
   for compositor damage and copying/converting pixels. It is not a GPU capture
@@ -128,6 +129,51 @@ on disconnect; timing and rate windows expire during idle periods. The browser
 labels these as sender measurements and keeps the detailed panel collapsed
 until requested.
 
+### H.264 over WebRTC
+
+`--webrtc` opts into software OpenH264, built from source into the binary;
+there is no runtime FFmpeg or encoder download. `str0m` supplies ICE-lite,
+DTLS-SRTP, RTP H.264 packetization, retransmission, and feedback. Only one
+receive-only video track, constrained-baseline H.264, and packetization mode
+1 are negotiated. Audio, data channels, incoming media, and remote control
+are outside this mode.
+
+Capture publishes one latest raw frame. With only WebRTC viewers, JPEG
+encoding is deferred until a snapshot/fallback asks for it. One encoder
+worker sends frames through a capacity-one queue; on a dropped encoded frame
+it forces an IDR before delivering another delta. New peers and PLI/FIR
+request an IDR even on a static screen. Static content repeats once a second.
+Resolution changes reinitialize OpenH264. I420 requires even dimensions;
+odd right/bottom edges are extended by one pixel. The encoder supports up to
+3840×2160 (or portrait), at least 16 pixels per edge, and at most 60 FPS; errors disable WebRTC for that share and leave JPEG
+available. A new share can retry the encoder.
+
+One network worker multiplexes at most eight peers. It drains str0m outputs
+after every input or media write. UDP sockets bind concrete addresses within
+`--bind` (default port 9848); no discovery server, STUN, TURN, or arbitrary
+external relay is used. Pending offers expire after 12 seconds. The signaling
+command queue holds at most 16 commands; JSON bodies are limited to 64 KiB
+with the HTTP five-second deadline. Offer/close endpoints require the share
+token, JSON, and matching Origin/Host when Origin is present. A separate
+random identifier controls each peer's close request.
+
+Each peer's retransmission cache is capped at 512 packets. A send queue over
+2 MiB or 250 ms disconnects the peer instead of accumulating video latency.
+An encoded frame over 2 MiB disables H.264 for the share. Viewer negotiation
+has a ten-second first-playback deadline, then falls back to JPEG; stalled
+decoding also falls back. Pause, page exit, source loss, and stale async
+answers release peer resources.
+
+The `webrtc` stats object reports software encoder timings, dimensions,
+encoded FPS/frames/keyframes, dropped frames, connected/pending peers,
+failures, and UDP bytes/rates (including DTLS/RTCP and retransmissions).
+Existing `diagnostics` delivery counters remain JPEG-only. Browser
+`RTCPeerConnection.getStats()` supplies actual decoded FPS/codec, receive
+bitrate, loss, jitter, and average decode/jitter-buffer time. These are not
+synchronized capture-to-display latency measurements. HTTP signaling remains
+unencrypted, so DTLS-SRTP does not authenticate the link against an active
+network attacker; use this on a trusted LAN.
+
 ## Automated checks
 
 ```bash
@@ -137,10 +183,16 @@ cargo build --locked
 python3 tests/packaging.py
 python3 -m venv /tmp/omabeam-tests
 /tmp/omabeam-tests/bin/pip install 'Pillow>=10,<13' 'playwright>=1.50,<2' 'PySide6-Essentials>=6.8,<6.11'
-/tmp/omabeam-tests/bin/python -m playwright install chromium
+/tmp/omabeam-tests/bin/python -m playwright install chromium chrome
 /tmp/omabeam-tests/bin/python tests/smoke.py --binary target/debug/omabeam --browser
+/tmp/omabeam-tests/bin/python tests/webrtc.py --binary target/debug/omabeam
 /tmp/omabeam-tests/bin/python tests/omarchy_ui.py --screenshots target/omarchy-qa
 ```
+
+The WebRTC test needs a Chromium/Chrome build exposing H.264 in
+`RTCRtpReceiver.getCapabilities("video")`. It prefers system Chrome/Chromium;
+set `OMABEAM_TEST_CHROMIUM` or `--browser-executable` to select another build.
+Playwright's bundled Chromium can lack H.264 and will exercise fallback only.
 
 Rust tests cover capture protocols, stable window identity, errors, buffer
 reuse, HTTP delivery, and IPC. Browser tests cover playback controls and

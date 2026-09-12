@@ -114,7 +114,7 @@ def browser_check(server, screenshot):
             page.wait_for_function('document.querySelector("#client-rows tr td").textContent.startsWith("Viewer ")')
             assert page.locator('#diag-capture').inner_text() == '640×360'
             assert page.locator('#diag-encoded').inner_text() == '640×360'
-            assert 'encoded fps' in page.locator('#metrics').inner_text()
+            assert 'capture fps' in page.locator('#metrics').inner_text()
             assert 'ms' in page.locator('#diag-encode').inner_text()
             assert 'Mbit/s' in page.locator('#diag-bandwidth').inner_text()
             assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
@@ -125,7 +125,7 @@ def browser_check(server, screenshot):
                 page.set_viewport_size({'width': 480, 'height': 380})
             page.get_by_role('button', name='Pause', exact=True).click()
             eventually(lambda: server.stats()['viewers'] == 0)
-            page.get_by_text('No active viewer connections', exact=True).wait_for()
+            page.get_by_text('No active JPEG connections', exact=True).wait_for()
             assert page.locator('#status').inner_text() == 'Paused'
             page.get_by_text('Stream diagnostics', exact=True).click()
             page.get_by_role('button', name='Resume', exact=True).click()

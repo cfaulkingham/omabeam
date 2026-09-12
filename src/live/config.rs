@@ -11,6 +11,9 @@ pub struct LiveConfig {
     pub quality: u8,
     pub max_width: Option<u32>,
     pub pixel_mode: PixelMode,
+    pub webrtc: bool,
+    pub webrtc_port: u16,
+    pub h264_bitrate: u32,
     pub cursor: bool,
     pub bind: IpAddr,
     pub port: u16,
@@ -23,6 +26,9 @@ impl Default for LiveConfig {
             quality: 55,
             max_width: None,
             pixel_mode: PixelMode::Logical,
+            webrtc: false,
+            webrtc_port: 9848,
+            h264_bitrate: 4_000_000,
             cursor: false,
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: super::LIVE_PORT,
@@ -32,6 +38,10 @@ impl Default for LiveConfig {
 
 impl LiveConfig {
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (100_000..=50_000_000).contains(&self.h264_bitrate),
+            "H.264 bitrate must be between 100000 and 50000000 bits/s"
+        );
         ensure!(
             (1..=120).contains(&self.fps),
             "FPS must be between 1 and 120"
@@ -68,11 +78,19 @@ impl LiveConfig {
                 }
                 "--cursor" => config.cursor = true,
                 "--native-pixels" => config.pixel_mode = PixelMode::Native,
-                "--fps" | "--quality" | "--width" | "--bind" | "--port" => {
+                "--webrtc" => config.webrtc = true,
+                "--fps" | "--quality" | "--width" | "--bind" | "--port" | "--webrtc-port"
+                | "--h264-bitrate" => {
                     let value = args
                         .next()
                         .with_context(|| format!("{arg} needs a value"))?;
                     match arg.as_str() {
+                        "--webrtc-port" => {
+                            config.webrtc_port = value.parse().context("invalid WebRTC UDP port")?
+                        }
+                        "--h264-bitrate" => {
+                            config.h264_bitrate = value.parse().context("invalid H.264 bitrate")?
+                        }
                         "--fps" => config.fps = value.parse().context("invalid FPS")?,
                         "--quality" => {
                             config.quality = value.parse().context("invalid JPEG quality")?
@@ -134,12 +152,19 @@ impl LiveConfig {
             self.bind.to_string(),
             "--port".into(),
             self.port.to_string(),
+            "--webrtc-port".into(),
+            self.webrtc_port.to_string(),
+            "--h264-bitrate".into(),
+            self.h264_bitrate.to_string(),
         ];
         if let Some(width) = self.max_width {
             args.extend(["--width".into(), width.to_string()]);
         }
         if self.cursor {
             args.push("--cursor".into());
+        }
+        if self.webrtc {
+            args.push("--webrtc".into());
         }
         if self.pixel_mode == PixelMode::Native {
             args.push("--native-pixels".into());

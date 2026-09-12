@@ -7,6 +7,7 @@ mod state;
 pub(crate) mod status;
 #[cfg(test)]
 mod tests;
+mod webrtc;
 
 use crate::{capture::CaptureRequest, portal::Selection};
 use anyhow::{Context, Result, bail, ensure};
@@ -29,6 +30,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+pub use webrtc::WebRtcStats;
 
 const BOUNDARY: &str = "omabeamframe";
 pub const LIVE_PORT: u16 = 9847;
@@ -247,6 +249,7 @@ pub struct LiveSession {
     frames: Arc<FrameState>,
     capture: Option<JoinHandle<()>>,
     server: Option<JoinHandle<()>>,
+    rtc_worker: Option<JoinHandle<()>>,
 }
 
 impl LiveSession {
@@ -297,11 +300,26 @@ impl LiveSession {
         let frames = Arc::new(FrameState::new(title.clone()));
         publish_frame(&frames, first, &config, first_capture_wait)?;
         let stop = Arc::new(AtomicBool::new(false));
+        let mut rtc_worker = if config.webrtc {
+            Some(webrtc::start(&config, &frames, &stop)?)
+        } else {
+            None
+        };
         let capture_frames = frames.clone();
         let capture_stop = stop.clone();
-        let capture = thread::Builder::new()
+        let capture = match thread::Builder::new()
             .name("omabeam-capture".into())
-            .spawn(move || capture_loop(next, config, capture_frames, capture_stop))?;
+            .spawn(move || capture_loop(next, config, capture_frames, capture_stop))
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                stop.store(true, Ordering::SeqCst);
+                if let Some(worker) = rtc_worker.take() {
+                    let _ = worker.join();
+                }
+                return Err(error.into());
+            }
+        };
         let server_frames = frames.clone();
         let server_stop = stop.clone();
         let server = match thread::Builder::new()
@@ -313,6 +331,9 @@ impl LiveSession {
                 stop.store(true, Ordering::SeqCst);
                 frames.tick.notify_all();
                 let _ = capture.join();
+                if let Some(worker) = rtc_worker.take() {
+                    let _ = worker.join();
+                }
                 return Err(error.into());
             }
         };
@@ -323,6 +344,7 @@ impl LiveSession {
             frames,
             capture: Some(capture),
             server: Some(server),
+            rtc_worker,
         };
         write_live_status(&session.status())?;
         Ok(session)
@@ -356,6 +378,9 @@ impl Drop for LiveSession {
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
+        if let Some(worker) = self.rtc_worker.take() {
+            let _ = worker.join();
+        }
         if failed {
             let _ = write_live_status(&self.status());
         } else {
@@ -371,8 +396,14 @@ fn publish_frame(
     capture_wait: Duration,
 ) -> Result<()> {
     let encode_started_at = Instant::now();
-    let (jpeg, width, height) =
-        frame.jpeg_with_mode(config.quality, config.max_width, config.pixel_mode)?;
+    let (width, height) = frame.stream_dimensions(config.max_width, config.pixel_mode)?;
+    let jpeg = if !config.webrtc || frames.viewers.load(Ordering::SeqCst) > 0 {
+        frame
+            .jpeg_with_mode(config.quality, config.max_width, config.pixel_mode)?
+            .0
+    } else {
+        Vec::new()
+    };
     let measurement = FrameMeasurement {
         pixel_mode: config.pixel_mode,
         capture_width: frame.image.width(),
@@ -383,7 +414,13 @@ fn publish_frame(
         encode: encode_started_at.elapsed(),
         encode_started_at,
     };
-    frames.publish(jpeg, width, height, measurement);
+    let raw = config.webrtc.then(|| {
+        Arc::new(webrtc::RawFrame {
+            frame,
+            config: config.clone(),
+        })
+    });
+    frames.publish_raw(jpeg, width, height, measurement, raw);
     Ok(())
 }
 
@@ -410,7 +447,7 @@ fn capture_loop(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                let interval = config.interval(frames.viewers.load(Ordering::SeqCst));
+                let interval = config.interval(frames.viewer_count());
                 let Some(left) = interval
                     .checked_sub(started.elapsed())
                     .filter(|d| !d.is_zero())

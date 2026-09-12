@@ -24,10 +24,13 @@ pub struct StreamStats {
     pub error: Option<String>,
     #[serde(default)]
     pub diagnostics: StreamDiagnostics,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webrtc: Option<super::WebRtcStats>,
 }
 
 pub(super) struct FrameData {
     pub jpeg: Arc<[u8]>,
+    pub raw: Option<Arc<super::webrtc::RawFrame>>,
     pub generation: u64,
     pub width: u32,
     pub height: u32,
@@ -43,6 +46,8 @@ pub(super) struct FrameState {
     pub inner: Mutex<FrameData>,
     pub tick: Condvar,
     pub viewers: AtomicUsize,
+    pub rtc: Mutex<Option<Arc<super::webrtc::Service>>>,
+    jpeg_encode: Mutex<()>,
     source: String,
 }
 
@@ -51,6 +56,7 @@ impl FrameState {
         Self {
             inner: Mutex::new(FrameData {
                 jpeg: Arc::from([]),
+                raw: None,
                 generation: 0,
                 width: 0,
                 height: 0,
@@ -63,10 +69,23 @@ impl FrameState {
             }),
             tick: Condvar::new(),
             viewers: AtomicUsize::new(0),
+            rtc: Mutex::new(None),
+            jpeg_encode: Mutex::new(()),
             source,
         }
     }
+    #[cfg(test)]
     pub fn publish(&self, jpeg: Vec<u8>, width: u32, height: u32, measurement: FrameMeasurement) {
+        self.publish_raw(jpeg, width, height, measurement, None);
+    }
+    pub fn publish_raw(
+        &self,
+        jpeg: Vec<u8>,
+        width: u32,
+        height: u32,
+        measurement: FrameMeasurement,
+        raw: Option<Arc<super::webrtc::RawFrame>>,
+    ) {
         let mut data = self.inner.lock().unwrap();
         if data.ended.is_some() {
             return;
@@ -75,6 +94,7 @@ impl FrameState {
         data.encode_started_at = measurement.encode_started_at;
         data.diagnostics.publish(now, jpeg.len(), measurement);
         data.jpeg = jpeg.into();
+        data.raw = raw;
         data.generation += 1;
         data.width = width;
         data.height = height;
@@ -88,10 +108,20 @@ impl FrameState {
     pub fn fail(&self, error: String) {
         let mut data = self.inner.lock().unwrap();
         data.jpeg = Arc::from([]);
+        data.raw = None;
         data.ended = Some(Instant::now());
         data.error = Some(error);
         drop(data);
         self.tick.notify_all();
+    }
+    pub fn viewer_count(&self) -> usize {
+        self.viewers.load(Ordering::SeqCst)
+            + self
+                .rtc
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |rtc| rtc.connected())
     }
     pub fn stats(&self) -> StreamStats {
         let data = self.inner.lock().unwrap();
@@ -103,7 +133,7 @@ impl FrameState {
             height: data.height,
             frames: data.generation,
             uptime: data.started.elapsed().as_secs(),
-            viewers: self.viewers.load(Ordering::SeqCst),
+            viewers: self.viewer_count(),
             source: self.source.clone(),
             state: if data.ended.is_some() {
                 "ended"
@@ -113,7 +143,44 @@ impl FrameState {
             .into(),
             error: data.error.clone(),
             diagnostics: data.diagnostics.stats(now),
+            webrtc: self.rtc.lock().unwrap().as_ref().map(|rtc| rtc.stats()),
         }
+    }
+
+    /// Cache at most the latest JPEG. RTC-only viewers do not run the JPEG
+    /// encoder; snapshots and fallback connections request it on demand.
+    pub fn jpeg_frame(&self) -> anyhow::Result<(Arc<[u8]>, u64, Instant)> {
+        let _encoder = self.jpeg_encode.lock().unwrap();
+        let (raw, generation, at) = {
+            let data = self.inner.lock().unwrap();
+            if !data.jpeg.is_empty() || data.ended.is_some() {
+                return Ok((data.jpeg.clone(), data.generation, data.encode_started_at));
+            }
+            (data.raw.clone(), data.generation, data.encode_started_at)
+        };
+        let Some(raw) = raw else {
+            return Ok((Arc::from([]), generation, at));
+        };
+        let started = Instant::now();
+        let (jpeg, _, _) = raw.frame.jpeg_with_mode(
+            raw.config.quality,
+            raw.config.max_width,
+            raw.config.pixel_mode,
+        )?;
+        let jpeg: Arc<[u8]> = jpeg.into();
+        let mut data = self.inner.lock().unwrap();
+        if data.ended.is_some() {
+            return Ok((Arc::from([]), generation, at));
+        }
+        if data.generation == generation {
+            data.jpeg = jpeg.clone();
+            data.encode_started_at = started;
+            // Capture publication records capture timings separately. Lazy JPEG
+            // timings are recorded here without counting another capture.
+            data.diagnostics
+                .jpeg_encoded(Instant::now(), jpeg.len(), started.elapsed());
+        }
+        Ok((jpeg, generation, started))
     }
 
     pub fn viewer_diagnostics(&self) -> Vec<ViewerDiagnostics> {

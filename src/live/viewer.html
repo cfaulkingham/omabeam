@@ -27,11 +27,11 @@ button:hover, a[href]:hover { background: color-mix(in srgb, var(--foreground) 1
 button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 button:disabled, a:not([href]) { opacity: 0.45; cursor: default; }
 #stage { flex: 1; min-height: 0; overflow: auto; display: grid; place-items: center; position: relative; background: color-mix(in srgb, var(--background) 90%, black); }
-#stage.contain img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+#stage.contain img, #stage.contain video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
 #stage.width { display: block; }
-#stage.width img { display: block; width: 100%; height: auto; }
+#stage.width img, #stage.width video { display: block; width: 100%; height: auto; }
 #stage.actual { display: block; }
-#stage.actual img { display: block; max-width: none; max-height: none; }
+#stage.actual img, #stage.actual video { display: block; max-width: none; max-height: none; }
 #stage:fullscreen, #stage.expanded { width: 100vw; height: 100dvh; }
 #stage.expanded { position: fixed; inset: 0; z-index: 10; }
 #exit { display: none; position: fixed; top: 12px; right: 12px; z-index: 11; }
@@ -48,7 +48,7 @@ button:disabled, a:not([href]) { opacity: 0.45; cursor: default; }
   line-height: 1.1;
 }
 #view:not([src]),
-#stage.ended #view { display: none !important; }
+#stage.ended #view, #stage.ended video, [hidden] { display: none !important; }
 #stage.ended { display: grid !important; place-items: center; }
 #stage.ended #disconnected { display: block; }
 footer { flex-shrink: 0; padding: 12px 20px; font-size: 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; border-top: 1px solid var(--outline); color: var(--muted); }
@@ -89,11 +89,11 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
     <span class="brand-mark" aria-hidden="true"><svg width="17" height="17" viewBox="0 0 17 17" fill="currentColor"><rect width="7" height="7" rx="1"/><rect x="10" width="7" height="7" rx="1"/><rect y="10" width="7" height="7" rx="1"/><rect x="10" y="10" width="7" height="7" rx="1" opacity=".35"/></svg></span>
     <div><h1>OmaBeam</h1><p class="subtitle">Watch a shared window, screen, or area</p></div>
   </div>
-  <nav aria-label="Viewer controls"><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
+  <nav aria-label="Viewer controls"><button id="transport" hidden>Video: Auto</button><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
 </header>
-<main id="stage" class="contain"><img id="view" alt=""><h2 id="disconnected">OmaBeam disconnected</h2><button id="exit">Exit fullscreen</button></main>
+<main id="stage" class="contain"><img id="view" alt=""><video id="video" autoplay muted playsinline hidden></video><h2 id="disconnected">OmaBeam disconnected</h2><button id="exit">Exit fullscreen</button></main>
 <footer>
-  <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="error" role="alert"></span>
+  <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="transport-note"></span><span id="error" role="alert"></span>
   <details id="diagnostics">
     <summary>Stream diagnostics</summary>
     <div class="diagnostic-body">
@@ -104,16 +104,27 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
         <div><dt>Encoded size</dt><dd id="diag-encoded">—</dd></div>
         <div><dt>Capture wait · p50 / p95</dt><dd id="diag-wait">—</dd></div>
         <div><dt>Scale + JPEG · p50 / p95</dt><dd id="diag-encode">—</dd></div>
-        <div><dt>Socket write · p50 / p95</dt><dd id="diag-send">—</dd></div>
+        <div><dt>JPEG socket write · p50 / p95</dt><dd id="diag-send">—</dd></div>
         <div><dt>Latest JPEG</dt><dd id="diag-jpeg">—</dd></div>
-        <div><dt>Outgoing · all viewers</dt><dd id="diag-bandwidth">—</dd></div>
-        <div><dt>Stream bytes sent</dt><dd id="diag-bytes">—</dd></div>
-        <div><dt>Frames sent / skipped</dt><dd id="diag-frames">—</dd></div>
-        <div><dt>Write failures</dt><dd id="diag-errors">—</dd></div>
+        <div><dt>Outgoing · JPEG viewers</dt><dd id="diag-bandwidth">—</dd></div>
+        <div><dt>JPEG stream bytes sent</dt><dd id="diag-bytes">—</dd></div>
+        <div><dt>JPEG frames sent / skipped</dt><dd id="diag-frames">—</dd></div>
+        <div><dt>JPEG write failures</dt><dd id="diag-errors">—</dd></div>
       </dl>
+      <dl id="rtc-diagnostics" class="diagnostic-grid" hidden>
+        <div><dt>H.264 encoder</dt><dd id="rtc-encoder">—</dd></div>
+        <div><dt>H.264 encoded size / fps</dt><dd id="rtc-size">—</dd></div>
+        <div><dt>Scale + H.264 · p50 / p95</dt><dd id="rtc-encode">—</dd></div>
+        <div><dt>WebRTC peers / outgoing</dt><dd id="rtc-outgoing">—</dd></div>
+        <div><dt>This browser · codec / fps</dt><dd id="rtc-codec">—</dd></div>
+        <div><dt>This browser · received</dt><dd id="rtc-received">—</dd></div>
+        <div><dt>Packets lost / jitter</dt><dd id="rtc-loss">—</dd></div>
+        <div><dt>Average decode / jitter buffer</dt><dd id="rtc-decode">—</dd></div>
+      </dl>
+      <p id="rtc-note" class="diagnostic-note" hidden>WebRTC media uses encrypted UDP. Signaling and JPEG fallback use HTTP. Browser decode and jitter-buffer times are averages since connection and do not measure end-to-end latency. H.264 uses 4:2:0 color; JPEG may preserve small colored text better. Odd image edges are padded by one pixel.</p>
       <div class="client-table">
         <table id="clients">
-          <caption>Active viewer connections</caption>
+          <caption>Active JPEG connections</caption>
           <thead><tr><th>Viewer</th><th>Sent fps</th><th>Mbit/s</th><th>Sent / skipped</th><th>Write p95</th><th>Frame age at send</th><th>Last send</th></tr></thead>
           <tbody id="client-rows"></tbody>
         </table>
@@ -125,6 +136,9 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
 </footer>
 <script>
 const img = document.getElementById('view');
+const video = document.getElementById('video');
+const transport = document.getElementById('transport');
+const transportNote = document.getElementById('transport-note');
 const stage = document.getElementById('stage');
 const status = document.getElementById('status');
 const error = document.getElementById('error');
@@ -134,32 +148,140 @@ let latestStats = null;
 function setStatus(message, state) { status.textContent = message; document.body.dataset.state = state; }
 const fits = ['contain', 'width', 'actual'];
 const fitLabels = ['contain', 'fill width', 'actual size'];
+let pc = null, peerId = null, epoch = 0, firstFrameTimer = null;
+let preferRtc = true, fallbackReason = '', playback = 'none', browserStats = null;
+let previousInbound = null, lastDecodedAt = 0;
+function releasePeer(id) {
+  if (id) fetch('webrtc/close', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}), keepalive: true}).catch(() => {});
+}
+function stopPlayback() {
+  epoch++; clearTimeout(firstFrameTimer); firstFrameTimer = null;
+  if (pc) { pc.close(); pc = null; }
+  releasePeer(peerId); peerId = null;
+  video.pause(); video.srcObject = null; video.hidden = true;
+  img.removeAttribute('src');
+  browserStats = null; previousInbound = null; playback = 'none';
+}
+function connectJpeg(reason = '') {
+  stopPlayback();
+  if (paused || ended) return;
+  fallbackReason = reason; playback = 'jpeg';
+  transport.textContent = reason && preferRtc ? 'Retry H.264' : (preferRtc ? 'Video: Auto' : 'Video: JPEG');
+  transportNote.textContent = reason ? `JPEG fallback · ${reason}` : 'JPEG';
+  img.src = 'stream?t=' + Date.now(); setStatus('Connecting…', 'connecting');
+}
 function connect() {
   clearTimeout(retry); retry = null;
-  if (!paused && !ended) { img.src = 'stream?t=' + Date.now(); setStatus('Connecting…', 'connecting'); }
+  if (paused || ended) return;
+  if (preferRtc && latestStats?.webrtc && !latestStats.webrtc.error) connectRtc();
+  else connectJpeg(preferRtc && latestStats?.webrtc?.error ? latestStats.webrtc.error : '');
 }
 function reconnect() {
-  if (!paused && !ended && retry === null) retry = setTimeout(connect, 1500);
+  if (!paused && !ended && retry === null) retry = setTimeout(() => connectJpeg(fallbackReason), 1500);
+}
+async function connectRtc() {
+  stopPlayback();
+  if (!window.RTCPeerConnection) { connectJpeg('WebRTC unavailable in this browser'); return; }
+  const current = epoch;
+  const active = () => current === epoch && !paused && !ended;
+  const fallback = reason => { if (active()) connectJpeg(reason); };
+  playback = 'connecting'; fallbackReason = '';
+  transport.textContent = 'Video: Auto'; transportNote.textContent = 'Connecting H.264…';
+  setStatus('Connecting H.264…', 'connecting');
+  firstFrameTimer = setTimeout(() => fallback('H.264 playback timed out'), 10000);
+  try {
+    const connection = new RTCPeerConnection({iceServers: [], bundlePolicy: 'max-bundle'});
+    pc = connection;
+    const transceiver = connection.addTransceiver('video', {direction: 'recvonly'});
+    const codecs = window.RTCRtpReceiver?.getCapabilities?.('video')?.codecs.filter(c => c.mimeType.toLowerCase() === 'video/h264');
+    if (codecs && codecs.length === 0) throw new Error('This browser has no H.264 decoder');
+    if (codecs?.length && transceiver.setCodecPreferences) transceiver.setCodecPreferences(codecs);
+    connection.onconnectionstatechange = () => {
+      if (['failed', 'disconnected', 'closed'].includes(connection.connectionState)) fallback('WebRTC connection lost');
+    };
+    connection.ontrack = event => {
+      if (!active()) return;
+      video.srcObject = event.streams[0] || new MediaStream([event.track]);
+      video.onplaying = () => {
+        if (!active()) return;
+        clearTimeout(firstFrameTimer); firstFrameTimer = null;
+        video.hidden = false; playback = 'webrtc'; lastDecodedAt = performance.now();
+        transportNote.textContent = 'H.264 / WebRTC'; setStatus('Live', 'live');
+      };
+      video.play().catch(() => fallback('Browser could not play H.264'));
+    };
+    await connection.setLocalDescription(await connection.createOffer());
+    await new Promise(resolve => {
+      if (connection.iceGatheringState === 'complete') return resolve();
+      const timer = setTimeout(done, 2000);
+      function done() { clearTimeout(timer); connection.removeEventListener('icegatheringstatechange', changed); resolve(); }
+      function changed() { if (connection.iceGatheringState === 'complete') done(); }
+      connection.addEventListener('icegatheringstatechange', changed);
+    });
+    if (!active()) return;
+    const response = await fetch('webrtc/offer', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(connection.localDescription), signal: AbortSignal.timeout(4000)});
+    if (!response.ok) throw new Error((await response.text()).slice(0, 180));
+    const result = await response.json();
+    if (!active()) { releasePeer(result.id); return; }
+    peerId = result.id;
+    await connection.setRemoteDescription(result.answer);
+  } catch (error) { fallback(error.message || 'H.264 negotiation failed'); }
+}
+async function sampleBrowser() {
+  const connection = pc;
+  if (!connection) return;
+  if (['failed', 'closed', 'disconnected'].includes(connection.connectionState)) { connectJpeg('WebRTC connection lost'); return; }
+  if (connection.connectionState !== 'connected') return;
+  try {
+    const report = await connection.getStats();
+    if (connection !== pc) return;
+    const inbound = [...report.values()].find(s => s.type === 'inbound-rtp' && s.kind === 'video');
+    if (!inbound) {
+      if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) connectJpeg('H.264 playback stalled');
+      return;
+    }
+    const before = previousInbound;
+    const seconds = before ? (inbound.timestamp - before.timestamp) / 1000 : 0;
+    const frames = inbound.framesDecoded || 0;
+    if (frames > (before?.framesDecoded || 0)) lastDecodedAt = performance.now();
+    browserStats = {
+      codec: report.get(inbound.codecId)?.mimeType || 'H.264',
+      fps: seconds > 0 ? (frames - before.framesDecoded) / seconds : null,
+      mbps: seconds > 0 ? (inbound.bytesReceived - before.bytesReceived) * 8 / seconds / 1e6 : null,
+      frames, lost: inbound.packetsLost, jitter: inbound.jitter * 1000,
+      decode: frames > 0 ? inbound.totalDecodeTime * 1000 / frames : null,
+      buffer: inbound.jitterBufferEmittedCount > 0 ? inbound.jitterBufferDelay * 1000 / inbound.jitterBufferEmittedCount : null,
+    };
+    previousInbound = {timestamp: inbound.timestamp, framesDecoded: frames, bytesReceived: inbound.bytesReceived};
+    if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) connectJpeg('H.264 playback stalled');
+  } catch { /* A pause can close the peer while getStats is pending. */ }
 }
 function finish(message) {
-  ended = true; clearTimeout(retry); retry = null;
-  img.removeAttribute('src'); pause.disabled = true;
+  ended = true; clearTimeout(retry); retry = null; stopPlayback();
+  pause.disabled = true; transport.disabled = true;
   document.getElementById('snapshot').removeAttribute('href');
   stage.classList.add('ended');
   setStatus('Share ended', 'ended'); error.textContent = message;
 }
 img.onerror = () => {
-  if (!paused && !ended) {
-    img.removeAttribute('src');
-    setStatus('Reconnecting…', 'connecting');
-    reconnect();
+  if (!paused && !ended && playback === 'jpeg') {
+    img.removeAttribute('src'); setStatus('Reconnecting…', 'connecting'); reconnect();
   }
 };
 pause.onclick = () => {
   paused = !paused; clearTimeout(retry); retry = null;
   pause.textContent = paused ? 'Resume' : 'Pause';
-  if (paused) { img.removeAttribute('src'); setStatus('Paused', 'paused'); } else connect();
+  if (paused) { stopPlayback(); setStatus('Paused', 'paused'); } else connect();
 };
+transport.onclick = () => {
+  if (!fallbackReason) preferRtc = !preferRtc;
+  else preferRtc = true;
+  fallbackReason = '';
+  if (!paused) connect();
+  else transport.textContent = preferRtc ? 'Video: Auto' : 'Video: JPEG';
+};
+addEventListener('pagehide', () => { paused = true; stopPlayback(); });
 document.getElementById('fit').onclick = e => {
   stage.classList.remove(fits[fit]); fit = (fit + 1) % fits.length; stage.classList.add(fits[fit]);
   e.target.textContent = 'Fit: ' + fitLabels[fit];
@@ -181,6 +303,22 @@ const timing = value => value && value.samples > 0 ? `${number(value.p50)} / ${n
 const dimensions = (width, height) => width > 0 && height > 0 ? `${width}×${height}` : '—';
 function renderDiagnostics(stats) {
   const d = stats.diagnostics || {};
+  const rtc = stats.webrtc;
+  document.getElementById('rtc-diagnostics').hidden = !rtc;
+  document.getElementById('rtc-note').hidden = !rtc;
+  if (rtc) {
+    const values = {
+      encoder: `${rtc.encoder} · ${number(rtc.target_bitrate / 1e6)} Mbit/s target`,
+      size: `${dimensions(rtc.width, rtc.height)} · ${number(rtc.encoded_fps)} fps`,
+      encode: timing(rtc.encode_ms),
+      outgoing: `${rtc.connected} connected · ${number(rtc.outgoing_mbps, 2)} Mbit/s`,
+      codec: browserStats ? `${browserStats.codec} · ${number(browserStats.fps)} fps` : '—',
+      received: browserStats ? `${number(browserStats.mbps, 2)} Mbit/s · ${browserStats.frames} decoded` : '—',
+      loss: browserStats ? `${number(browserStats.lost, 0)} / ${milliseconds(browserStats.jitter)}` : '—',
+      decode: browserStats ? `${milliseconds(browserStats.decode)} / ${milliseconds(browserStats.buffer)}` : '—',
+    };
+    for (const [key, value] of Object.entries(values)) document.getElementById('rtc-' + key).textContent = value;
+  }
   const values = {
     pixels: typeof d.native_pixels === 'boolean' ? (d.native_pixels ? 'Native pixels' : 'Logical pixels') : '—',
     capture: dimensions(d.capture_width, d.capture_height),
@@ -208,7 +346,7 @@ function renderDiagnostics(stats) {
     rows.append(row);
   }
   if (!rows.children.length) {
-    const cell = document.createElement('td'); cell.colSpan = 7; cell.textContent = 'No active viewer connections';
+    const cell = document.createElement('td'); cell.colSpan = 7; cell.textContent = 'No active JPEG connections';
     const row = document.createElement('tr'); row.append(cell); rows.append(row);
   }
 }
@@ -220,26 +358,31 @@ async function poll() {
     const response = await fetch('stats', {cache: 'no-store', signal: AbortSignal.timeout(3000)});
     if (!response.ok) throw new Error('Status unavailable');
     const stats = await response.json(); failures = 0;
+    const initial = latestStats === null;
     latestStats = stats;
+    transport.hidden = !stats.webrtc;
+    await sampleBrowser();
+    if (initial && stats.state !== 'ended') connect();
+    if (['webrtc', 'connecting'].includes(playback) && stats.webrtc?.error) connectJpeg(stats.webrtc.error);
     if (document.getElementById('diagnostics').open) renderDiagnostics(stats);
-    document.getElementById('metrics').textContent = `${stats.width}×${stats.height} · ${stats.fps.toFixed(1)} encoded fps · ${stats.viewers} viewer${stats.viewers === 1 ? '' : 's'}`;
+    document.getElementById('metrics').textContent = `${stats.width}×${stats.height} · ${stats.fps.toFixed(1)} capture fps · ${stats.viewers} viewer${stats.viewers === 1 ? '' : 's'}`;
     document.getElementById('source').textContent = stats.source;
     error.textContent = stats.error || '';
     if (stats.state === 'ended') finish(stats.error || 'The source is no longer available.');
-    else if (!paused) setStatus(stats.fps > 0 ? 'Live' : 'Live · waiting for changes', 'live');
+    else if (!paused && playback !== 'connecting') setStatus(stats.fps > 0 ? 'Live' : 'Live · waiting for changes', 'live');
   } catch {
     if (!ended) {
       failures++;
       setStatus(paused ? 'Paused' : 'Connection lost', paused ? 'paused' : 'connecting');
       error.textContent = 'The share may have stopped. Reconnecting…';
       // Do not leave an old image presented as a live share.
-      img.removeAttribute('src'); reconnect();
+      stopPlayback(); reconnect();
       if (failures >= 5) finish('The share stopped or the connection was lost. Reload to try again.');
     }
   }
   if (!ended) setTimeout(poll, 1000);
 }
-connect(); poll();
+poll();
 </script>
 </body>
 </html>

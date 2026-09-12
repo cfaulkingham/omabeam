@@ -74,7 +74,13 @@ pub(super) fn serve(
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<String> {
+struct Request {
+    header: String,
+    buffered: Vec<u8>,
+    deadline: Instant,
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let deadline = Instant::now() + IO_DEADLINE;
     let mut header = Vec::new();
     let mut buf = [0; 1024];
@@ -89,10 +95,79 @@ fn read_request(stream: &mut TcpStream) -> Option<String> {
         if header.len() > 16 * 1024 {
             return None;
         }
-        if header.windows(4).any(|w| w == b"\r\n\r\n") {
-            return String::from_utf8(header).ok();
+        if let Some(end) = header.windows(4).position(|w| w == b"\r\n\r\n") {
+            let buffered = header.split_off(end + 4);
+            return Some(Request {
+                header: String::from_utf8(header).ok()?,
+                buffered,
+                deadline,
+            });
         }
     }
+}
+
+fn read_json_body(stream: &mut TcpStream, request: &Request) -> Option<Vec<u8>> {
+    let mut length = None;
+    let mut json = false;
+    let mut origin = None;
+    let mut host = None;
+    for line in request
+        .header
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+    {
+        let (name, value) = line.split_once(':')?;
+        let value = value.trim();
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => {
+                if length.is_some() {
+                    return None;
+                }
+                length = Some(value.parse::<usize>().ok()?);
+            }
+            "content-type" => json = value.split(';').next()?.trim() == "application/json",
+            "transfer-encoding" => return None,
+            "origin" => {
+                if origin.is_some() {
+                    return None;
+                }
+                origin = Some(value);
+            }
+            "host" => {
+                if host.is_some() {
+                    return None;
+                }
+                host = Some(value);
+            }
+            _ => {}
+        }
+    }
+    if !json
+        || origin.is_some_and(|origin| host.is_none_or(|host| origin != format!("http://{host}")))
+    {
+        return None;
+    }
+    let length = length.filter(|length| (1..=65536).contains(length))?;
+    if request.buffered.len() > length {
+        return None;
+    }
+    let mut body = request.buffered.clone();
+    while body.len() < length {
+        stream
+            .set_read_timeout(Some(
+                request.deadline.checked_duration_since(Instant::now())?,
+            ))
+            .ok()?;
+        let mut buf = [0; 4096];
+        let left = (length - body.len()).min(buf.len());
+        let count = stream.read(&mut buf[..left]).ok()?;
+        if count == 0 {
+            return None;
+        }
+        body.extend_from_slice(&buf[..count]);
+    }
+    Some(body)
 }
 
 pub(super) fn write_parts(
@@ -158,6 +233,7 @@ pub(super) fn handle_client(
         return;
     };
     let fields: Vec<_> = request
+        .header
         .lines()
         .next()
         .unwrap_or_default()
@@ -176,6 +252,72 @@ pub(super) fn handle_client(
         );
         return;
     }
+    let path = fields[1].split('?').next().unwrap_or_default();
+    // Match the complete token path before exposing any frames or diagnostics.
+    let Some(route) = path.strip_prefix(prefix) else {
+        let _ = response(&mut stream, "404 Not Found", "text/plain", b"not found", "");
+        return;
+    };
+    if fields[0] == "POST" && matches!(route, "/webrtc/offer" | "/webrtc/close") {
+        let rtc = frames.rtc.lock().unwrap().clone();
+        let Some(rtc) = rtc else {
+            let _ = response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain",
+                b"WebRTC is disabled",
+                "",
+            );
+            return;
+        };
+        if stop.load(Ordering::SeqCst) || frames.inner.lock().unwrap().ended.is_some() {
+            let _ = response(&mut stream, "410 Gone", "text/plain", b"share ended", "");
+            return;
+        }
+        let Some(body) = read_json_body(&mut stream, &request) else {
+            let _ = response(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain",
+                b"expected bounded, same-origin JSON",
+                "",
+            );
+            return;
+        };
+        let result = if route == "/webrtc/offer" {
+            rtc.offer(&body)
+        } else {
+            #[derive(serde::Deserialize)]
+            struct Close {
+                id: String,
+            }
+            serde_json::from_slice::<Close>(&body)
+                .map_err(anyhow::Error::from)
+                .and_then(|body| rtc.close(body.id))
+                .map(|_| serde_json::json!({"closed": true}))
+        };
+        match result {
+            Ok(value) => {
+                let _ = response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_vec(&value).unwrap(),
+                    "",
+                );
+            }
+            Err(error) => {
+                let _ = response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "text/plain",
+                    error.to_string().as_bytes(),
+                    "",
+                );
+            }
+        }
+        return;
+    }
     if fields[0] != "GET" {
         let _ = response(
             &mut stream,
@@ -186,12 +328,6 @@ pub(super) fn handle_client(
         );
         return;
     }
-    let path = fields[1].split('?').next().unwrap_or_default();
-    // Match the complete token path before exposing any frames or diagnostics.
-    let Some(route) = path.strip_prefix(prefix) else {
-        let _ = response(&mut stream, "404 Not Found", "text/plain", b"not found", "");
-        return;
-    };
     match route {
         "" => {
             let _ = response(
@@ -233,7 +369,10 @@ pub(super) fn handle_client(
             );
         }
         "/frame.jpg" => {
-            let jpeg = frames.inner.lock().unwrap().jpeg.clone();
+            let jpeg = frames
+                .jpeg_frame()
+                .map(|frame| frame.0)
+                .unwrap_or_else(|_| Arc::from([]));
             if jpeg.is_empty() {
                 let _ = response(
                     &mut stream,
@@ -297,17 +436,15 @@ fn write_mjpeg(stream: &mut TcpStream, frames: &FrameState, stop: &AtomicBool) -
             }
             continue;
         }
-        // Initial joins start at the latest image; older frames were never
-        // intended for this connection and must not count as skipped.
+        drop(data);
+        let (jpeg, generation, encode_started_at) =
+            frames.jpeg_frame().map_err(io::Error::other)?;
         let skipped = if last == 0 {
             0
         } else {
-            data.generation.saturating_sub(last + 1)
+            generation.saturating_sub(last + 1)
         };
-        last = data.generation;
-        let encode_started_at = data.encode_started_at;
-        let jpeg = data.jpeg.clone();
-        drop(data);
+        last = generation;
         if jpeg.is_empty() {
             continue;
         }

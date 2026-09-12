@@ -30,6 +30,7 @@ for sway_socket in "$review_runtime"/sway-ipc.*.sock; do
     if [ -S "$sway_socket" ]; then
         swaymsg -s "$sway_socket" output HEADLESS-1 scale 2 >/dev/null
         python3 tests/smoke.py --binary "$binary" --capture-output HEADLESS-1 --capture-scale 2
+        python3 tests/webrtc.py --binary "$binary" --capture-output HEADLESS-1 --sway-socket "$sway_socket"
         exit 0
     fi
 done
