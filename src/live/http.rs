@@ -1,5 +1,6 @@
 use super::{
     BOUNDARY,
+    diagnostics::SendMeasurement,
     state::{FrameState, Viewer},
 };
 use std::{
@@ -99,6 +100,15 @@ pub(super) fn write_parts(
     parts: &[&[u8]],
     timeout: Duration,
 ) -> io::Result<()> {
+    write_parts_counted(stream, parts, timeout, &mut 0)
+}
+
+fn write_parts_counted(
+    stream: &mut TcpStream,
+    parts: &[&[u8]],
+    timeout: Duration,
+    bytes_written: &mut u64,
+) -> io::Result<()> {
     let deadline = Instant::now() + timeout;
     for part in parts {
         let mut remaining = *part;
@@ -112,7 +122,10 @@ pub(super) fn write_parts(
             stream.set_write_timeout(Some(left))?;
             match stream.write(remaining) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                Ok(n) => remaining = &remaining[n..],
+                Ok(n) => {
+                    *bytes_written += n as u64;
+                    remaining = &remaining[n..];
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) => return Err(e),
             }
@@ -199,11 +212,23 @@ pub(super) fn handle_client(
             );
         }
         "/stats" => {
+            // Per-connection details are HTTP-only: keep the bounded on-disk
+            // session status small even with all 64 client slots in use.
+            #[derive(serde::Serialize)]
+            struct Response {
+                #[serde(flatten)]
+                stream: super::StreamStats,
+                clients: Vec<super::ViewerDiagnostics>,
+            }
             let _ = response(
                 &mut stream,
                 "200 OK",
                 "application/json",
-                &serde_json::to_vec(&frames.stats()).unwrap(),
+                &serde_json::to_vec(&Response {
+                    stream: frames.stats(),
+                    clients: frames.viewer_diagnostics(),
+                })
+                .unwrap(),
                 "",
             );
         }
@@ -252,7 +277,7 @@ fn write_mjpeg(stream: &mut TcpStream, frames: &FrameState, stop: &AtomicBool) -
         "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary={BOUNDARY}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
     );
     write_parts(stream, &[header.as_bytes()], IO_DEADLINE)?;
-    let _viewer = Viewer::new(frames);
+    let viewer = Viewer::new(frames);
     let mut last = 0;
     while !stop.load(Ordering::SeqCst) {
         let data = frames.inner.lock().unwrap();
@@ -272,7 +297,15 @@ fn write_mjpeg(stream: &mut TcpStream, frames: &FrameState, stop: &AtomicBool) -
             }
             continue;
         }
+        // Initial joins start at the latest image; older frames were never
+        // intended for this connection and must not count as skipped.
+        let skipped = if last == 0 {
+            0
+        } else {
+            data.generation.saturating_sub(last + 1)
+        };
         last = data.generation;
+        let encode_started_at = data.encode_started_at;
         let jpeg = data.jpeg.clone();
         drop(data);
         if jpeg.is_empty() {
@@ -282,7 +315,22 @@ fn write_mjpeg(stream: &mut TcpStream, frames: &FrameState, stop: &AtomicBool) -
             "--{BOUNDARY}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
             jpeg.len()
         );
-        write_parts(stream, &[part.as_bytes(), &jpeg, b"\r\n"], IO_DEADLINE)?;
+        let started = Instant::now();
+        let mut bytes = 0;
+        let result = write_parts_counted(
+            stream,
+            &[part.as_bytes(), &jpeg, b"\r\n"],
+            IO_DEADLINE,
+            &mut bytes,
+        );
+        viewer.record_send(SendMeasurement {
+            bytes,
+            skipped,
+            elapsed: started.elapsed(),
+            frame_age: encode_started_at.elapsed(),
+            completed: result.is_ok(),
+        });
+        result?;
     }
     Ok(())
 }
@@ -319,7 +367,103 @@ fn themed_viewer_html(theme: &gpui_omarchy::Theme) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::diagnostics::FrameMeasurement;
     use super::*;
+    use std::io::{BufRead, BufReader};
+
+    #[test]
+    fn slow_viewer_skips_old_frames_without_charging_a_new_viewer() {
+        fn connect(frames: &Arc<FrameState>) -> (BufReader<TcpStream>, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
+            let frames = frames.clone();
+            let worker = thread::spawn(move || {
+                let _ = write_mjpeg(&mut socket, &frames, &AtomicBool::new(false));
+            });
+            let mut reader = BufReader::new(client);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(!line.is_empty());
+                if line == "\r\n" {
+                    break;
+                }
+            }
+            (reader, worker)
+        }
+        fn part_length(reader: &mut BufReader<TcpStream>) -> usize {
+            let mut boundary = String::new();
+            reader.read_line(&mut boundary).unwrap();
+            assert_eq!(boundary, format!("--{BOUNDARY}\r\n"));
+            let mut length = None;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(!line.is_empty());
+                if line == "\r\n" {
+                    return length.unwrap();
+                }
+                if let Some(value) = line.strip_prefix("Content-Length: ") {
+                    length = Some(value.trim().parse().unwrap());
+                }
+            }
+        }
+        fn consume(reader: &mut BufReader<TcpStream>, length: usize) {
+            assert_eq!(
+                io::copy(&mut (&mut *reader).take(length as u64), &mut io::sink()).unwrap(),
+                length as u64
+            );
+            let mut end = [0; 2];
+            reader.read_exact(&mut end).unwrap();
+            assert_eq!(&end, b"\r\n");
+        }
+        fn until(mut ready: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let frames = Arc::new(FrameState::new("slow-reader".into()));
+        let size = 32 * 1024 * 1024; // larger than the socket send buffer
+        frames.publish(vec![1; size], 1, 1, FrameMeasurement::default());
+        let (mut slow, slow_worker) = connect(&frames);
+        assert_eq!(part_length(&mut slow), size);
+        assert_eq!(frames.stats().diagnostics.frames_sent, 0);
+        for value in [2, 3, 4] {
+            frames.publish(vec![value], 1, 1, FrameMeasurement::default());
+        }
+        let (mut fast, fast_worker) = connect(&frames);
+        assert_eq!(part_length(&mut fast), 1);
+        consume(&mut fast, 1);
+        until(|| frames.viewer_diagnostics()[1].frames_sent == 1);
+        assert_eq!(frames.viewer_diagnostics()[1].frames_skipped, 0);
+        consume(&mut slow, size);
+        assert_eq!(part_length(&mut slow), 1);
+        consume(&mut slow, 1);
+        until(|| frames.stats().diagnostics.frames_sent == 3);
+        let clients = frames.viewer_diagnostics();
+        assert_eq!(clients[0].frames_sent, 2);
+        assert_eq!(clients[0].frames_skipped, 2);
+        assert_eq!(clients[1].frames_skipped, 0);
+        assert_eq!(frames.stats().diagnostics.frames_skipped, 2);
+        assert!(frames.stats().diagnostics.bytes_sent > size as u64);
+        assert!(clients[0].frame_age_ms.is_some());
+        for client in [&slow, &fast] {
+            client.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+        }
+        drop((slow, fast));
+        slow_worker.join().unwrap();
+        fast_worker.join().unwrap();
+        assert!(frames.viewer_diagnostics().is_empty());
+        assert_eq!(frames.stats().diagnostics.frames_skipped, 2);
+    }
+
     #[test]
     fn viewer_uses_host_colors_without_inserting_theme_metadata() {
         let mut theme = gpui_omarchy::Theme::flexoki_light();

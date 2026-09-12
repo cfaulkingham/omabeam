@@ -55,6 +55,20 @@ footer { flex-shrink: 0; padding: 12px 20px; font-size: 12px; display: flex; ali
 #source, #error { overflow-wrap: anywhere; }
 #error { color: var(--urgent); }
 #error:empty { display: none; }
+#diagnostics { flex-basis: 100%; min-width: 0; }
+#diagnostics summary { cursor: pointer; width: fit-content; padding: 5px 0; color: var(--foreground); }
+#diagnostics summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.diagnostic-body { max-height: 40dvh; overflow: auto; padding-top: 6px; }
+.diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px 20px; margin: 6px 0 14px; }
+.diagnostic-grid dt { font-size: 11px; }
+.diagnostic-grid dd { margin: 4px 0 0; color: var(--foreground); font-variant-numeric: tabular-nums; }
+.diagnostic-note { line-height: 1.5; margin: 10px 0; max-width: 100ch; }
+.client-table { overflow-x: auto; }
+#clients { border-collapse: collapse; width: 100%; white-space: nowrap; text-align: left; font-variant-numeric: tabular-nums; }
+#clients caption { text-align: left; padding-bottom: 6px; color: var(--foreground); }
+#clients th, #clients td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--outline); }
+#clients th { font-size: 11px; font-weight: 500; }
+#clients td { color: var(--foreground); }
 #status { color: var(--accent); display: inline-flex; align-items: center; gap: 6px; }
 #status::before { content: ''; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 body[data-state="live"] #status, body[data-state="ended"] #status { color: var(--urgent); }
@@ -78,7 +92,37 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
   <nav aria-label="Viewer controls"><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
 </header>
 <main id="stage" class="contain"><img id="view" alt=""><h2 id="disconnected">OmaBeam disconnected</h2><button id="exit">Exit fullscreen</button></main>
-<footer><span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="error" role="alert"></span></footer>
+<footer>
+  <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="error" role="alert"></span>
+  <details id="diagnostics">
+    <summary>Stream diagnostics</summary>
+    <div class="diagnostic-body">
+      <dl class="diagnostic-grid">
+        <div><dt>Pixel detail</dt><dd id="diag-pixels">—</dd></div>
+        <div><dt>Captured pixels</dt><dd id="diag-capture">—</dd></div>
+        <div><dt>Logical size</dt><dd id="diag-logical">—</dd></div>
+        <div><dt>Encoded size</dt><dd id="diag-encoded">—</dd></div>
+        <div><dt>Capture wait · p50 / p95</dt><dd id="diag-wait">—</dd></div>
+        <div><dt>Scale + JPEG · p50 / p95</dt><dd id="diag-encode">—</dd></div>
+        <div><dt>Socket write · p50 / p95</dt><dd id="diag-send">—</dd></div>
+        <div><dt>Latest JPEG</dt><dd id="diag-jpeg">—</dd></div>
+        <div><dt>Outgoing · all viewers</dt><dd id="diag-bandwidth">—</dd></div>
+        <div><dt>Stream bytes sent</dt><dd id="diag-bytes">—</dd></div>
+        <div><dt>Frames sent / skipped</dt><dd id="diag-frames">—</dd></div>
+        <div><dt>Write failures</dt><dd id="diag-errors">—</dd></div>
+      </dl>
+      <div class="client-table">
+        <table id="clients">
+          <caption>Active viewer connections</caption>
+          <thead><tr><th>Viewer</th><th>Sent fps</th><th>Mbit/s</th><th>Sent / skipped</th><th>Write p95</th><th>Frame age at send</th><th>Last send</th></tr></thead>
+          <tbody id="client-rows"></tbody>
+        </table>
+      </div>
+      <p class="diagnostic-note">Sender measurements; network and browser buffering add delay. Frame age runs from encoding start to completed socket write, and is not display latency. Capture wait includes waiting for screen changes. Static content can report 0 fps.</p>
+      <p class="diagnostic-note">Rates cover about 2 seconds; p50 / p95 show the median and 95th percentile of up to 256 samples from the last 5 seconds. Sent, skipped, bytes, and failures are session totals. Skipped frames were replaced by newer ones before sending.</p>
+    </div>
+  </details>
+</footer>
 <script>
 const img = document.getElementById('view');
 const stage = document.getElementById('stage');
@@ -86,6 +130,7 @@ const status = document.getElementById('status');
 const error = document.getElementById('error');
 const pause = document.getElementById('pause');
 let paused = false, ended = false, retry = null, fit = 0, failures = 0;
+let latestStats = null;
 function setStatus(message, state) { status.textContent = message; document.body.dataset.state = state; }
 const fits = ['contain', 'width', 'actual'];
 const fitLabels = ['contain', 'fill width', 'actual size'];
@@ -130,12 +175,54 @@ async function exitFullscreen() {
 document.getElementById('fullscreen').onclick = fullscreen;
 document.getElementById('exit').onclick = exitFullscreen;
 addEventListener('keydown', e => { if (e.key === 'Escape') exitFullscreen(); if (e.key === 'f') fullscreen(); });
+const number = (value, digits = 1) => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—';
+const milliseconds = value => value == null ? '—' : `${number(value)} ms`;
+const timing = value => value && value.samples > 0 ? `${number(value.p50)} / ${number(value.p95)} ms` : '—';
+const dimensions = (width, height) => width > 0 && height > 0 ? `${width}×${height}` : '—';
+function renderDiagnostics(stats) {
+  const d = stats.diagnostics || {};
+  const values = {
+    pixels: typeof d.native_pixels === 'boolean' ? (d.native_pixels ? 'Native pixels' : 'Logical pixels') : '—',
+    capture: dimensions(d.capture_width, d.capture_height),
+    logical: dimensions(d.logical_width, d.logical_height),
+    encoded: dimensions(stats.width, stats.height),
+    wait: timing(d.capture_wait_ms), encode: timing(d.encode_ms), send: timing(d.send_ms),
+    jpeg: d.jpeg_bytes == null ? '—' : `${number(d.jpeg_bytes / 1024)} KiB`,
+    bandwidth: d.outgoing_mbps == null ? '—' : `${number(d.outgoing_mbps, 2)} Mbit/s`,
+    bytes: d.bytes_sent == null ? '—' : `${number(d.bytes_sent / 1048576, 2)} MiB`,
+    frames: `${number(d.frames_sent, 0)} / ${number(d.frames_skipped, 0)}`,
+    errors: number(d.write_errors, 0),
+  };
+  for (const [key, value] of Object.entries(values)) document.getElementById('diag-' + key).textContent = value;
+  const rows = document.getElementById('client-rows');
+  rows.replaceChildren();
+  for (const client of stats.clients || []) {
+    const row = document.createElement('tr');
+    const cells = [
+      `Viewer ${client.id}`, number(client.sent_fps), number(client.outgoing_mbps, 2),
+      `${number(client.frames_sent, 0)} / ${number(client.frames_skipped, 0)}`,
+      milliseconds(client.send_ms?.p95), milliseconds(client.frame_age_ms),
+      client.last_sent_ago_ms == null ? 'Waiting' : `${number(client.last_sent_ago_ms / 1000)} s ago`,
+    ];
+    for (const value of cells) { const cell = document.createElement('td'); cell.textContent = value; row.append(cell); }
+    rows.append(row);
+  }
+  if (!rows.children.length) {
+    const cell = document.createElement('td'); cell.colSpan = 7; cell.textContent = 'No active viewer connections';
+    const row = document.createElement('tr'); row.append(cell); rows.append(row);
+  }
+}
+document.getElementById('diagnostics').addEventListener('toggle', () => {
+  if (latestStats && document.getElementById('diagnostics').open) renderDiagnostics(latestStats);
+});
 async function poll() {
   try {
     const response = await fetch('stats', {cache: 'no-store', signal: AbortSignal.timeout(3000)});
     if (!response.ok) throw new Error('Status unavailable');
     const stats = await response.json(); failures = 0;
-    document.getElementById('metrics').textContent = `${stats.width}×${stats.height} · ${stats.fps.toFixed(1)} fps · ${stats.viewers} viewer${stats.viewers === 1 ? '' : 's'}`;
+    latestStats = stats;
+    if (document.getElementById('diagnostics').open) renderDiagnostics(stats);
+    document.getElementById('metrics').textContent = `${stats.width}×${stats.height} · ${stats.fps.toFixed(1)} encoded fps · ${stats.viewers} viewer${stats.viewers === 1 ? '' : 's'}`;
     document.getElementById('source').textContent = stats.source;
     error.textContent = stats.error || '';
     if (stats.state === 'ended') finish(stats.error || 'The source is no longer available.');

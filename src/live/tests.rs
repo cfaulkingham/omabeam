@@ -57,6 +57,7 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
         "--width",
         "1280",
         "--cursor",
+        "--native-pixels",
         "--bind",
         "::1",
         "--port",
@@ -66,6 +67,7 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
     assert_eq!(rest, args(&["--live", "output", "DP-1"]));
     assert_eq!(config.fps, 30);
     assert!(config.cursor);
+    assert_eq!(config.pixel_mode, omabeam_capture::PixelMode::Native);
     assert_eq!(
         LiveConfig::parse_args(&config.to_cli_args()).unwrap().0,
         config
@@ -157,9 +159,9 @@ fn stats_measure_elapsed_time_and_clear_frames_after_source_failure() {
         state::measured_fps(&times, first + Duration::from_secs(4)),
         0.0
     );
-    frames.publish(vec![1, 2, 3], 100, 50);
+    frames.publish(vec![1, 2, 3], 100, 50, FrameMeasurement::default());
     frames.fail("source closed".into());
-    frames.publish(vec![4], 200, 100);
+    frames.publish(vec![4], 200, 100, FrameMeasurement::default());
     assert!(frames.inner.lock().unwrap().jpeg.is_empty());
     let stats = frames.stats();
     assert_eq!(stats.frames, 1);
@@ -182,6 +184,62 @@ fn status_requires_current_fields_and_has_strong_tokens() {
     assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
     assert_ne!(token, random_token().unwrap());
     assert!(!pid_alive(0));
+    let old = r#"{"fps":15.0,"width":640,"height":360,"frames":1,"uptime":1,"viewers":0,"source":"demo","state":"live","error":null}"#;
+    let stats: StreamStats = serde_json::from_str(old).unwrap();
+    assert_eq!(stats.diagnostics, StreamDiagnostics::default());
+}
+
+#[test]
+fn publish_uses_native_pixels_and_reports_capture_encode_measurements() {
+    let frames = FrameState::new("HiDPI".into());
+    let hidpi = || {
+        let mut frame = omabeam_capture::demo_frame(0);
+        frame.logical_width = 320;
+        frame.logical_height = 180;
+        frame
+    };
+    let mut config = LiveConfig::default();
+    publish_frame(&frames, hidpi(), &config, Duration::from_millis(12)).unwrap();
+    assert_eq!((frames.stats().width, frames.stats().height), (320, 180));
+    config.pixel_mode = omabeam_capture::PixelMode::Native;
+    publish_frame(&frames, hidpi(), &config, Duration::from_millis(18)).unwrap();
+    let stats = frames.stats();
+    assert_eq!((stats.width, stats.height), (640, 360));
+    let d = stats.diagnostics;
+    assert!(d.native_pixels);
+    assert_eq!((d.capture_width, d.capture_height), (640, 360));
+    assert_eq!((d.logical_width, d.logical_height), (320, 180));
+    assert_eq!(d.capture_wait_ms.p95, Some(18.0));
+    assert_eq!(d.encode_ms.samples, 2);
+    assert!(d.encode_ms.p50.unwrap() > 0.0);
+    assert_eq!(d.jpeg_bytes, frames.inner.lock().unwrap().jpeg.len());
+    config.max_width = Some(480);
+    publish_frame(&frames, hidpi(), &config, Duration::ZERO).unwrap();
+    assert_eq!((frames.stats().width, frames.stats().height), (480, 270));
+}
+
+#[test]
+fn per_viewer_diagnostics_do_not_expand_the_bounded_session_file() {
+    let frames = FrameState::new("x".repeat(status::MAX_SOURCE_BYTES));
+    publish_frame(
+        &frames,
+        omabeam_capture::demo_frame(0),
+        &LiveConfig::default(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    let viewers: Vec<_> = (0..64).map(|_| state::Viewer::new(&frames)).collect();
+    let status = LiveStatus {
+        pid: 1,
+        starttime: 1,
+        title: "x".repeat(status::MAX_TITLE_BYTES),
+        url: "x".repeat(status::MAX_URL_BYTES),
+        stats: frames.stats(),
+    };
+    assert_eq!(frames.viewer_diagnostics().len(), 64);
+    assert!(serde_json::to_vec(&status).unwrap().len() < status::MAX_STATUS_BYTES);
+    drop(viewers);
+    assert!(frames.viewer_diagnostics().is_empty());
 }
 
 #[test]
@@ -200,7 +258,12 @@ fn http_validates_methods_routes_and_token_before_serving_frames_or_stats() {
         let response = exchange(&frames, request.as_bytes());
         assert!(String::from_utf8_lossy(&response).starts_with(&format!("HTTP/1.1 {expected}")));
     }
-    frames.publish(vec![0xff, 0xd8, 0xff, 0xd9], 1, 1);
+    frames.publish(
+        vec![0xff, 0xd8, 0xff, 0xd9],
+        1,
+        1,
+        FrameMeasurement::default(),
+    );
     assert!(
         exchange(&frames, b"GET /s/test/frame.jpg HTTP/1.1\r\n\r\n")
             .ends_with(&[0xff, 0xd8, 0xff, 0xd9])
@@ -222,7 +285,7 @@ fn http_validates_methods_routes_and_token_before_serving_frames_or_stats() {
 #[test]
 fn static_stream_sends_first_frame_immediately_and_reaps_disconnected_viewers() {
     let frames = Arc::new(FrameState::new("static".into()));
-    frames.publish(vec![1, 2, 3], 1, 1);
+    frames.publish(vec![1, 2, 3], 1, 1, FrameMeasurement::default());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     client
@@ -263,7 +326,7 @@ fn static_stream_sends_first_frame_immediately_and_reaps_disconnected_viewers() 
 #[test]
 fn capture_failure_stops_production_and_is_visible_to_viewer() {
     let frames = Arc::new(FrameState::new("window".into()));
-    frames.publish(vec![1], 1, 1);
+    frames.publish(vec![1], 1, 1, FrameMeasurement::default());
     let calls = AtomicUsize::new(0);
     capture_loop(
         |_| {

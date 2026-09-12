@@ -1,7 +1,7 @@
 //! A single bounded worker owns preview capture sessions. No preview is written
 //! to disk or served over HTTP, and a result is only displayed for its exact key.
 use gpui_kit::{Image, ImageFormat};
-use omabeam_capture::{CaptureSession, CaptureTarget, CapturedFrame};
+use omabeam_capture::{CaptureSession, CaptureTarget, CapturedFrame, PixelMode};
 use std::{
     sync::{
         Arc,
@@ -17,6 +17,7 @@ pub(super) struct PreviewKey {
     pub cursor: bool,
     pub quality: u8,
     pub max_width: Option<u32>,
+    pub pixel_mode: PixelMode,
     pub screenshot: bool,
 }
 
@@ -36,7 +37,8 @@ impl PreviewFrame {
                 frame.image.height(),
             )
         } else {
-            let (bytes, width, height) = frame.jpeg_scaled(key.quality, key.max_width)?;
+            let (bytes, width, height) =
+                frame.jpeg_with_mode(key.quality, key.max_width, key.pixel_mode)?;
             (ImageFormat::Jpeg, bytes, width, height)
         };
         Ok(Self {
@@ -108,6 +110,7 @@ impl PreviewWorker {
                                 cursor: false,
                                 quality: 55,
                                 max_width: Some(256),
+                                pixel_mode: PixelMode::Logical,
                                 screenshot: false,
                             };
                             let frame = if demo {
@@ -144,6 +147,7 @@ impl super::OmaBeam {
             cursor: !self.picker && !self.screenshot_mode && self.live_config.cursor,
             quality: self.live_config.quality,
             max_width: self.live_config.max_width,
+            pixel_mode: self.live_config.pixel_mode,
             screenshot: self.picker || self.screenshot_mode,
         })
     }
@@ -324,6 +328,7 @@ mod tests {
             cursor: false,
             quality: 55,
             max_width: Some(320),
+            pixel_mode: PixelMode::Logical,
             screenshot: false,
         };
         worker
@@ -362,6 +367,7 @@ mod tests {
             cursor: true,
             quality: 72,
             max_width: Some(320),
+            pixel_mode: PixelMode::Logical,
             screenshot: false,
         };
         let stream = PreviewFrame::encode(omabeam_capture::demo_frame(0), &key).unwrap();
@@ -369,6 +375,20 @@ mod tests {
         key.screenshot = true;
         let shot = PreviewFrame::encode(omabeam_capture::demo_frame(0), &key).unwrap();
         assert_eq!((shot.width, shot.height), (640, 360));
+
+        let hidpi = || {
+            let mut frame = omabeam_capture::demo_frame(0);
+            frame.logical_width = 320;
+            frame.logical_height = 180;
+            frame
+        };
+        key.screenshot = false;
+        key.max_width = None;
+        let logical = PreviewFrame::encode(hidpi(), &key).unwrap();
+        assert_eq!((logical.width, logical.height), (320, 180));
+        key.pixel_mode = PixelMode::Native;
+        let native = PreviewFrame::encode(hidpi(), &key).unwrap();
+        assert_eq!((native.width, native.height), (640, 360));
     }
 
     #[test]
@@ -378,6 +398,7 @@ mod tests {
             cursor: false,
             quality: 55,
             max_width: None,
+            pixel_mode: PixelMode::Logical,
             screenshot: false,
         };
         let mut next = original.clone();
@@ -391,6 +412,9 @@ mod tests {
         assert_ne!(original, next);
         next = original.clone();
         next.max_width = Some(1280);
+        assert_ne!(original, next);
+        next = original.clone();
+        next.pixel_mode = PixelMode::Native;
         assert_ne!(original, next);
     }
 }

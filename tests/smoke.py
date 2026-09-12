@@ -109,9 +109,25 @@ def browser_check(server, screenshot):
             page.goto(server.url, wait_until='domcontentloaded')
             page.wait_for_function('document.getElementById("view").naturalWidth > 0')
             eventually(lambda: server.stats()['viewers'] == 1)
+            page.get_by_text('Stream diagnostics', exact=True).click()
+            page.wait_for_function('document.getElementById("diag-pixels").textContent === "Native pixels"')
+            page.wait_for_function('document.querySelector("#client-rows tr td").textContent.startsWith("Viewer ")')
+            assert page.locator('#diag-capture').inner_text() == '640×360'
+            assert page.locator('#diag-encoded').inner_text() == '640×360'
+            assert 'encoded fps' in page.locator('#metrics').inner_text()
+            assert 'ms' in page.locator('#diag-encode').inner_text()
+            assert 'Mbit/s' in page.locator('#diag-bandwidth').inner_text()
+            assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+            if screenshot:
+                page.screenshot(path=str(Path(screenshot).with_name('diagnostics.png')))
+                page.set_viewport_size({'width': 1280, 'height': 900})
+                page.screenshot(path=str(Path(screenshot).with_name('diagnostics-desktop.png')))
+                page.set_viewport_size({'width': 480, 'height': 380})
             page.get_by_role('button', name='Pause', exact=True).click()
             eventually(lambda: server.stats()['viewers'] == 0)
+            page.get_by_text('No active viewer connections', exact=True).wait_for()
             assert page.locator('#status').inner_text() == 'Paused'
+            page.get_by_text('Stream diagnostics', exact=True).click()
             page.get_by_role('button', name='Resume', exact=True).click()
             page.wait_for_function('document.getElementById("view").naturalWidth > 0')
             eventually(lambda: server.stats()['viewers'] == 1)
@@ -140,7 +156,7 @@ def browser_check(server, screenshot):
             assert not errors, errors
         finally:
             browser.close()
-    print('PASS browser: live image, pause/resume, fit modes, fullscreen, source-loss feedback')
+    print('PASS browser: native-pixel diagnostics, viewer cleanup, live image, pause/resume, fit modes, fullscreen, source-loss feedback')
 
 
 def main():
@@ -149,17 +165,36 @@ def main():
     parser.add_argument('--browser', action='store_true')
     parser.add_argument('--screenshot')
     parser.add_argument('--capture-output', help='Test an output in an existing Wayland session')
+    parser.add_argument('--capture-scale', type=int, help='Assert this integer output scale in capture tests')
     opts = parser.parse_args()
     if opts.capture_output:
-        for source, expected in [(['--live', 'output', opts.capture_output], None), (['--live', 'region', opts.capture_output, '10', '20', '160', '100'], (160, 100))]:
-            with Server(opts.binary, ['--fps', '5', '--cursor'], source) as server:
-                snapshot = decode(server.get('frame.jpg')[1])
-                if expected:
-                    assert snapshot.size == expected, snapshot.size
-                with urllib.request.urlopen(server.url + 'stream', timeout=5) as stream:
-                    assert frame(stream).size == snapshot.size
-                    assert frame(stream).size == snapshot.size
-        print('PASS real compositor output and region JPEG/MJPEG with cursor enabled')
+        for source, region in [(['--live', 'output', opts.capture_output], False), (['--live', 'region', opts.capture_output, '10', '20', '160', '100'], True)]:
+            for native, limit in [(False, None), (True, None), (True, 128)]:
+                arguments = ['--fps', '5', '--cursor']
+                if native:
+                    arguments.append('--native-pixels')
+                if limit:
+                    arguments.extend(['--width', str(limit)])
+                with Server(opts.binary, arguments, source) as server:
+                    snapshot = decode(server.get('frame.jpg')[1])
+                    stats = server.stats()
+                    d = stats['diagnostics']
+                    logical = (d['logical_width'], d['logical_height'])
+                    captured = (d['capture_width'], d['capture_height'])
+                    if region:
+                        assert logical == (160, 100), logical
+                    if opts.capture_scale:
+                        assert captured == tuple(value * opts.capture_scale for value in logical), d
+                    expected = captured if native else logical
+                    if limit and expected[0] > limit:
+                        expected = (limit, max(1, expected[1] * limit // expected[0]))
+                    assert snapshot.size == expected, (snapshot.size, expected)
+                    assert (stats['width'], stats['height']) == expected
+                    assert d['native_pixels'] == native
+                    with urllib.request.urlopen(server.url + 'stream', timeout=5) as stream:
+                        assert frame(stream).size == expected
+                        assert frame(stream).size == expected
+        print('PASS real compositor output/region capture, logical/native pixels, width caps, and diagnostics')
         return
     with Server(opts.binary, ['--fps', '5', '--width', '320']) as server:
         assert server.get('')[0] == 200
@@ -172,11 +207,26 @@ def main():
             time.sleep(2.5)
             stats = server.stats()
             assert 2 < stats['fps'] <= 5.5, stats
+            d = stats['diagnostics']
+            assert not d['native_pixels']
+            assert (d['capture_width'], d['capture_height']) == (640, 360)
+            assert d['encode_ms']['samples'] > 0 and d['encode_ms']['p95'] > 0
+            assert d['capture_wait_ms']['samples'] > 0
+            assert d['bytes_sent'] > 0 and d['frames_sent'] >= 2
+            assert d['outgoing_mbps'] > 0
+            assert len(stats['clients']) == 1
+            assert stats['clients'][0]['frames_sent'] >= 2
+            assert stats['clients'][0]['frame_age_ms'] >= 0
         eventually(lambda: server.stats()['viewers'] == 0)
+        assert not server.stats()['clients']
         time.sleep(3)
         assert server.stats()['fps'] <= 1.5, server.stats()
         status = subprocess.run([server.binary, '--status'], env=server.env, capture_output=True, text=True, check=True)
         assert json.loads(status.stdout)['frames'] > 0
+        assert json.loads(status.stdout)['diagnostics']['bytes_sent'] > 0
+        assert len(status.stdout.encode()) <= 8192
+        assert 'clients' not in json.loads(status.stdout)
+        assert server.stats()['diagnostics']['outgoing_mbps'] == 0
         print('PASS real HTTP/MJPEG, dimensions, FPS, idle rate, viewer cleanup, CLI status')
     for width in [1, 17, 320]:
         for quality in [1, 55, 95]:
@@ -188,7 +238,7 @@ def main():
         assert result.returncode == 1 and result.stderr, arguments
     print('PASS invalid arguments rejected before starting capture')
     if opts.browser:
-        with Server(opts.binary, ['--fps', '10']) as server:
+        with Server(opts.binary, ['--fps', '10', '--native-pixels']) as server:
             browser_check(server, opts.screenshot)
 
 

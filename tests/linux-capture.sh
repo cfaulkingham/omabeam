@@ -25,4 +25,13 @@ while [ "$attempt" -lt 100 ]; do
     attempt=$((attempt + 1))
 done
 if [ -z "${WAYLAND_DISPLAY:-}" ]; then cat "$review_runtime/sway.log"; exit 1; fi
-python3 tests/smoke.py --binary "$binary" --capture-output HEADLESS-1
+python3 tests/smoke.py --binary "$binary" --capture-output HEADLESS-1 --capture-scale 1
+for sway_socket in "$review_runtime"/sway-ipc.*.sock; do
+    if [ -S "$sway_socket" ]; then
+        swaymsg -s "$sway_socket" output HEADLESS-1 scale 2 >/dev/null
+        python3 tests/smoke.py --binary "$binary" --capture-output HEADLESS-1 --capture-scale 2
+        exit 0
+    fi
+done
+echo "Could not find the test compositor's IPC socket" >&2
+exit 1

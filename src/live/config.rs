@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail, ensure};
+use omabeam_capture::PixelMode;
 use std::{
     net::{IpAddr, Ipv4Addr},
     time::Duration,
@@ -9,6 +10,7 @@ pub struct LiveConfig {
     pub fps: u32,
     pub quality: u8,
     pub max_width: Option<u32>,
+    pub pixel_mode: PixelMode,
     pub cursor: bool,
     pub bind: IpAddr,
     pub port: u16,
@@ -20,6 +22,7 @@ impl Default for LiveConfig {
             fps: 15,
             quality: 55,
             max_width: None,
+            pixel_mode: PixelMode::Logical,
             cursor: false,
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: super::LIVE_PORT,
@@ -64,6 +67,7 @@ impl LiveConfig {
                     break;
                 }
                 "--cursor" => config.cursor = true,
+                "--native-pixels" => config.pixel_mode = PixelMode::Native,
                 "--fps" | "--quality" | "--width" | "--bind" | "--port" => {
                     let value = args
                         .next()
@@ -136,6 +140,9 @@ impl LiveConfig {
         }
         if self.cursor {
             args.push("--cursor".into());
+        }
+        if self.pixel_mode == PixelMode::Native {
+            args.push("--native-pixels".into());
         }
         args
     }

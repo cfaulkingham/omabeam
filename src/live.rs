@@ -1,6 +1,7 @@
 //! Capture orchestration and local session lifecycle. HTTP and viewer state are
 //! independent of the compositor, so the same path can be exercised by --demo.
 mod config;
+mod diagnostics;
 mod http;
 mod state;
 pub(crate) mod status;
@@ -10,6 +11,8 @@ mod tests;
 use crate::{capture::CaptureRequest, portal::Selection};
 use anyhow::{Context, Result, bail, ensure};
 pub use config::LiveConfig;
+use diagnostics::FrameMeasurement;
+pub use diagnostics::{StreamDiagnostics, TimingStats, ViewerDiagnostics};
 pub use http::viewer_html;
 use omabeam_capture::{CaptureSession, CapturedFrame};
 use serde::{Deserialize, Serialize};
@@ -166,11 +169,18 @@ pub fn run_headless(source: LiveSource, config: LiveConfig) -> Result<()> {
 pub fn run_demo(config: LiveConfig) -> Result<()> {
     ensure!(current_status().is_none(), "a share is already running");
     let mut counter = 0u32;
+    let started = Instant::now();
     let first = omabeam_capture::demo_frame(counter);
-    let session = LiveSession::start_frames("OmaBeam demo".into(), config, first, move |_| {
-        counter = counter.wrapping_add(1);
-        Ok(Some(omabeam_capture::demo_frame(counter)))
-    })?;
+    let session = LiveSession::start_frames(
+        "OmaBeam demo".into(),
+        config,
+        first,
+        started.elapsed(),
+        move |_| {
+            counter = counter.wrapping_add(1);
+            Ok(Some(omabeam_capture::demo_frame(counter)))
+        },
+    )?;
     run_session(session)
 }
 
@@ -249,16 +259,22 @@ impl LiveSession {
         let mut capturer =
             CaptureSession::new_with_cursor(source.request()?.target()?, config.cursor)
                 .context("live share capture initialization failed")?;
+        let started = Instant::now();
         let first = capturer.capture()?;
-        Self::start_frames(source.label(), config, first, move |timeout| {
-            capturer.next_frame(timeout)
-        })
+        Self::start_frames(
+            source.label(),
+            config,
+            first,
+            started.elapsed(),
+            move |timeout| capturer.next_frame(timeout),
+        )
     }
 
     fn start_frames(
         title: String,
         config: LiveConfig,
         first: CapturedFrame,
+        first_capture_wait: Duration,
         next: impl FnMut(Duration) -> Result<Option<CapturedFrame>> + Send + 'static,
     ) -> Result<Self> {
         config.validate()?;
@@ -279,7 +295,7 @@ impl LiveSession {
         };
         let url = format!("http://{host}:{port}/s/{token}/");
         let frames = Arc::new(FrameState::new(title.clone()));
-        publish_frame(&frames, first, &config)?;
+        publish_frame(&frames, first, &config, first_capture_wait)?;
         let stop = Arc::new(AtomicBool::new(false));
         let capture_frames = frames.clone();
         let capture_stop = stop.clone();
@@ -348,9 +364,26 @@ impl Drop for LiveSession {
     }
 }
 
-fn publish_frame(frames: &FrameState, frame: CapturedFrame, config: &LiveConfig) -> Result<()> {
-    let (jpeg, width, height) = frame.jpeg_scaled(config.quality, config.max_width)?;
-    frames.publish(jpeg, width, height);
+fn publish_frame(
+    frames: &FrameState,
+    frame: CapturedFrame,
+    config: &LiveConfig,
+    capture_wait: Duration,
+) -> Result<()> {
+    let encode_started_at = Instant::now();
+    let (jpeg, width, height) =
+        frame.jpeg_with_mode(config.quality, config.max_width, config.pixel_mode)?;
+    let measurement = FrameMeasurement {
+        pixel_mode: config.pixel_mode,
+        capture_width: frame.image.width(),
+        capture_height: frame.image.height(),
+        logical_width: frame.logical_width,
+        logical_height: frame.logical_height,
+        capture_wait,
+        encode: encode_started_at.elapsed(),
+        encode_started_at,
+    };
+    frames.publish(jpeg, width, height, measurement);
     Ok(())
 }
 
@@ -364,10 +397,11 @@ fn capture_loop(
         while !stop.load(Ordering::SeqCst) {
             let started = Instant::now();
             if let Some(frame) = next(Duration::from_millis(250))? {
+                let capture_wait = started.elapsed();
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                publish_frame(&frames, frame, &config)?;
+                publish_frame(&frames, frame, &config, capture_wait)?;
             }
             // Viewer changes wake the wait so a new viewer need not wait out
             // a full idle second. Spurious wakeups retain the original deadline.

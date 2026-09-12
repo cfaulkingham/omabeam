@@ -178,6 +178,14 @@ pub(crate) fn decode(
     )
 }
 
+/// Choose the pixel grid before applying the streaming width limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PixelMode {
+    #[default]
+    Logical,
+    Native,
+}
+
 /// Pixels at capture resolution, with logical dimensions for scale-1 streaming.
 #[derive(Debug)]
 pub struct CapturedFrame {
@@ -205,19 +213,30 @@ impl CapturedFrame {
     /// JPEG at logical resolution, optionally limited in width. Returns the
     /// actual encoded dimensions for stream diagnostics.
     pub fn jpeg_scaled(&self, quality: u8, max_width: Option<u32>) -> Result<(Vec<u8>, u32, u32)> {
+        self.jpeg_with_mode(quality, max_width, PixelMode::Logical)
+    }
+
+    /// Native mode preserves captured pixels. The width limit applies to the
+    /// selected mode, never upscales it, and leaves PNG screenshots unchanged.
+    pub fn jpeg_with_mode(
+        &self,
+        quality: u8,
+        max_width: Option<u32>,
+        mode: PixelMode,
+    ) -> Result<(Vec<u8>, u32, u32)> {
         ensure!((1..=95).contains(&quality), "invalid JPEG quality");
-        ensure!(
-            self.logical_width > 0 && self.logical_height > 0,
-            "empty logical image"
-        );
+        let (base_width, base_height) = match mode {
+            PixelMode::Logical => (self.logical_width, self.logical_height),
+            PixelMode::Native => self.image.dimensions(),
+        };
+        ensure!(base_width > 0 && base_height > 0, "empty stream image");
         ensure!(
             max_width.is_none_or(|w| w > 0),
             "maximum width must be positive"
         );
-        let width = max_width.map_or(self.logical_width, |w| w.min(self.logical_width));
-        let height = (u64::from(self.logical_height) * u64::from(width)
-            / u64::from(self.logical_width))
-        .max(1) as u32;
+        let width = max_width.map_or(base_width, |w| w.min(base_width));
+        let height =
+            (u64::from(base_height) * u64::from(width) / u64::from(base_width)).max(1) as u32;
         let image = if self.image.dimensions() == (width, height) {
             std::borrow::Cow::Borrowed(&self.image)
         } else {
@@ -315,6 +334,50 @@ pub(crate) fn compose(tiles: &[(&RgbaImage, Rect)], region: Rect) -> Result<Capt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_streams_keep_hidpi_detail_and_width_limits_use_the_selected_grid() {
+        // Include fractional scaling and portrait dimensions. The encoded
+        // dimensions must agree with the decoded JPEG, not just metadata.
+        for (width, height, logical_width, logical_height) in [
+            (640, 360, 320, 180),
+            (641, 361, 427, 241),
+            (360, 640, 180, 320),
+        ] {
+            let frame = CapturedFrame {
+                image: RgbaImage::from_fn(width, height, |x, _| {
+                    let gray = if x % 2 == 0 { 0 } else { 255 };
+                    Rgba([gray, gray, gray, 255])
+                }),
+                logical_width,
+                logical_height,
+            };
+            for mode in [PixelMode::Logical, PixelMode::Native] {
+                let (base_w, base_h) = match mode {
+                    PixelMode::Logical => (logical_width, logical_height),
+                    PixelMode::Native => (width, height),
+                };
+                for limit in [None, Some(1), Some(480), Some(1000)] {
+                    let (bytes, w, h) = frame.jpeg_with_mode(95, limit, mode).unwrap();
+                    let decoded = image::load_from_memory(&bytes).unwrap().to_rgb8();
+                    assert_eq!(decoded.dimensions(), (w, h));
+                    assert_eq!(w, limit.map_or(base_w, |cap| cap.min(base_w)));
+                    assert_eq!(h, (base_h * w / base_w).max(1));
+                    if mode == PixelMode::Native && limit.is_none() {
+                        // One-pixel lines survive in native mode.
+                        assert!(decoded.get_pixel(0, 0)[0] < 20);
+                        assert!(decoded.get_pixel(1, 0)[0] > 235);
+                    }
+                }
+            }
+            assert_eq!(
+                image::load_from_memory(&frame.png().unwrap())
+                    .unwrap()
+                    .width(),
+                width
+            );
+        }
+    }
+
     #[test]
     fn jpeg_width_limit_preserves_aspect_and_decodes_at_quality_extremes() {
         let frame = crate::demo_frame(0);

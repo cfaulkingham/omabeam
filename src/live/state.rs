@@ -1,3 +1,6 @@
+use super::diagnostics::{
+    DiagnosticsState, FrameMeasurement, SendMeasurement, StreamDiagnostics, ViewerDiagnostics,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -19,6 +22,8 @@ pub struct StreamStats {
     pub source: String,
     pub state: String,
     pub error: Option<String>,
+    #[serde(default)]
+    pub diagnostics: StreamDiagnostics,
 }
 
 pub(super) struct FrameData {
@@ -26,6 +31,8 @@ pub(super) struct FrameData {
     pub generation: u64,
     pub width: u32,
     pub height: u32,
+    pub encode_started_at: Instant,
+    diagnostics: DiagnosticsState,
     times: VecDeque<Instant>,
     started: Instant,
     pub ended: Option<Instant>,
@@ -47,6 +54,8 @@ impl FrameState {
                 generation: 0,
                 width: 0,
                 height: 0,
+                encode_started_at: Instant::now(),
+                diagnostics: DiagnosticsState::new(Instant::now()),
                 times: VecDeque::new(),
                 started: Instant::now(),
                 ended: None,
@@ -57,16 +66,18 @@ impl FrameState {
             source,
         }
     }
-    pub fn publish(&self, jpeg: Vec<u8>, width: u32, height: u32) {
+    pub fn publish(&self, jpeg: Vec<u8>, width: u32, height: u32, measurement: FrameMeasurement) {
         let mut data = self.inner.lock().unwrap();
         if data.ended.is_some() {
             return;
         }
+        let now = Instant::now();
+        data.encode_started_at = measurement.encode_started_at;
+        data.diagnostics.publish(now, jpeg.len(), measurement);
         data.jpeg = jpeg.into();
         data.generation += 1;
         data.width = width;
         data.height = height;
-        let now = Instant::now();
         data.times.push_back(now);
         while data.times.len() > 2 && now.duration_since(data.times[0]) > Duration::from_secs(2) {
             data.times.pop_front();
@@ -101,7 +112,16 @@ impl FrameState {
             }
             .into(),
             error: data.error.clone(),
+            diagnostics: data.diagnostics.stats(now),
         }
+    }
+
+    pub fn viewer_diagnostics(&self) -> Vec<ViewerDiagnostics> {
+        self.inner
+            .lock()
+            .unwrap()
+            .diagnostics
+            .viewers(Instant::now())
     }
 }
 
@@ -116,17 +136,40 @@ pub(super) fn measured_fps(times: &VecDeque<Instant>, now: Instant) -> f64 {
     }
 }
 
-pub(super) struct Viewer<'a>(pub &'a FrameState);
+pub(super) struct Viewer<'a> {
+    frames: &'a FrameState,
+    id: u64,
+}
 impl<'a> Viewer<'a> {
     pub fn new(frames: &'a FrameState) -> Self {
+        let id = frames
+            .inner
+            .lock()
+            .unwrap()
+            .diagnostics
+            .add_viewer(Instant::now());
         frames.viewers.fetch_add(1, Ordering::SeqCst);
         frames.tick.notify_all();
-        Self(frames)
+        Self { frames, id }
+    }
+
+    pub fn record_send(&self, measurement: SendMeasurement) {
+        self.frames.inner.lock().unwrap().diagnostics.record_send(
+            self.id,
+            Instant::now(),
+            measurement,
+        );
     }
 }
 impl Drop for Viewer<'_> {
     fn drop(&mut self) {
-        self.0.viewers.fetch_sub(1, Ordering::SeqCst);
-        self.0.tick.notify_all();
+        self.frames
+            .inner
+            .lock()
+            .unwrap()
+            .diagnostics
+            .remove_viewer(self.id);
+        self.frames.viewers.fetch_sub(1, Ordering::SeqCst);
+        self.frames.tick.notify_all();
     }
 }

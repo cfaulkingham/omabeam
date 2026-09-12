@@ -94,6 +94,20 @@ Defaults: 15 FPS, JPEG quality 55, native logical width, cursor off, and
 local network (TCP **9847** on 0.0.0.0). Presets offer Balanced, Crisp text,
 and Smooth motion. Advanced exposes individual settings.
 
+Crisp text uses native captured pixels at JPEG quality 90, preserving fine
+detail on HiDPI displays. Balanced and Smooth motion use logical pixels.
+Advanced → Pixel detail lets you choose either mode; Maximum width caps the
+encoded image in that mode. Preview uses the same settings as the stream.
+Native pixels can increase CPU use and bandwidth. PNG screenshots always
+keep capture resolution.
+
+Open **Stream diagnostics** in the browser viewer to see captured and encoded
+sizes, capture/encode timing, outgoing bandwidth, and delivery counters for
+each viewer connection. The main FPS value counts encoded frames on the host.
+Sent frames measure socket writes; they do not measure browser playback or
+end-to-end latency. Capture wait includes waiting for screen changes, so a
+static source can report 0 FPS without a problem.
+
 Links use a fresh random token and plain HTTP. Anyone on the local network
 with the link can view the share. If a firewall blocks viewers, allow TCP 9847
 from your intended subnet only. Use `--bind 127.0.0.1` to keep the stream on

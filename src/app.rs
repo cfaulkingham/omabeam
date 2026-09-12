@@ -126,7 +126,8 @@ Usage:
 Live options (also apply when opening the picker):
   --fps N               1–120 (default 15; about 1 when nobody is watching)
   --quality N           JPEG quality 1–95 (default 55)
-  --width N             Limit encoded width (default logical resolution)
+  --width N             Limit encoded width in the selected pixel mode
+  --native-pixels       Preserve captured pixels (default logical resolution)
   --cursor              Include cursor
   --bind ADDRESS        Default 0.0.0.0 (local network); 127.0.0.1 for this computer only
   --port N              Default 9847; 0 chooses an available port

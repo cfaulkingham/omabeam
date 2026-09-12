@@ -1,4 +1,5 @@
 use super::*;
+use omabeam_capture::PixelMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StreamPreset {
@@ -16,20 +17,31 @@ impl StreamPreset {
             Self::Motion => "Smooth motion",
         }
     }
-    pub fn values(self) -> (u32, u8, Option<u32>) {
+    pub fn values(self) -> (u32, u8, Option<u32>, PixelMode) {
         match self {
-            Self::Balanced => (15, 55, None),
-            Self::Text => (15, 90, None),
-            Self::Motion => (60, 55, Some(1280)),
+            Self::Balanced => (15, 55, None, PixelMode::Logical),
+            Self::Text => (15, 90, None, PixelMode::Native),
+            Self::Motion => (60, 55, Some(1280), PixelMode::Logical),
         }
     }
     pub fn apply(self, config: &mut LiveConfig) {
-        (config.fps, config.quality, config.max_width) = self.values();
+        (
+            config.fps,
+            config.quality,
+            config.max_width,
+            config.pixel_mode,
+        ) = self.values();
     }
     pub fn matching(config: &LiveConfig) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|p| p.values() == (config.fps, config.quality, config.max_width))
+        Self::ALL.into_iter().find(|p| {
+            p.values()
+                == (
+                    config.fps,
+                    config.quality,
+                    config.max_width,
+                    config.pixel_mode,
+                )
+        })
     }
 }
 
@@ -181,13 +193,35 @@ impl OmaBeam {
                 .collect(),
             move |index, window, cx| changed(&index, window, cx),
         );
+        let modes = [PixelMode::Logical, PixelMode::Native];
+        let pixel_mode = self.live_config.pixel_mode;
+        let changed = cx.listener(move |this, index: &usize, _, cx| {
+            this.live_config.pixel_mode = modes[*index];
+            cx.notify();
+        });
+        let pixel_menu = menu(
+            "pixels-menu",
+            dropdown("pixels", pixel_label(pixel_mode), self.busy, cx),
+            modes
+                .iter()
+                .map(|mode| {
+                    MenuItem::new(pixel_label(*mode))
+                        .checked(*mode == pixel_mode)
+                        .disabled(self.busy)
+                })
+                .collect(),
+            move |index, window, cx| changed(&index, window, cx),
+        );
         div().flex().flex_col().gap_2().p_3().bg(cx.omarchy().inset)
             .border_1()
             .border_color(cx.omarchy().divider())
             .child(div().flex().flex_wrap().gap_3()
                 .child(field("Frame rate", fps_menu, cx))
                 .child(field("JPEG quality", jpeg_menu, cx))
-                .child(field("Maximum width", width_menu, cx)))
+                .child(field("Maximum width", width_menu, cx))
+                .child(field("Pixel detail", pixel_menu, cx)))
+            .child(div().text_xs().text_color(cx.omarchy().secondary)
+                .child("Native pixels preserve fine text on scaled displays and use more bandwidth. Maximum width still applies."))
             .child(div().text_xs().text_color(cx.omarchy().secondary).child(if self.live_config.bind.is_loopback() {
                 "Only available on this computer unless you forward the connection."
             } else { "Anyone who can reach this computer and has the link can view. HTTP is unencrypted." }))
@@ -229,7 +263,14 @@ pub(super) fn field(
 }
 
 fn width_label(width: Option<u32>) -> String {
-    width.map_or("Native".into(), |v| format!("{v} px"))
+    width.map_or("No limit".into(), |v| format!("{v} px"))
+}
+
+fn pixel_label(mode: PixelMode) -> &'static str {
+    match mode {
+        PixelMode::Logical => "Logical pixels",
+        PixelMode::Native => "Native pixels",
+    }
 }
 
 #[cfg(test)]
@@ -257,5 +298,21 @@ mod tests {
         config.fps = 24;
         assert_eq!(StreamPreset::matching(&config), None);
         assert_eq!(config.fps, 24);
+    }
+
+    #[test]
+    fn crisp_text_selects_native_pixels_and_other_presets_restore_logical_pixels() {
+        let mut config = LiveConfig::default();
+        StreamPreset::Text.apply(&mut config);
+        assert_eq!(config.pixel_mode, PixelMode::Native);
+        assert_eq!(config.quality, 90);
+        assert_eq!(config.max_width, None);
+        config.pixel_mode = PixelMode::Logical;
+        assert_eq!(StreamPreset::matching(&config), None);
+        for preset in [StreamPreset::Balanced, StreamPreset::Motion] {
+            StreamPreset::Text.apply(&mut config);
+            preset.apply(&mut config);
+            assert_eq!(config.pixel_mode, PixelMode::Logical);
+        }
     }
 }

@@ -10,7 +10,7 @@ mod selector;
 mod protocol_tests;
 
 pub use capture::CaptureSession;
-pub use pixels::CapturedFrame;
+pub use pixels::{CapturedFrame, PixelMode};
 pub use selector::pick_region;
 
 /// A rectangle in logical pixels. Regions are output-relative; DesktopRect
