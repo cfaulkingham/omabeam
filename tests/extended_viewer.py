@@ -127,6 +127,9 @@ def check_browser(fixture, browser, artifacts):
     first.evaluate('pc.close()')
     first.wait_for_function("ownsDesktop && playback === 'jpeg' && img.naturalWidth === 1080")
     assert first.locator('#snapshot').get_attribute('href') == before_fallback
+    assert first.locator('#transport').inner_text() == 'Video: Auto'
+    first.locator('#transport').click()
+    first.wait_for_function("playback === 'jpeg' && preferRtc === false")
     first.locator('#transport').click()
     first.wait_for_function("ownsDesktop && playback === 'webrtc'", timeout=20000)
     first.locator('#pause').click()

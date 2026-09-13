@@ -83,6 +83,9 @@ def checks(server, browser, screenshot):
     page.evaluate('pc.close()')
     page.wait_for_function("playback === 'jpeg' && fallbackReason.length > 0", timeout=12000)
     eventually(lambda: server.stats()['webrtc']['peers'] == 0)
+    assert page.locator('#transport').inner_text() == 'Video: Auto'
+    page.locator('#transport').click()
+    page.wait_for_function("playback === 'jpeg' && preferRtc === false")
     page.locator('#transport').click()
     playing(page)
     second = browser.new_page()
@@ -115,7 +118,7 @@ def checks(server, browser, screenshot):
     eventually(lambda: server.stats()['viewers'] == 0)
     page.close()
     assert not errors, errors
-    print('PASS WebRTC: decoded H.264 pixels on LAN HTTP, diagnostics, lazy JPEG snapshots, pause/resume, transport switching, loss fallback, retry, two peers, late answer cleanup, source loss')
+    print('PASS WebRTC: decoded H.264 pixels on LAN HTTP, diagnostics, lazy JPEG snapshots, pause/resume, transport switching, loss fallback, two peers, late answer cleanup, source loss')
 
 
 def signaling(server, browser):

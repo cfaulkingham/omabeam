@@ -79,7 +79,7 @@ impl OmaBeam {
         });
         let webrtc = self.live_config.webrtc;
         let transport_changed = cx.listener(|this, index: &usize, _, cx| {
-            this.live_config.webrtc = *index == 1;
+            this.live_config.webrtc = *index == 0;
             cx.notify();
         });
         let transport_menu = menu(
@@ -90,12 +90,12 @@ impl OmaBeam {
                 self.busy,
                 cx,
             ),
-            ["JPEG", "H.264 / WebRTC"]
+            ["H.264 / WebRTC", "JPEG"]
                 .iter()
                 .enumerate()
                 .map(|(i, label)| {
                     MenuItem::new(*label)
-                        .checked(webrtc == (i == 1))
+                        .checked(webrtc == (i == 0))
                         .disabled(self.busy)
                 })
                 .collect(),

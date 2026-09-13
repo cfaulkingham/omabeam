@@ -58,7 +58,7 @@ impl Default for LiveConfig {
             quality: 55,
             max_width: None,
             pixel_mode: PixelMode::Logical,
-            webrtc: false,
+            webrtc: true,
             webrtc_port: 9848,
             h264_bitrate: 4_000_000,
             encoder: EncoderMode::Auto,
@@ -112,6 +112,7 @@ impl LiveConfig {
                 "--cursor" => config.cursor = true,
                 "--native-pixels" => config.pixel_mode = PixelMode::Native,
                 "--webrtc" => config.webrtc = true,
+                "--jpeg" => config.webrtc = false,
                 "--fps" | "--quality" | "--width" | "--bind" | "--port" | "--webrtc-port"
                 | "--h264-bitrate" | "--encoder" => {
                     let value = args
@@ -202,6 +203,8 @@ impl LiveConfig {
         }
         if self.webrtc {
             args.push("--webrtc".into());
+        } else {
+            args.push("--jpeg".into());
         }
         if self.pixel_mode == PixelMode::Native {
             args.push("--native-pixels".into());

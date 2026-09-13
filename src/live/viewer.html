@@ -40,20 +40,41 @@ body.idle, body.idle * { cursor: none !important; }
 body.idle #stage:fullscreen #chrome, body.idle #stage.expanded #chrome { display: none; }
 #disconnected {
   display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
   margin: 0;
-  padding: 24px;
-  max-width: 16ch;
+  padding: 32px 24px;
+  color: var(--accent);
   text-align: center;
-  font-size: clamp(2.5rem, 9vw, 5.5rem);
-  font-weight: 650;
-  letter-spacing: -0.04em;
-  line-height: 1.1;
+}
+#disconnected .oma-logo {
+  width: clamp(52px, 11vw, 80px);
+  height: auto;
+  shape-rendering: crispEdges;
+}
+#disconnected .oma-wordmark {
+  width: min(78vw, 540px);
+  max-height: 18vh;
+  height: auto;
+  shape-rendering: crispEdges;
+}
+#disconnected-copy {
+  margin: 0;
+  max-width: 28ch;
+  color: var(--muted);
+  font-size: clamp(0.95rem, 2.4vw, 1.15rem);
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  line-height: 1.35;
 }
 #view:not([src]),
 #stage.ended #view, #stage.ended video, [hidden] { display: none !important; }
 #stage.ended { display: grid !important; place-items: center; }
-#stage.ended #disconnected { display: block; }
-#stage.blocked #disconnected { display: block; max-width: 28ch; font-size: clamp(1.4rem, 4vw, 2.5rem); }
+#stage.ended #disconnected, #stage.blocked #disconnected { display: flex; }
+#stage.blocked #disconnected-copy { letter-spacing: 0.02em; text-transform: none; }
 #desktop-note { overflow-wrap: anywhere; }
 button[aria-pressed="true"] { border-color: var(--accent); }
 footer { flex-shrink: 0; padding: 12px 20px; font-size: 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; border-top: 1px solid var(--outline); color: var(--muted); }
@@ -96,7 +117,7 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
   </div>
   <nav aria-label="Viewer controls"><button id="match-device" aria-pressed="false" hidden>Match this device</button><button id="transport" hidden>Video: Auto</button><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
 </header>
-<main id="stage" class="contain"><img id="view" alt=""><video id="video" autoplay muted playsinline hidden></video><h2 id="disconnected">OmaBeam disconnected</h2><div id="chrome"><button id="exit">Exit fullscreen</button></div></main>
+<main id="stage" class="contain"><img id="view" alt=""><video id="video" autoplay muted playsinline hidden></video><div id="disconnected"><svg class="oma-logo" viewBox="0 0 1200 1200" fill="currentColor" aria-hidden="true"><path clip-rule="evenodd" fill-rule="evenodd" d="m1200 1200h-480v-80h400v-1040h-479.996v160h-400v720h720v-720h-80v-80h159.996v880h-400v160h-640v-1200h1200zm-1120-80h480v-80h-400l.004-400h-80.004zm0-560h80.004v-400h400v-80h-480.004z"/></svg><svg class="oma-wordmark" viewBox="0 0 1215 285" fill="currentColor" aria-hidden="true"><path clip-rule="evenodd" fill-rule="evenodd" d="m720 120h-15v15h-14.998v14.999l-60.002.001v15.002l90-.002v.002h.002l-.002 89.998h-15v15h-13v15h-17v-89.998h-45v90l-45-.002v-89.998h-14.998v-30h14.998v-15.002h-14.998v-30.001h14.998v-75h15v-14.997h15v-15.002h105.002zm-90-.001h45v-74.997h-45z"/><path clip-rule="evenodd" fill-rule="evenodd" d="m105 30.002h15v14.997h15v180.001h-15v15h-15v15.002h-75v-15.002h-15v-15h-15v-180.001h15v-14.997h15v-15.002h75zm-60 194.998h45v-179.998h-45z"/><path d="m300 15h60v15h15v14.999h15v180.001h-15v15h-15v15h-15l-.004-209.998h-44.994v-.002h-.002v210.002h-45v-210h-44.998v179.997h-.002v30.003h-15v-15.002h-15v-15h-14.998v-180.001h14.998v-14.999h15v-15h60v-15h45z"/><path clip-rule="evenodd" fill-rule="evenodd" d="m555 225h-15v15h-15v15h-15v-105.001l-44.998.001v105.002h-45.002v-105.002h-15v-30.001h15v-75h15.002v-14.997h15v-15.002h105zm-89.998-105.001h44.998v-74.997h-44.998z"/><path d="m885 75h-15v15h-15v15h-15v-59.998h-45v179.998h45v-59.998h15v14.997h15v15.001h15v30h-15v15h-15v15.002l-105-.002v-210.001h14.998v-14.997h15.002v-15.002h105z"/><path d="m960 119.999h45v-104.999h15v15h15v14.999h15v75.001h15v15h-15v90h-15v15h-15v15h-15v-105h-45v105.002l-45-.002v-105h-30v-15h15v-15.001h15v-75h15v-14.997h15v-15.002h15z"/><path d="m1125 119.999h45v-104.999h15v15h15v15h15v180h-15v15h-15v15.002l-75-.002v-15h-15v-15h-15v-45.001h15v-14.997-.002h30v60h45v-75h-90v-105.001h15v-14.997h15v-15.002h15z"/></svg><h2 id="disconnected-copy">OmaBeam disconnected</h2></div><div id="chrome"><button id="exit">Exit fullscreen</button></div></main>
 <footer>
   <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="transport-note"></span><span id="desktop-note"></span><span id="error" role="alert"></span>
   <details id="diagnostics">
@@ -151,7 +172,9 @@ const error = document.getElementById('error');
 const pause = document.getElementById('pause');
 let paused = false, ended = false, retry = null, fit = 0, failures = 0;
 let latestStats = null;
+const disconnectedCopy = document.getElementById('disconnected-copy');
 function setStatus(message, state) { status.textContent = message; document.body.dataset.state = state; }
+function labelTransport() { transport.textContent = preferRtc ? 'Video: Auto' : 'Video: JPEG'; }
 const fits = ['contain', 'width', 'actual'];
 const fitLabels = ['contain', 'fill width', 'actual size'];
 let pc = null, peerId = null, epoch = 0, firstFrameTimer = null;
@@ -183,7 +206,7 @@ function showDesktopBlocked() {
   ownsDesktop = false; desktopBlocked = true;
   stopPlayback(); clearTimeout(retry); retry = null;
   stage.classList.add('blocked');
-  document.getElementById('disconnected').textContent = 'This display is already connected to another device.';
+  disconnectedCopy.textContent = 'This display is already connected to another device.';
   setStatus('Display in use', 'connecting');
   desktopNote.textContent = 'Waiting for the display to become available…';
   document.getElementById('snapshot').removeAttribute('href');
@@ -328,7 +351,7 @@ function connectJpeg(reason = '') {
   stopPlayback();
   if (paused || ended || (latestStats?.desktop && !ownsDesktop)) return;
   fallbackReason = reason; playback = 'jpeg';
-  transport.textContent = reason && preferRtc ? 'Retry H.264' : (preferRtc ? 'Video: Auto' : 'Video: JPEG');
+  labelTransport();
   transportNote.textContent = reason ? `JPEG fallback · ${reason}` : 'JPEG';
   const url = mediaUrl('stream');
   img.src = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now(); setStatus('Connecting…', 'connecting');
@@ -351,7 +374,7 @@ async function connectRtc() {
   const active = () => current === epoch && !paused && !ended;
   const fallback = reason => { if (active()) connectJpeg(reason); };
   playback = 'connecting'; fallbackReason = '';
-  transport.textContent = 'Video: Auto'; transportNote.textContent = 'Connecting H.264…';
+  labelTransport(); transportNote.textContent = 'Connecting H.264…';
   setStatus('Connecting H.264…', 'connecting');
   firstFrameTimer = setTimeout(() => fallback('H.264 playback timed out'), 10000);
   try {
@@ -425,11 +448,11 @@ async function sampleBrowser() {
 function finish(message) {
   ended = true; clearTimeout(retry); retry = null; stopPlayback();
   releaseDesktop(); clearTimeout(matchTimer); matchDevice.disabled = true;
-  pause.disabled = true; transport.disabled = true;
+  pause.disabled = true; transport.disabled = true; transport.hidden = true;
   document.getElementById('snapshot').removeAttribute('href');
   stage.classList.add('ended');
   stage.classList.remove('blocked');
-  document.getElementById('disconnected').textContent = 'OmaBeam disconnected';
+  disconnectedCopy.textContent = 'OmaBeam disconnected';
   setStatus('Share ended', 'ended'); error.textContent = message;
 }
 img.onerror = () => {
@@ -444,11 +467,10 @@ pause.onclick = () => {
   renderDesktop(latestStats?.desktop);
 };
 transport.onclick = () => {
-  if (!fallbackReason) preferRtc = !preferRtc;
-  else preferRtc = true;
+  preferRtc = !preferRtc;
   fallbackReason = '';
   if (!paused) connect();
-  else transport.textContent = preferRtc ? 'Video: Auto' : 'Video: JPEG';
+  else labelTransport();
 };
 addEventListener('pagehide', () => { paused = true; stopPlayback(); releaseDesktop(); });
 addEventListener('pageshow', event => {
@@ -538,7 +560,7 @@ async function poll() {
     const stats = await response.json(); failures = 0;
     const initial = latestStats === null;
     latestStats = stats;
-    transport.hidden = !stats.webrtc;
+    transport.hidden = ended || stats.state === 'ended' || !stats.webrtc;
     renderDesktop(stats.desktop);
     if (stats.desktop && stats.state !== 'ended' && !paused) {
       if (ownsDesktop) {

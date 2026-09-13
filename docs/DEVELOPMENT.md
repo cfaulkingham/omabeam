@@ -182,7 +182,8 @@ until requested.
 
 ### H.264 over WebRTC
 
-`--webrtc` uses automatic hardware selection with built-in OpenH264 fallback.
+H.264 / WebRTC is the default transport. `--jpeg` selects JPEG/MJPEG.
+`--webrtc` remains accepted. Auto hardware selection uses built-in OpenH264 fallback.
 The separate `omabeam-encoder` binary uses system FFmpeg libraries and vendor
 drivers: NVENC first, then up to eight sorted VA-API render nodes on Linux;
 VideoToolbox on macOS. Detection attempts a real encode at the share's actual

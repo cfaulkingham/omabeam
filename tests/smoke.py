@@ -149,6 +149,8 @@ def browser_check(server, screenshot):
             page.route('**/stats', lambda route: route.fulfill(json={**server.stats(), 'state': 'ended', 'error': 'Selected window closed'}))
             page.get_by_role('heading', name='OmaBeam disconnected').wait_for()
             assert page.locator('#disconnected').is_visible()
+            assert page.locator('#disconnected .oma-logo').is_visible()
+            assert page.locator('#disconnected .oma-wordmark').is_visible()
             assert not page.locator('#view').is_visible()
             assert page.locator('#status').inner_text() == 'Share ended'
             assert page.locator('#error').inner_text() == 'Selected window closed'
@@ -171,7 +173,7 @@ def main():
     if opts.capture_output:
         for source, region in [(['--live', 'output', opts.capture_output], False), (['--live', 'region', opts.capture_output, '10', '20', '160', '100'], True)]:
             for native, limit in [(False, None), (True, None), (True, 128)]:
-                arguments = ['--fps', '5', '--cursor']
+                arguments = ['--jpeg', '--fps', '5', '--cursor']
                 if native:
                     arguments.append('--native-pixels')
                 if limit:
@@ -197,7 +199,7 @@ def main():
                         assert frame(stream).size == expected
         print('PASS real compositor output/region capture, logical/native pixels, width caps, and diagnostics')
         return
-    with Server(opts.binary, ['--fps', '5', '--width', '320']) as server:
+    with Server(opts.binary, ['--jpeg', '--fps', '5', '--width', '320']) as server:
         assert server.get('')[0] == 200
         assert server.get('missing')[0] == 404
         assert decode(server.get('frame.jpg')[1]).size == (320, 180)
@@ -237,7 +239,7 @@ def main():
         print('PASS real HTTP/MJPEG, dimensions, FPS, idle rate, viewer cleanup, session status')
     for width in [1, 17, 320]:
         for quality in [1, 55, 95]:
-            with Server(opts.binary, ['--width', str(width), '--quality', str(quality)]) as server:
+            with Server(opts.binary, ['--jpeg', '--width', str(width), '--quality', str(quality)]) as server:
                 assert decode(server.get('frame.jpg')[1]).size == (width, max(1, width * 360 // 640))
     print('PASS nine JPEG decode cases')
     for arguments in [['--demo', '--fps', '0'], ['--demo', '--quality', '96'], ['--width', '0'], ['--live', 'output', 'DP-1', 'extra'], ['--demo', 'unexpected']]:
@@ -245,7 +247,7 @@ def main():
         assert result.returncode == 1 and result.stderr, arguments
     print('PASS invalid arguments rejected before starting capture')
     if opts.browser:
-        with Server(opts.binary, ['--fps', '10', '--native-pixels']) as server:
+        with Server(opts.binary, ['--jpeg', '--fps', '10', '--native-pixels']) as server:
             browser_check(server, opts.screenshot)
 
 

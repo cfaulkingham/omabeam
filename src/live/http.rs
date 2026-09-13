@@ -736,6 +736,10 @@ mod tests {
         let html = viewer_html();
         assert!(html.contains("OmaBeam disconnected"));
         assert!(html.contains("id=\"disconnected\""));
+        assert!(html.contains("id=\"disconnected-copy\""));
+        assert!(html.contains("class=\"oma-logo\""));
+        assert!(html.contains("class=\"oma-wordmark\""));
+        assert!(!html.contains("Retry H.264"));
         assert!(!html.contains("Shared tile"));
         assert!(html.contains("#stage.ended #disconnected"));
     }

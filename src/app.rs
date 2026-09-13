@@ -135,7 +135,8 @@ Live options (also apply when opening the picker):
   --quality N           JPEG quality 1–95 (default 55)
   --width N             Limit encoded width in the selected pixel mode
   --native-pixels       Preserve captured pixels (default logical resolution)
-  --webrtc              Prefer H.264 over WebRTC with automatic JPEG fallback
+  --webrtc              H.264 over WebRTC (default) with automatic JPEG fallback
+  --jpeg                JPEG/MJPEG instead of H.264
   --webrtc-port N       UDP port for WebRTC (default 9848; 0 selects a port)
   --h264-bitrate N      Target bits/s for H.264 (default 4000000)
   --encoder MODE        auto (default), hardware, or software

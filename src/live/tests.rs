@@ -298,6 +298,19 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
         LiveConfig::parse_args(&config.to_cli_args()).unwrap().0,
         config
     );
+    assert!(LiveConfig::default().webrtc);
+    let (jpeg, _) = LiveConfig::parse_args(&args(&["--jpeg"])).unwrap();
+    assert!(!jpeg.webrtc);
+    assert_eq!(
+        LiveConfig::parse_args(&jpeg.to_cli_args()).unwrap().0,
+        jpeg
+    );
+    assert!(
+        LiveConfig::parse_args(&args(&["--jpeg", "--webrtc"]))
+            .unwrap()
+            .0
+            .webrtc
+    );
     for input in [
         vec!["--fps", "0"],
         vec!["--fps", "121"],
@@ -430,7 +443,10 @@ fn publish_uses_native_pixels_and_reports_capture_encode_measurements() {
         frame.logical_height = 180;
         frame
     };
-    let mut config = LiveConfig::default();
+    let mut config = LiveConfig {
+        webrtc: false,
+        ..LiveConfig::default()
+    };
     publish_frame(&frames, hidpi(), &config, Duration::from_millis(12)).unwrap();
     assert_eq!((frames.stats().width, frames.stats().height), (320, 180));
     config.pixel_mode = omabeam_capture::PixelMode::Native;
@@ -626,6 +642,7 @@ fn streams_a_jpeg_from_the_active_monitor() {
         LiveConfig {
             bind: "127.0.0.1".parse().unwrap(),
             port: 0,
+            webrtc: false,
             ..LiveConfig::default()
         },
     )

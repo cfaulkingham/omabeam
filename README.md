@@ -7,9 +7,9 @@ over one local-network link.**
 
 OmaBeam is a screen-sharing plugin for Omarchy and Hyprland. Use a tablet,
 laptop, or another device as a real extra desktop, or share what is already
-on screen. Preview first, then open the copied link in any browser. Optional
-H.264 uses GPU encoding when a compatible NVIDIA, Intel, or AMD encoder is
-available.
+on screen. Preview first, then open the copied link in any browser. H.264 uses GPU
+encoding when a compatible NVIDIA, Intel, or AMD encoder is available, and
+falls back to JPEG automatically.
 
 ## Features
 
@@ -19,7 +19,8 @@ available.
   computer's mouse and keyboard.
 - **Hardware-accelerated H.264:** NVIDIA NVENC or VA-API on Linux, and
   VideoToolbox in macOS demo builds. Auto selects a working GPU encoder after
-  a test frame, then falls back to OpenH264. JPEG remains the default transport.
+  a test frame, then falls back to OpenH264. H.264 / WebRTC is the default
+  transport; JPEG remains available as a fallback and a manual choice.
 - **Window, Screen, or Area:** choose from a workspace map, select a monitor,
   or drag a region. Preview the selection before sharing.
 - **Browser viewer:** pause/resume, snapshots, fullscreen, fit controls, and
@@ -126,8 +127,9 @@ when idle so it does not cover the host cursor, and enters fullscreen when the
 browser allows or when you tap the picture. Move windows onto the extra display
 using your Omarchy computer's mouse or keyboard. The extra display starts empty;
 windows and notifications placed there become visible to viewers. Native pixels
-and the host cursor are selected when entering this mode. Choose **Video
-transport → H.264 / WebRTC** for hardware-accelerated video. JPEG and H.264 use
+and the host cursor are selected when entering this mode. H.264 / WebRTC is
+the default video transport; choose **Video transport → JPEG** if you want
+MJPEG instead. JPEG and H.264 use
 the same firewall ports as other shares.
 
 An extended display accepts **one active browser client**. Additional devices
@@ -181,9 +183,10 @@ Window capture follows the selected window even when another window overlaps
 it. If the compositor cannot capture it separately, select an area explicitly.
 A lost source ends the share and clears the viewer image.
 
-Defaults: 15 FPS, JPEG quality 55, native logical width, cursor off, and
-local network (TCP **9847** on 0.0.0.0). Presets offer Balanced, Crisp text,
-and Smooth motion. Advanced exposes individual settings.
+Defaults: 15 FPS, H.264 / WebRTC with JPEG fallback, JPEG quality 55, native
+logical width, cursor off, and local network (TCP **9847** and UDP **9848** on
+0.0.0.0). Presets offer Balanced, Crisp text, and Smooth motion. Advanced exposes
+individual settings.
 
 Crisp text uses native captured pixels at JPEG quality 90, preserving fine
 detail on HiDPI displays. Balanced and Smooth motion use logical pixels.
@@ -199,18 +202,19 @@ Sent frames measure socket writes; they do not measure browser playback or
 end-to-end latency. Capture wait includes waiting for screen changes, so a
 static source can report 0 FPS without a problem.
 
-Choose **Video transport → H.264 / WebRTC** for optional compressed video.
-The encoder defaults to **Auto**: OmaBeam tries NVIDIA NVENC or VA-API
+**H.264 / WebRTC** is the default video transport. Choose **Video transport →
+JPEG** for MJPEG. The encoder defaults to **Auto**: OmaBeam tries NVIDIA NVENC or VA-API
 (Intel/AMD and other compatible drivers) on Linux, and VideoToolbox in macOS
 demo builds. A backend is selected only after it encodes a compatible frame.
 If hardware is unavailable or fails during a share, Auto continues with the
 built-in OpenH264 software encoder. Stream diagnostics show the selected
 encoder and any fallback reason. Advanced settings also offer **Hardware**
 (require GPU encoding) and **Software**.
-JPEG remains the default transport. H.264 starts with a 4 Mbit/s target;
+H.264 starts with a 4 Mbit/s target;
 Advanced lets you adjust the target bitrate. The browser automatically falls back to JPEG
-if H.264 negotiation or playback fails, and offers **Retry H.264**. Click
-**Video: Auto** to select JPEG manually. Pause releases the connection.
+if H.264 negotiation or playback fails, and stays on JPEG. Click **Video: Auto**
+to select JPEG manually, or **Video: JPEG** to try Auto again. Pause releases
+the connection. `--jpeg` selects JPEG/MJPEG from the command line.
 
 H.264 uses 4:2:0 color, which can soften fine colored text. Preview and browser
 snapshots remain JPEG; PNG screenshots are unchanged. Odd image dimensions
@@ -226,7 +230,7 @@ local host candidates only, with no external STUN/TURN servers. A TCP-only
 SSH tunnel uses JPEG fallback. Up to eight WebRTC viewers can connect.
 
 ```bash
-omabeam --webrtc --fps 30 --width 1280 --h264-bitrate 4000000
+omabeam --fps 30 --width 1280 --h264-bitrate 4000000
 ```
 
 To test encoder detection with generated frames, without capturing your desktop:
