@@ -34,8 +34,10 @@ button:disabled, a:not([href]) { opacity: 0.45; cursor: default; }
 #stage.actual img, #stage.actual video { display: block; max-width: none; max-height: none; }
 #stage:fullscreen, #stage.expanded { width: 100vw; height: 100dvh; }
 #stage.expanded { position: fixed; inset: 0; z-index: 10; }
-#exit { display: none; position: fixed; top: 12px; right: 12px; z-index: 11; }
-#stage:fullscreen #exit, #stage.expanded #exit { display: block; }
+#chrome { display: none; position: fixed; top: 12px; right: 12px; z-index: 11; gap: 8px; }
+#stage:fullscreen #chrome, #stage.expanded #chrome { display: flex; }
+body.idle, body.idle * { cursor: none !important; }
+body.idle #stage:fullscreen #chrome, body.idle #stage.expanded #chrome { display: none; }
 #disconnected {
   display: none;
   margin: 0;
@@ -94,7 +96,7 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
   </div>
   <nav aria-label="Viewer controls"><button id="match-device" aria-pressed="false" hidden>Match this device</button><button id="transport" hidden>Video: Auto</button><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
 </header>
-<main id="stage" class="contain"><img id="view" alt=""><video id="video" autoplay muted playsinline hidden></video><h2 id="disconnected">OmaBeam disconnected</h2><button id="exit">Exit fullscreen</button></main>
+<main id="stage" class="contain"><img id="view" alt=""><video id="video" autoplay muted playsinline hidden></video><h2 id="disconnected">OmaBeam disconnected</h2><div id="chrome"><button id="exit">Exit fullscreen</button></div></main>
 <footer>
   <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="transport-note"></span><span id="desktop-note"></span><span id="error" role="alert"></span>
   <details id="diagnostics">
@@ -208,6 +210,7 @@ async function claimDesktop() {
     document.getElementById('snapshot').href = mediaUrl('frame.jpg');
     renderDesktop(await response.json());
     if (matchEnabled) scheduleMatch();
+    tryDesktopFullscreen();
     return true;
   })();
   try { return await claiming; } finally { claiming = null; }
@@ -219,8 +222,14 @@ function renderDesktop(desktop) {
   matchDevice.setAttribute('aria-pressed', String(matchEnabled));
   matchDevice.textContent = matchEnabled ? 'Device size: On' : 'Match this device';
   matchDevice.title = matchEnabled ? 'Restore the size and scale selected on the host' : 'Resize the extended desktop to this viewing area';
-  if (!desktopBlocked) desktopNote.textContent = desktop.updating ? 'Resizing desktop…' :
-    (desktop.error || `Desktop ${desktop.config.width}×${desktop.config.height} · ${desktop.config.scale * 100}% scale`);
+  if (!desktopBlocked) {
+    desktopNote.textContent = desktop.updating ? 'Resizing desktop…' :
+      (desktop.error || `Desktop ${desktop.config.width}×${desktop.config.height} · ${desktop.config.scale * 100}% scale`);
+    if (ownsDesktop && !desktop.updating && !desktop.error &&
+        document.fullscreenElement !== stage && !stage.classList.contains('expanded')) {
+      desktopNote.textContent += ' · Tap the picture to enter fullscreen';
+    }
+  }
 }
 function requestedDeviceSize() {
   const rect = stage.getBoundingClientRect();
@@ -272,7 +281,38 @@ matchDevice.onclick = () => {
 };
 new ResizeObserver(scheduleMatch).observe(stage);
 addEventListener('resize', scheduleMatch);
-document.addEventListener('fullscreenchange', scheduleMatch);
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement) stage.classList.remove('expanded');
+  placeDesktopControls();
+  if (latestStats?.desktop) renderDesktop(latestStats.desktop);
+  scheduleMatch();
+});
+let idleTimer = null;
+function markActive() {
+  document.body.classList.remove('idle');
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => document.body.classList.add('idle'), 2000);
+}
+for (const type of ['pointermove', 'pointerdown', 'keydown']) addEventListener(type, markActive, {passive: true});
+markActive();
+function placeDesktopControls() {
+  const overlay = document.fullscreenElement === stage || stage.classList.contains('expanded');
+  if (overlay) document.getElementById('chrome').insertBefore(matchDevice, document.getElementById('exit'));
+  else document.querySelector('nav').prepend(matchDevice);
+}
+function tryDesktopFullscreen() {
+  if (!ownsDesktop || paused || ended || document.fullscreenElement === stage) return;
+  stage.requestFullscreen?.().catch(() => {});
+}
+function enterDesktopFullscreen() {
+  if (!ownsDesktop || paused || ended) return;
+  if (document.fullscreenElement === stage || stage.classList.contains('expanded')) return;
+  fullscreen();
+}
+stage.addEventListener('pointerdown', event => {
+  if (event.target.closest('#chrome')) return;
+  enterDesktopFullscreen();
+});
 function releasePeer(id) {
   if (id) fetch(mediaUrl('webrtc/close'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}), keepalive: true}).catch(() => {});
 }
@@ -421,9 +461,13 @@ document.getElementById('fit').onclick = e => {
 async function fullscreen() {
   try { if (stage.requestFullscreen) await stage.requestFullscreen(); else stage.classList.add('expanded'); }
   catch { stage.classList.add('expanded'); }
+  placeDesktopControls();
+  if (latestStats?.desktop) renderDesktop(latestStats.desktop);
 }
 async function exitFullscreen() {
   stage.classList.remove('expanded');
+  placeDesktopControls();
+  if (latestStats?.desktop) renderDesktop(latestStats.desktop);
   if (document.fullscreenElement) await document.exitFullscreen();
 }
 document.getElementById('fullscreen').onclick = fullscreen;

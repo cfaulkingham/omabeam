@@ -151,6 +151,10 @@ def check_browser(fixture, browser, artifacts):
     assert fixture.stats()['desktop']['occupied']
     assert len(fixture.compositor.outputs) == 2
     second.wait_for_function("ownsDesktop && playback === 'webrtc'", timeout=25000)
+    second.locator('#stage').click(position={'x': 40, 'y': 40})
+    second.wait_for_function("document.fullscreenElement === stage || stage.classList.contains('expanded')")
+    second.locator('#exit').click()
+    second.wait_for_function("document.fullscreenElement === null && !stage.classList.contains('expanded')")
     second.locator('#match-device').click()
     second.wait_for_function("latestStats.desktop.matched && video.videoWidth === 1800")
     assert fixture.stats()['desktop']['config']['scale'] == 2

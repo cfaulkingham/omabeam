@@ -68,14 +68,22 @@ class Compositor:
                             if self.hold_create:
                                 self.release.wait(10)
                     elif request.startswith('/eval hl.monitor('):
-                        match = re.fullmatch(r'/eval hl.monitor\(\{ output = "(OMABEAM-[0-9a-f]{32})", mode = "(\d+)x(\d+)@60", position = "(-?\d+)x(-?\d+)", scale = (\d+) \}\)', request)
-                        assert match, request
-                        name, w, h, x, y, scale = match.groups()
-                        if self.fail_config or self.fail_next_config:
-                            self.fail_next_config = False
-                            reply = 'configuration rejected'
+                        extra = re.fullmatch(r'/eval hl.monitor\(\{ output = "(OMABEAM-[0-9a-f]{32})", mode = "(\d+)x(\d+)@60", position = "(-?\d+)x(-?\d+)", scale = (\d+) \}\)', request)
+                        pin = re.fullmatch(r'/eval hl.monitor\(\{ output = "([A-Za-z0-9._-]+)", mode = "(\d+)x(\d+)@[\d.]+", position = "(-?\d+)x(-?\d+)", scale = [\d.]+, transform = (\d+) \}\)', request)
+                        if extra:
+                            name, w, h, x, y, scale = extra.groups()
+                            if self.fail_config or self.fail_next_config:
+                                self.fail_next_config = False
+                                reply = 'configuration rejected'
+                            else:
+                                self.outputs[name] = monitor(name, int(w), int(h), int(scale), int(x), int(y))
+                        elif pin:
+                            name, w, h, x, y, transform = pin.groups()
+                            assert name in self.outputs and not name.startswith('OMABEAM-'), name
+                            current = self.outputs[name]
+                            self.outputs[name] = monitor(name, int(w), int(h), current['scale'], int(x), int(y))
                         else:
-                            self.outputs[name] = monitor(name, int(w), int(h), int(scale), int(x), int(y))
+                            raise AssertionError(request)
                     elif request.startswith('/output remove '):
                         name = request.split()[-1]
                         assert name != 'DP-1'
@@ -123,7 +131,12 @@ class ExtendedDesktop(unittest.TestCase):
         result = self.start()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('capture initialization failed', result.stderr)
-        self.assertTrue(any('position = "-1280x0"' in command for command in self.compositor.commands))
+        commands = self.compositor.commands
+        create = next(i for i, command in enumerate(commands) if command.startswith('/output create headless '))
+        pins = [i for i, command in enumerate(commands) if 'output = "DP-1"' in command]
+        self.assertTrue(pins and pins[0] < create, commands)
+        self.assertIn('position = "0x0"', commands[pins[0]])
+        self.assertTrue(any('position = "-1280x0"' in command for command in commands))
         self.assertEqual(list(self.compositor.outputs), ['DP-1'])
         self.assertFalse(self.journal.exists())
 

@@ -739,4 +739,16 @@ mod tests {
         assert!(!html.contains("Shared tile"));
         assert!(html.contains("#stage.ended #disconnected"));
     }
+
+    #[test]
+    fn viewer_hides_an_idle_pointer_and_requests_fullscreen_for_an_extended_display() {
+        let html = viewer_html();
+        assert!(html.contains("body.idle"));
+        assert!(html.contains("cursor: none"));
+        assert!(html.contains("id=\"chrome\""));
+        assert!(html.contains("tryDesktopFullscreen"));
+        assert!(html.contains("enterDesktopFullscreen"));
+        assert!(html.contains("placeDesktopControls"));
+        assert!(html.contains("Tap the picture to enter fullscreen"));
+    }
 }

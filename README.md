@@ -23,7 +23,9 @@ available.
 - **Window, Screen, or Area:** choose from a workspace map, select a monitor,
   or drag a region. Preview the selection before sharing.
 - **Browser viewer:** pause/resume, snapshots, fullscreen, fit controls, and
-  stream diagnostics. Viewers do not need an app.
+  stream diagnostics. The local pointer hides when idle. Extended-desktop
+  sessions enter fullscreen when the browser allows, or when you tap the
+  picture. Viewers do not need an app.
 - **Omarchy bar controls:** see the source and viewers, copy or open the link,
   send it to a nearby device, or stop sharing.
 - **Nearby sharing:** send the link to OmaSend or LocalSend devices. OmaBeam
@@ -119,13 +121,14 @@ landscape or portrait orientation, and placement beside your existing screens.
 The layout preview shows where the new display will appear. It is created only
 when you click **Extend desktop**.
 
-Open the copied link on your other device and use the viewer's fullscreen
-button. Move windows onto the extra display using your Omarchy computer's mouse
-or keyboard. The extra display starts empty; windows and notifications placed
-there become visible to viewers. Native pixels and the host cursor are selected
-when entering this mode. Choose **Video transport → H.264 / WebRTC** for
-hardware-accelerated video. JPEG and H.264 use the same firewall ports as other
-shares.
+Open the copied link on your other device. The viewer hides the local pointer
+when idle so it does not cover the host cursor, and enters fullscreen when the
+browser allows or when you tap the picture. Move windows onto the extra display
+using your Omarchy computer's mouse or keyboard. The extra display starts empty;
+windows and notifications placed there become visible to viewers. Native pixels
+and the host cursor are selected when entering this mode. Choose **Video
+transport → H.264 / WebRTC** for hardware-accelerated video. JPEG and H.264 use
+the same firewall ports as other shares.
 
 An extended display accepts **one active browser client**. Additional devices
 or tabs see “This display is already connected to another device.” Refreshing

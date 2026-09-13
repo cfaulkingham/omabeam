@@ -122,7 +122,7 @@ impl OmaBeam {
                 .child(field("Placement", position, cx))
                 .child(field("Orientation", orientation, cx)))
             .child(div().text_xs().text_color(cx.omarchy().secondary)
-                .child("Start sharing, open the link on your other device, and enter fullscreen. Move windows onto the extra screen using this computer’s mouse or keyboard."))
+                .child("Start sharing and open the link on your other device. The viewer hides the local pointer when idle and enters fullscreen when you tap the picture. Move windows onto the extra screen using this computer’s mouse or keyboard."))
             .child(div().text_xs().text_color(cx.omarchy().secondary)
                 .child("Stop sharing from the bar to remove the extra display. Closing the browser keeps it available for reconnection."))
     }

@@ -114,6 +114,64 @@ impl DesktopConfig {
     }
 }
 
+fn output_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn hypr_number(value: f32) -> String {
+    let rounded = value.round();
+    if (value - rounded).abs() < 0.0005 {
+        format!("{}", rounded as i32)
+    } else {
+        format!("{value:.4}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+/// Freeze an output at its current layout coordinates. Omarchy's catch-all
+/// `position = "auto"` would otherwise reflow it when a new display appears:
+/// Hyprland places explicit monitors first, then shoves auto monitors to their
+/// right, so an extra screen requested on the right becomes the origin.
+fn pin_command(monitor: &Monitor) -> Result<String> {
+    ensure!(
+        output_name_is_safe(&monitor.name),
+        "unrecognized display name"
+    );
+    Ok(format!(
+        "eval hl.monitor({{ output = \"{}\", mode = \"{}x{}@{}\", position = \"{}x{}\", scale = {}, transform = {} }})",
+        monitor.name,
+        monitor.width,
+        monitor.height,
+        hypr_number(monitor.refresh_rate),
+        monitor.x,
+        monitor.y,
+        hypr_number(monitor.scale),
+        monitor.transform
+    ))
+}
+
+fn extra_command(name: &str, config: &DesktopConfig, x: i32, y: i32) -> Result<String> {
+    ensure!(output_name_is_safe(name), "unrecognized display name");
+    Ok(format!(
+        "eval hl.monitor({{ output = \"{name}\", mode = \"{}x{}@60\", position = \"{x}x{y}\", scale = {} }})",
+        config.width, config.height, config.scale
+    ))
+}
+
+fn pin_outputs(ipc: &Ipc, monitors: &[Monitor]) -> Result<()> {
+    for monitor in monitors {
+        ipc.command(&pin_command(monitor)?)
+            .with_context(|| format!("Hyprland could not keep {} in place", monitor.name))?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OwnedDisplay {
     name: String,
@@ -171,6 +229,7 @@ impl VirtualDisplay {
             ipc,
             cleanup: true,
         };
+        pin_outputs(&guard.ipc, &monitors)?;
         guard
             .ipc
             .command(&format!("output create headless {}", guard.name()))
@@ -193,10 +252,10 @@ impl VirtualDisplay {
             .into_iter()
             .filter(|m| m.name != self.name())
             .collect();
+        pin_outputs(&self.ipc, &others)?;
         let (x, y) = config.placement(&others)?;
-        self.ipc.command(&format!(
-            "eval hl.monitor({{ output = \"{}\", mode = \"{}x{}@60\", position = \"{}x{}\", scale = {} }})",
-            self.name(), config.width, config.height, x, y, config.scale))
+        self.ipc
+            .command(&extra_command(self.name(), config, x, y)?)
             .context("Hyprland could not configure the extended display")?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
@@ -320,6 +379,28 @@ mod tests {
             assert_eq!(config.placement(&monitors).unwrap(), expected);
         }
         assert!(config.placement(&[]).is_err());
+    }
+
+    #[test]
+    fn pin_command_freezes_auto_monitors_at_their_current_layout_coordinates() {
+        let physical = monitor(-1920, 100, 1920, 1080, 1.25, 1);
+        assert_eq!(
+            pin_command(&physical).unwrap(),
+            r#"eval hl.monitor({ output = "physical", mode = "1920x1080@60", position = "-1920x100", scale = 1.25, transform = 1 })"#
+        );
+        let mut bad = physical;
+        bad.name = "DP-1; output remove DP-1".into();
+        assert!(pin_command(&bad).is_err());
+        assert!(
+            extra_command(
+                "OMABEAM-0123456789abcdef0123456789abcdef",
+                &DesktopConfig::default(),
+                1920,
+                0
+            )
+            .is_ok()
+        );
+        assert!(extra_command("DP-1;evil", &DesktopConfig::default(), 0, 0).is_err());
     }
 
     #[test]

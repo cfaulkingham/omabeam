@@ -143,6 +143,7 @@ mod tests {
             x: 0,
             y: 0,
             scale: 1.25,
+            refresh_rate: 60.,
             focused: true,
             reserved: [0, 26, 0, 0],
             active_workspace: Workspace {

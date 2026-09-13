@@ -41,6 +41,7 @@ pub(super) fn snapshot() -> Snapshot {
             x: 0,
             y: 0,
             scale: 1.,
+            refresh_rate: 60.,
             transform: 0,
             focused: true,
             reserved: [0; 4],

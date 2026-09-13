@@ -1075,6 +1075,7 @@ mod tests {
             x: 0,
             y: 0,
             scale,
+            refresh_rate: 60.,
             transform: 0,
             focused: true,
             reserved: [0, reserved_top, 0, 0],

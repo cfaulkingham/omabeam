@@ -68,6 +68,7 @@ pub struct Monitor {
     pub x: i32,
     pub y: i32,
     pub scale: f32,
+    pub refresh_rate: f32,
     pub transform: u32,
     pub focused: bool,
     pub reserved: [i32; 4],
@@ -493,6 +494,8 @@ struct RawMonitor {
     x: i32,
     y: i32,
     scale: f32,
+    #[serde(rename = "refreshRate", default)]
+    refresh_rate: Option<f32>,
     #[serde(default)]
     transform: u32,
     focused: bool,
@@ -549,6 +552,10 @@ pub fn parse_monitors(json: &str) -> Result<Vec<Monitor>> {
             x: monitor.x,
             y: monitor.y,
             scale: monitor.scale,
+            refresh_rate: monitor
+                .refresh_rate
+                .filter(|rate| *rate > 0.0)
+                .unwrap_or(60.0),
             transform: monitor.transform,
             focused: monitor.focused,
             reserved: monitor.reserved.unwrap_or([0, 0, 0, 0]),

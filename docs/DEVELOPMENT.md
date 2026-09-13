@@ -92,9 +92,12 @@ process whose pidfd still matches the recorded start time, uid, and `--live`
 or `--demo` command.
 
 Extended desktop sessions create a random `OMABEAM-` output through socket1,
-configure it with `eval hl.monitor(...)`, verify its layout, and capture that
-named output. A session lock serializes startup and recovery. A private
-`display.json` records the exact output and compositor instance before creation.
+pin existing monitors to their current coordinates, configure the extra output
+with `eval hl.monitor(...)`, verify its layout, and capture that named output.
+Pinning keeps Omarchy's catch-all `position = "auto"` from shoving physical
+displays aside when the extra screen is attached. A session lock serializes
+startup and recovery. A private `display.json` records the exact output and
+compositor instance before creation.
 Failed starts and graceful termination remove the owned output after capture
 stops. Recovery after a forced kill uses that record, never a prefix scan of
 monitors. If removal fails, the record remains for `omabeam --stop` to retry.
@@ -110,6 +113,11 @@ lease. Page exit/pause invalidates its media immediately while reserving the
 tab's reconnection identity for that grace period. Both JPEG routes and WebRTC
 signaling require `?viewer=PAGE_ID`; ongoing JPEG and RTC delivery also checks
 the lease. Stats contain display configuration and occupancy, never either ID.
+
+The viewer hides the local pointer after two idle seconds, including the
+fullscreen controls on an extra display. Owning an extended display requests
+fullscreen immediately; browsers that require a gesture retry when the picture
+is tapped. Match-this-device stays available in the fullscreen overlay.
 
 Client sizing is opt-in and debounced. It uses the viewer stage's CSS dimensions
 and the nearest supported desktop density (1× or 2×), rounds to even pixels,
