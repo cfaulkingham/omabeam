@@ -304,6 +304,12 @@ if [[ -f $ROOT/Cargo.toml ]]; then
   # Keep build caches outside the plugin checkout (plugin folders forbid symlinks).
   CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omabeam/build}" \
     cargo install --path "$ROOT" --root "$ROOT/omarchy-plugin/native" --locked --force
+  echo "==> building the optional hardware encoder helper"
+  if ! CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omabeam/build}" \
+    cargo install --path "$ROOT/crates/omabeam-encoder" --root "$ROOT/omarchy-plugin/native" --locked --force; then
+    echo "WARNING: Hardware encoder helper could not be built. Auto mode can use software H.264."
+    echo "On Omarchy, install ffmpeg (including its development files) and rerun this installer for GPU encoding."
+  fi
 elif [[ ! -x $NATIVE ]]; then
   echo "install.sh: this bundle has neither source nor a native binary." >&2
   exit 1
@@ -312,6 +318,7 @@ fi
   echo "install.sh: the native app cannot run here. Check the bundle architecture and runtime dependencies." >&2
   exit 1
 }
+echo "Check GPU encoding with: $NATIVE --check-encoders"
 if $BACKEND_ONLY; then
   echo "OmaBeam native app ready. Open the bar panel and check status again."
   check_ports

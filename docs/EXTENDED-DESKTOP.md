@@ -31,3 +31,18 @@ The receiver is the existing browser viewer. This implementation uses the
 host's input devices; browser-to-host keyboard/touch injection, multiple
 simultaneous independently configured displays, USB device discovery, and the
 OpenDisplay wire protocol are separate features.
+
+## Verification status — 2026-09-13
+
+Passed the macOS and Linux Rust suites, six extended-display lifecycle tests,
+five packaging tests, and thirteen firewall tests. Browser smoke tests passed,
+as did actual output/region capture from a software-rendered Sway compositor.
+The native picker was visually checked in landscape and portrait, including
+switching back to screenshot mode.
+
+On 2026-09-13, the user confirmed that they had tested extended desktop on
+Omarchy and it was working, resolving the remaining live-verification blocker.
+This is user-reported manual acceptance; the automated live acceptance script
+was not run by the agent. The procedure in `docs/DEVELOPMENT.md` remains
+available for repeatable checks of output creation, browser playback and
+reconnection, and removal.

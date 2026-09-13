@@ -33,6 +33,8 @@ def source_copy(destination):
         shutil.copy2(ROOT / name, destination / name)
     shutil.copytree(ROOT / "omarchy-plugin", destination / "omarchy-plugin", ignore=shutil.ignore_patterns("native", "__pycache__"))
     shutil.copytree(ROOT / "docs", destination / "docs")
+    (destination / "crates/omabeam-encoder").mkdir(parents=True)
+    shutil.copy2(ROOT / "crates/omabeam-encoder/Cargo.toml", destination / "crates/omabeam-encoder/Cargo.toml")
     (destination / "vendor/localsend").mkdir(parents=True)
     shutil.copy2(ROOT / "vendor/localsend/LICENSE", destination / "vendor/localsend/LICENSE")
     shutil.copy2(ROOT / "vendor/localsend/UPSTREAM.md", destination / "vendor/localsend/UPSTREAM.md")
@@ -56,7 +58,7 @@ class Packaging(unittest.TestCase):
         self.licenses.write_text("test-only license fixture\n")
 
     def package(self, target="x86_64-unknown-linux-gnu"):
-        return PACKAGER.package(self.binary, target, self.licenses, self.base / "dist", root=self.source)
+        return PACKAGER.package(self.binary, target, self.licenses, self.base / "dist", root=self.source, encoder_helper=self.binary)
 
     def test_archive_layout_modes_checksum_and_reproducibility(self):
         (self.source / "omarchy-plugin/native/bin").mkdir(parents=True)
@@ -69,6 +71,7 @@ class Packaging(unittest.TestCase):
             manifest = json.load(tar.extractfile(f"{PLUGIN_ID}/manifest.json"))
             self.assertIn(f"{PLUGIN_ID}/{manifest['entryPoints']['barWidget']}", tar.getnames())
             self.assertEqual(tar.getmember(f"{PLUGIN_ID}/omarchy-plugin/native/bin/omabeam").mode, 0o755)
+            self.assertEqual(tar.getmember(f"{PLUGIN_ID}/omarchy-plugin/native/bin/omabeam-encoder").mode, 0o755)
             self.assertEqual(tar.getmember(f"{PLUGIN_ID}/omarchy-plugin/omabeam").mode, 0o755)
             self.assertTrue(all(member.isfile() for member in tar.getmembers()))
             self.assertIn(f"{PLUGIN_ID}/docs/DEVELOPMENT.md", tar.getnames())
@@ -90,6 +93,20 @@ class Packaging(unittest.TestCase):
         manifest_path.write_text(json.dumps(manifest))
         with self.assertRaisesRegex(ValueError, "entry point"):
             self.package()
+
+    def test_rejects_an_invalid_or_non_executable_encoder_helper(self):
+        helper = self.base / "helper"
+        helper.write_bytes(b"wrong architecture")
+        helper.chmod(0o755)
+        def package():
+            return PACKAGER.package(self.binary, "x86_64-unknown-linux-gnu", self.licenses,
+                self.base / "dist", root=self.source, encoder_helper=helper)
+        with self.assertRaisesRegex(ValueError, "ELF"):
+            package()
+        helper.write_bytes(self.binary.read_bytes())
+        helper.chmod(0o644)
+        with self.assertRaisesRegex(ValueError, "executable"):
+            package()
 
     def test_launcher_requires_plugin_binary_and_preserves_literal_arguments(self):
         home, tools = self.base / "home", self.base / "tools"
@@ -130,11 +147,13 @@ if sys.argv[1:3] == ["plugin", "validate"]:
     assert (root / manifest["entryPoints"]["barWidget"]).is_file()
 ''')
         executable(tools / "cargo", f'''#!{sys.executable}
-import sys
+import os, sys
 from pathlib import Path
 assert "--locked" in sys.argv
 root = Path(sys.argv[sys.argv.index("--root") + 1])
-path = root / "bin/omabeam"
+name = "omabeam-encoder" if Path(sys.argv[sys.argv.index("--path") + 1]).name == "omabeam-encoder" else "omabeam"
+if name == "omabeam-encoder" and os.environ.get("OMABEAM_TEST_HELPER_FAIL"): sys.exit(1)
+path = root / "bin" / name
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text({native!r})
 path.chmod(0o755)
@@ -144,11 +163,18 @@ path.chmod(0o755)
             result = subprocess.run(["bash", str(path / "install.sh"), *args], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
             return result
-        self.assertIn("WARNING: LAN viewing", install(self.source, "--backend-only").stdout)
+        env["OMABEAM_TEST_HELPER_FAIL"] = "1"
+        result = install(self.source, "--backend-only")
+        self.assertIn("WARNING: LAN viewing", result.stdout)
+        self.assertIn("Hardware encoder helper could not be built", result.stdout)
+        self.assertTrue((self.source / "omarchy-plugin/native/bin/omabeam").is_file())
+        self.assertFalse((self.source / "omarchy-plugin/native/bin/omabeam-encoder").exists())
+        env.pop("OMABEAM_TEST_HELPER_FAIL")
         self.assertFalse((config / "omarchy").exists())
         install(self.source)
         installed = config / "omarchy/plugins" / PLUGIN_ID
         self.assertTrue((installed / "omarchy-plugin/native/bin/omabeam").is_file())
+        self.assertTrue((installed / "omarchy-plugin/native/bin/omabeam-encoder").is_file())
         self.assertTrue((installed / "RELEASING.md").is_file())
         self.assertTrue((installed / "omarchy-plugin/firewall.py").is_file())
         self.assertIn(str(installed / "omarchy-plugin/omabeam"), (hypr / "bindings.lua").read_text())

@@ -82,6 +82,13 @@ def main():
                 page.wait_for_function("document.querySelector('img').naturalWidth === 1280")
                 page.wait_for_function("document.querySelector('#source').textContent.includes('Extended desktop')")
                 page.screenshot(path=str(artifacts / 'viewer.png'))
+                page.close()
+                # A viewer can disconnect and reconnect to the same output.
+                assert any(m['name'] == owned_name for m in json.loads(command('--hypr', 'monitors').stdout))
+                page = browser.new_page()
+                page.goto(status['url'])
+                page.wait_for_function("document.querySelector('img').naturalWidth === 1280")
+                page.wait_for_function("document.querySelector('#source').textContent.includes('Extended desktop')")
                 browser.close()
             # Disconnecting the viewer must leave the desktop available.
             assert any(m['name'] == owned_name for m in json.loads(command('--hypr', 'monitors').stdout))

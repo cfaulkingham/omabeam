@@ -84,13 +84,18 @@ cargo bundle-licenses --format yaml --output target/THIRDPARTY.yml
 # Review the report and fill missing license texts before distribution.
 python3 scripts/package-plugin.py \
   --binary target/release/omabeam \
+  --encoder-helper target/release/omabeam-encoder \
   --target x86_64-unknown-linux-gnu \
   --licenses target/THIRDPARTY.yml
 ```
 
 The packager checks the ELF architecture, entry point, and absence of symlinks.
 It includes runtime files, the binary, installer, documentation, and licenses.
-Build caches and session data are excluded. Identical inputs produce identical
+Both executables must have the target architecture; the hardware helper is
+installed beside the app. It links system FFmpeg (`libavcodec`, `libavutil`,
+`libavformat`); include it in the runtime-library report and verify the target
+system has the matching ABI and GPU drivers. The main app can fall back to
+software if the helper cannot load. Build caches and session data are excluded. Identical inputs produce identical
 archives. Review `licenses/THIRDPARTY.yml` before distributing workflow artifacts.
 
 The workflow targets x86_64 GNU/Linux. The packager also accepts

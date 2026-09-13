@@ -1,0 +1,21 @@
+[package]
+name = "omabeam-encoder"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Isolated hardware H.264 encoder for OmaBeam"
+
+[features]
+default = ["hardware"]
+hardware = ["dep:ffmpeg-next"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format"], optional = true }
+
+[[bin]]
+name = "omabeam-encoder"
+path = "src/main.rs"
+required-features = ["hardware"]

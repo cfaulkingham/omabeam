@@ -9,10 +9,11 @@ pub(crate) mod status;
 #[cfg(test)]
 mod tests;
 mod webrtc;
+pub use webrtc::probe_encoder;
 
 use crate::{capture::CaptureRequest, portal::Selection};
 use anyhow::{Context, Result, bail, ensure};
-pub use config::LiveConfig;
+pub use config::{EncoderMode, LiveConfig};
 use diagnostics::FrameMeasurement;
 pub use diagnostics::{StreamDiagnostics, TimingStats, ViewerDiagnostics};
 pub use http::viewer_html;

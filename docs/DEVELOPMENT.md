@@ -5,12 +5,18 @@
 Use a current stable Rust toolchain with edition 2024 support. Linux builds
 need a C/C++ toolchain, Clang, CMake, NASM (x86 H.264 assembly), pkg-config, Fontconfig, FreeType, Wayland,
 libxkbcommon, libxcb, and OpenSSL development libraries. CI lists the Ubuntu
-package names.
+package names. The hardware helper also needs FFmpeg development libraries
+(`libavcodec`, `libavutil`, `libavformat`). Arch/Omarchy supplies these in
+`ffmpeg`; macOS development can use Homebrew's `ffmpeg`.
 
 ```bash
 cargo build --locked
 cargo run --locked
 ```
+
+The workspace builds `omabeam` and the adjacent `omabeam-encoder` helper.
+`cargo build -p omabeam --locked` builds just the app with software encoding
+and does not require FFmpeg. Only the helper links to system FFmpeg libraries.
 
 Real capture requires Hyprland. macOS builds support synthetic demos and
 native UI review; they do not capture the Mac desktop:
@@ -29,7 +35,8 @@ HTTP/WebRTC server. `--demo-picker` uses synthetic sources with sharing disabled
 | --- | --- |
 | `src/app/` | Picker, preview worker, branding, settings, nearby-device UI |
 | `src/live/` | Browser viewer, HTTP delivery, stream settings and state |
-| `src/live/webrtc.rs`, `src/live/webrtc/encoder.rs` | LAN ICE/DTLS/RTP peers and shared software H.264 encoder |
+| `src/live/webrtc.rs`, `src/live/webrtc/encoder.rs` | LAN ICE/DTLS/RTP peers and shared adaptive H.264 encoder |
+| `crates/omabeam-encoder/` | Bounded pipe protocol and isolated FFmpeg hardware encoder helper |
 | `src/localsend.rs` | Discovery and viewer-link sending |
 | `src/hypr/` and `src/hypr.rs` | Hyprland IPC and picker positioning |
 | `src/hypr/desktop.rs`, `src/app/desktop.rs` | Extended output ownership, recovery, placement, and picker controls |
@@ -65,8 +72,10 @@ Live sessions reuse their capture connection and buffers. JPEG streams default
 to logical output resolution. `--native-pixels` (also selected by Crisp text)
 uses the captured pixel dimensions; `--width` caps either mode without
 upscaling its pixel grid. Preview and live encoding use the same mode and width
-limit. PNG screenshots keep capture resolution. The backend uses CPU-accessible shared memory; GPU
-encoding, HDR color management, and DMA-BUF-only sources are unsupported.
+limit. PNG screenshots keep capture resolution. Capture uses CPU-accessible
+shared memory. Hardware encoding uploads these frames to the GPU; capture,
+resizing, and RGB-to-YUV conversion still use the CPU. HDR color management
+and DMA-BUF-only sources are unsupported.
 
 All viewer routes require the session's 128-bit URL token. The server limits
 concurrent clients to 64 and bounds request/response time. Pausing disconnects
@@ -143,8 +152,27 @@ until requested.
 
 ### H.264 over WebRTC
 
-`--webrtc` opts into software OpenH264, built from source into the binary;
-there is no runtime FFmpeg or encoder download. `str0m` supplies ICE-lite,
+`--webrtc` uses automatic hardware selection with built-in OpenH264 fallback.
+The separate `omabeam-encoder` binary uses system FFmpeg libraries and vendor
+drivers: NVENC first, then up to eight sorted VA-API render nodes on Linux;
+VideoToolbox on macOS. Detection attempts a real encode at the share's actual
+resolution, rather than trusting GPU names or FFmpeg's codec list. All hardware
+output is checked for Annex B framing, constrained-baseline SPS, and SPS/PPS
+on requested IDRs. VideoToolbox software fallback is disabled.
+
+The helper communicates only through inherited pipes with versioned, bounded
+headers and frame sizes. Driver stderr is continuously drained into a bounded
+tail. The host allows five seconds for initial encoding and 750 ms for later
+frames; a failed, malformed, or stalled helper is killed and reaped. Auto falls
+back to OpenH264 with a fresh IDR and records `encoder_note`; it does not retry a
+failed device until the next share. Working hardware is reopened on a size
+change. Explicit `--encoder hardware` instead reports a WebRTC encoder error,
+allowing the existing JPEG fallback. `--encoder software` skips the helper.
+Missing/incompatible FFmpeg runtime libraries cannot prevent the main app from
+starting, because it does not link them. Release helper binaries must match the
+target system's FFmpeg ABI; source installs build against the local libraries.
+
+`str0m` supplies ICE-lite,
 DTLS-SRTP, RTP H.264 packetization, retransmission, and feedback. Only one
 receive-only video track, constrained-baseline H.264, and packetization mode
 1 are negotiated. Audio, data channels, incoming media, and remote control
@@ -176,7 +204,7 @@ has a ten-second first-playback deadline, then falls back to JPEG; stalled
 decoding also falls back. Pause, page exit, source loss, and stale async
 answers release peer resources.
 
-The `webrtc` stats object reports software encoder timings, dimensions,
+The `webrtc` stats object reports the selected encoder, fallback reason, timings, dimensions,
 encoded FPS/frames/keyframes, dropped frames, connected/pending peers,
 failures, and UDP bytes/rates (including DTLS/RTCP and retransmissions).
 Existing `diagnostics` delivery counters remain JPEG-only. Browser
@@ -194,6 +222,7 @@ cargo test --workspace --locked
 cargo build --locked
 python3 tests/firewall.py
 python3 tests/extended_desktop.py --binary target/debug/omabeam
+python3 tests/hardware_encoding.py --binary target/debug/omabeam
 python3 tests/packaging.py
 python3 -m venv /tmp/omabeam-tests
 /tmp/omabeam-tests/bin/pip install 'Pillow>=10,<13' 'playwright>=1.50,<2' 'PySide6-Essentials>=6.8,<6.11'
@@ -207,6 +236,20 @@ The WebRTC test needs a Chromium/Chrome build exposing H.264 in
 `RTCRtpReceiver.getCapabilities("video")`. It prefers system Chrome/Chromium;
 set `OMABEAM_TEST_CHROMIUM` or `--browser-executable` to select another build.
 Playwright's bundled Chromium can lack H.264 and will exercise fallback only.
+
+On a GPU-equipped machine, require actual hardware success (software fallback
+does not pass these checks):
+
+```bash
+python3 tests/hardware_encoding.py --binary target/debug/omabeam --require-hardware
+/tmp/omabeam-tests/bin/python tests/hardware_encoding.py --binary target/debug/omabeam --require-hardware --browser
+/tmp/omabeam-tests/bin/python tests/webrtc.py --binary target/debug/omabeam --encoder hardware
+```
+
+Rust tests inject helper crashes, stalls, and oversized responses, verify bounded
+failure handling, and decode the independent software IDR after a backend switch.
+The hardware browser check also terminates its own encoder helper and confirms
+that browser decoding continues through the switch to software.
 
 Rust tests cover capture protocols, stable window identity, errors, buffer
 reuse, HTTP delivery, and IPC. Browser tests cover playback controls and

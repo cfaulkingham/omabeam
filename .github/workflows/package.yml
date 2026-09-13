@@ -12,7 +12,7 @@ jobs:
       - name: Linux desktop build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang cmake nasm pkg-config libfontconfig1-dev libfreetype6-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev
+          sudo apt-get install -y build-essential clang cmake nasm pkg-config libfontconfig1-dev libfreetype6-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev libavcodec-dev libavutil-dev libavformat-dev
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
       - run: cargo build --release --locked
@@ -21,6 +21,7 @@ jobs:
           python-version: '3.12'
       - run: python tests/firewall.py
       - run: python tests/extended_desktop.py --binary target/release/omabeam
+      - run: python tests/hardware_encoding.py --binary target/release/omabeam
       - run: python tests/packaging.py
       - run: python -m pip install 'Pillow>=10,<13' 'playwright>=1.50,<2'
       - run: python -m playwright install --with-deps chromium chrome
@@ -32,8 +33,8 @@ jobs:
           cargo bundle-licenses --format yaml --output target/THIRDPARTY.yml
       - name: Assemble plugin and native app
         run: |
-          python scripts/package-plugin.py --binary target/release/omabeam --target x86_64-unknown-linux-gnu --licenses target/THIRDPARTY.yml
-          ldd target/release/omabeam > dist/linux-runtime-libraries.txt
+          python scripts/package-plugin.py --binary target/release/omabeam --encoder-helper target/release/omabeam-encoder --target x86_64-unknown-linux-gnu --licenses target/THIRDPARTY.yml
+          ldd target/release/omabeam target/release/omabeam-encoder > dist/linux-runtime-libraries.txt
       - uses: actions/upload-artifact@v4
         with:
           name: omabeam-omarchy-linux-x86_64

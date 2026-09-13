@@ -1,6 +1,7 @@
 //! LAN-only, receive-only H.264. One encoder feeds at most eight peers through
 //! a one-frame channel. ICE/DTLS/RTP run independently of capture and encoding.
 mod encoder;
+pub use encoder::probe as probe_encoder;
 
 use super::{
     LiveConfig,
@@ -43,6 +44,8 @@ pub(super) struct RawFrame {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WebRtcStats {
     pub encoder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoder_note: Option<String>,
     pub udp_port: u16,
     pub target_bitrate: u32,
     pub peers: usize,
@@ -148,7 +151,7 @@ pub(super) fn start(
         failed: AtomicBool::new(false),
         metrics: Mutex::new(Metrics {
             stats: WebRtcStats {
-                encoder: "OpenH264 software".into(),
+                encoder: "Waiting for viewer".into(),
                 udp_port: port,
                 target_bitrate: config.h264_bitrate,
                 ..Default::default()
@@ -238,7 +241,7 @@ impl Peer {
             .set_ice_lite(true)
             .set_crypto_provider(Arc::new(str0m::crypto::from_feature_flags()))
             .set_send_buffer_video(512);
-        // OpenH264 produces constrained baseline. Never negotiate Main/High or
+        // Every backend must produce constrained baseline. Never negotiate Main/High or
         // packetization mode 0 and then feed it a different bitstream.
         config
             .codec_config()

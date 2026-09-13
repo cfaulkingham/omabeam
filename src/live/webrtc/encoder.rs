@@ -1,4 +1,7 @@
 use super::*;
+mod hardware;
+use crate::live::config::EncoderMode;
+use openh264::formats::YUVSource;
 use openh264::{
     OpenH264API, Timestamp,
     encoder::{
@@ -28,6 +31,110 @@ fn create(config: &LiveConfig) -> Result<Encoder> {
             .num_threads(2)
             .intra_frame_period(IntraFramePeriod::from_num_frames(config.fps * 2)),
     )?)
+}
+
+struct AdaptiveEncoder {
+    config: LiveConfig,
+    software: Encoder,
+    hardware: Option<hardware::Hardware>,
+    attempted: bool,
+    name: String,
+    note: Option<String>,
+}
+impl AdaptiveEncoder {
+    fn new(config: &LiveConfig) -> Result<Self> {
+        Ok(Self {
+            config: config.clone(),
+            software: create(config)?,
+            hardware: None,
+            attempted: config.encoder == EncoderMode::Software,
+            name: "OpenH264 software".into(),
+            note: None,
+        })
+    }
+    fn encode(&mut self, yuv: &YUVBuffer, pts: i64, mut force: bool) -> Result<(Vec<u8>, bool)> {
+        if self
+            .hardware
+            .as_ref()
+            .is_some_and(|h| h.dimensions != yuv.dimensions())
+        {
+            self.hardware = None;
+            self.attempted = false;
+        }
+        let hardware_result = (|| {
+            if !self.attempted {
+                self.attempted = true;
+                let (w, h) = yuv.dimensions();
+                self.hardware = Some(hardware::Hardware::new(&omabeam_encoder::Config {
+                    version: omabeam_encoder::VERSION,
+                    width: w as u32,
+                    height: h as u32,
+                    fps: self.config.fps.min(60),
+                    bitrate: self.config.h264_bitrate,
+                })?);
+            }
+            match &mut self.hardware {
+                Some(hardware) => {
+                    let frame = hardware.encode(yuv, pts, force)?;
+                    self.name = hardware.name.clone();
+                    self.note = None;
+                    Ok(Some(frame))
+                }
+                None => Ok(None),
+            }
+        })();
+        match hardware_result {
+            Ok(Some(frame)) => return Ok(frame),
+            Ok(None) => {}
+            Err(error) => {
+                self.hardware = None;
+                if self.config.encoder == EncoderMode::Hardware {
+                    return Err(error);
+                }
+                self.note = Some(
+                    format!("Hardware unavailable; using software. {error:#}")
+                        .chars()
+                        .take(600)
+                        .collect(),
+                );
+                self.name = "OpenH264 software".into();
+                // A backend switch must restart the prediction sequence with
+                // fresh SPS/PPS and IDR, even when the desktop is static.
+                force = true;
+            }
+        }
+        if force {
+            self.software.force_intra_frame();
+        }
+        let bitstream = self
+            .software
+            .encode_at(yuv, Timestamp::from_millis((pts.max(0) / 1000) as u64))?;
+        Ok((bitstream.to_vec(), bitstream.frame_type() == FrameType::IDR))
+    }
+}
+
+pub fn probe(config: &LiveConfig) -> Result<serde_json::Value> {
+    let mut config = config.clone();
+    config.fps = config.fps.min(60);
+    let raw = RawFrame {
+        frame: omabeam_capture::demo_frame(0),
+        config: config.clone(),
+    };
+    let yuv = yuv(&raw)?;
+    let mut encoder = AdaptiveEncoder::new(&config)?;
+    // Verify first frame, a delta, and a forced IDR at the negotiated profile.
+    for (pts, force) in [(0, true), (100_000, false), (200_000, true)] {
+        let (bytes, _) = encoder.encode(&yuv, pts, force)?;
+        let idr = omabeam_encoder::inspect_h264(&bytes)?;
+        ensure!(
+            !force || idr,
+            "encoder probe did not return a requested IDR"
+        );
+    }
+    Ok(
+        serde_json::json!({ "encoder": encoder.name, "hardware": encoder.hardware.is_some(),
+        "note": encoder.note, "width": yuv.dimensions().0, "height": yuv.dimensions().1 }),
+    )
 }
 
 /// Pad odd edges by one pixel for I420 without rescaling native text.
@@ -79,7 +186,7 @@ pub(super) fn run(
     tx: SyncSender<Encoded>,
 ) -> Result<()> {
     config.fps = config.fps.min(60);
-    let mut encoder = create(&config)?;
+    let mut encoder = AdaptiveEncoder::new(&config)?;
     let origin = Instant::now();
     let mut last_generation = 0;
     let mut last_frame = origin;
@@ -113,15 +220,7 @@ pub(super) fn run(
         };
         let at = Instant::now();
         let yuv = yuv(&raw)?;
-        if force {
-            encoder.force_intra_frame();
-        }
-        let bitstream = encoder.encode_at(
-            &yuv,
-            Timestamp::from_millis(origin.elapsed().as_millis() as u64),
-        )?;
-        let keyframe = bitstream.frame_type() == FrameType::IDR;
-        let bytes = bitstream.to_vec();
+        let (bytes, keyframe) = encoder.encode(&yuv, origin.elapsed().as_micros() as i64, force)?;
         last_frame = at;
         last_generation = generation;
         if bytes.is_empty() {
@@ -134,6 +233,8 @@ pub(super) fn run(
         {
             use openh264::formats::YUVSource;
             let mut metrics = service.metrics.lock().unwrap();
+            metrics.stats.encoder = encoder.name.clone();
+            metrics.stats.encoder_note = encoder.note.clone();
             metrics.stats.width = yuv.dimensions().0 as u32;
             metrics.stats.height = yuv.dimensions().1 as u32;
             metrics.stats.encoded_frames += 1;
@@ -226,6 +327,7 @@ mod static_tests {
     fn a_new_peer_gets_an_idr_without_any_new_capture_and_source_loss_stops_encoding() {
         let config = LiveConfig {
             webrtc: true,
+            encoder: EncoderMode::Software,
             ..Default::default()
         };
         let frames = Arc::new(FrameState::new("unchanged source".into()));
@@ -263,5 +365,99 @@ mod static_tests {
         frames.fail("window closed".into());
         worker.join().unwrap().unwrap();
         assert!(frames.inner.lock().unwrap().raw.is_none());
+    }
+}
+
+#[cfg(test)]
+mod hardware_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fixture(mode: &str) -> (tempfile::TempDir, YUVBuffer, AdaptiveEncoder) {
+        let directory = tempfile::tempdir().unwrap();
+        let config = LiveConfig::default();
+        let mut frame = omabeam_capture::demo_frame(0);
+        frame.logical_width = 64;
+        frame.logical_height = 64;
+        let pixels = yuv(&RawFrame {
+            frame,
+            config: config.clone(),
+        })
+        .unwrap();
+        let mut software = create(&config).unwrap();
+        software.force_intra_frame();
+        let packet = software.encode(&pixels).unwrap().to_vec();
+        std::fs::write(directory.path().join("frame.h264"), packet).unwrap();
+        std::fs::write(directory.path().join("mode"), mode).unwrap();
+        let helper = directory.path().join("helper");
+        std::fs::write(
+            &helper,
+            r#"#!/usr/bin/env python3
+import json, pathlib, struct, sys, time
+root = pathlib.Path(__file__).parent
+mode = (root / 'mode').read_text()
+source, target = sys.stdin.buffer, sys.stdout.buffer
+size = struct.unpack('<I', source.read(4))[0]
+config = json.loads(source.read(size))
+length = config['width'] * config['height'] * 3 // 2
+packet = (root / 'frame.h264').read_bytes()
+for index in range(2):
+    if len(source.read(9 + length)) != 9 + length: sys.exit(0)
+    if index == 1:
+        if mode == 'stall': time.sleep(30)
+        elif mode == 'oversized':
+            target.write(struct.pack('<I', 0xffffffff)); target.flush(); time.sleep(30)
+        else: sys.exit(1)
+    header = json.dumps({'encoder': 'Fixture hardware', 'bytes': len(packet)}).encode()
+    target.write(struct.pack('<I', len(header)) + header + packet); target.flush()
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut encoder = AdaptiveEncoder::new(&config).unwrap();
+        encoder.hardware = Some(
+            hardware::Hardware::spawn(
+                &helper,
+                &omabeam_encoder::Config {
+                    version: omabeam_encoder::VERSION,
+                    width: 64,
+                    height: 64,
+                    fps: 15,
+                    bitrate: config.h264_bitrate,
+                },
+            )
+            .unwrap(),
+        );
+        encoder.attempted = true;
+        (directory, pixels, encoder)
+    }
+
+    #[test]
+    fn helper_failure_recovers_with_a_decodable_software_idr_and_does_not_retry() {
+        for mode in ["crash", "stall", "oversized"] {
+            let (_directory, pixels, mut encoder) = fixture(mode);
+            assert!(encoder.encode(&pixels, 0, true).unwrap().1);
+            assert_eq!(encoder.name, "Fixture hardware");
+            let started = Instant::now();
+            let (packet, idr) = encoder.encode(&pixels, 100_000, false).unwrap();
+            assert!(started.elapsed() < Duration::from_secs(3), "{mode}");
+            assert!(idr && omabeam_encoder::inspect_h264(&packet).unwrap());
+            let mut decoder = openh264::decoder::Decoder::new().unwrap();
+            assert_eq!(
+                decoder.decode(&packet).unwrap().unwrap().dimensions(),
+                (64, 64)
+            );
+            assert_eq!(encoder.name, "OpenH264 software");
+            assert!(encoder.note.is_some() && encoder.hardware.is_none() && encoder.attempted);
+            encoder.encode(&pixels, 200_000, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn explicit_hardware_mode_reports_failure_instead_of_silently_using_software() {
+        let (_directory, pixels, mut encoder) = fixture("crash");
+        encoder.config.encoder = EncoderMode::Hardware;
+        encoder.encode(&pixels, 0, true).unwrap();
+        assert!(encoder.encode(&pixels, 100_000, false).is_err());
     }
 }

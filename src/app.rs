@@ -137,7 +137,9 @@ Live options (also apply when opening the picker):
   --native-pixels       Preserve captured pixels (default logical resolution)
   --webrtc              Prefer H.264 over WebRTC with automatic JPEG fallback
   --webrtc-port N       UDP port for WebRTC (default 9848; 0 selects a port)
-  --h264-bitrate N      Target bits/s for software H.264 (default 4000000)
+  --h264-bitrate N      Target bits/s for H.264 (default 4000000)
+  --encoder MODE        auto (default), hardware, or software
+  --check-encoders      Test H.264 encoding and report the selected backend
   --cursor              Include cursor
   --bind ADDRESS        Default 0.0.0.0 (local network); 127.0.0.1 for this computer only
   --port N              Default 9847; 0 chooses an available port

@@ -25,6 +25,14 @@ fn run() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if args.first().is_some_and(|arg| arg == "--check-encoders") {
+        anyhow::ensure!(args.len() == 1, "unexpected command argument");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&omabeam::live::probe_encoder(&config)?)?
+        );
+        return Ok(());
+    }
     if args.first().is_some_and(|arg| arg == "--demo") {
         anyhow::ensure!(args.len() == 1, "unexpected command argument");
         if !std::env::args().any(|arg| arg == "--bind") {

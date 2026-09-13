@@ -1,4 +1,5 @@
 use super::*;
+use crate::live::EncoderMode;
 use omabeam_capture::PixelMode;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +262,23 @@ impl OmaBeam {
                 .collect(),
             move |index, window, cx| changed(&index, window, cx),
         );
+        let changed = cx.listener(|this, index: &usize, _, cx| {
+            this.live_config.encoder = EncoderMode::ALL[*index];
+            cx.notify();
+        });
+        let encoder_menu = menu(
+            "encoder-menu",
+            dropdown("encoder", self.live_config.encoder.label(), self.busy, cx),
+            EncoderMode::ALL
+                .iter()
+                .map(|mode| {
+                    MenuItem::new(mode.label())
+                        .checked(*mode == self.live_config.encoder)
+                        .disabled(self.busy)
+                })
+                .collect(),
+            move |index, window, cx| changed(&index, window, cx),
+        );
         div().flex().flex_col().gap_2().p_3().bg(cx.omarchy().inset)
             .border_1()
             .border_color(cx.omarchy().divider())
@@ -269,9 +287,10 @@ impl OmaBeam {
                 .child(field("JPEG quality", jpeg_menu, cx))
                 .child(field("Maximum width", width_menu, cx))
                 .child(field("Pixel detail", pixel_menu, cx))
-                .when(self.live_config.webrtc, |row| row.child(field("H.264 target bitrate", bitrate_menu, cx))))
+                .when(self.live_config.webrtc, |row| row.child(field("H.264 target bitrate", bitrate_menu, cx))
+                    .child(field("Encoder", encoder_menu, cx))))
             .when(self.live_config.webrtc, |root| root.child(div().text_xs().text_color(cx.omarchy().secondary)
-                .child("H.264 uses a software encoder and a separate UDP connection. Viewers fall back to JPEG when needed. Preview and snapshots use JPEG.")))
+                .child("Auto uses a working hardware encoder when available and falls back to software. Hardware requires GPU encoding; if unavailable, viewers can use JPEG. Preview and snapshots use JPEG.")))
             .child(div().text_xs().text_color(cx.omarchy().secondary)
                 .child("Native pixels preserve fine text on scaled displays and use more bandwidth. Maximum width still applies."))
             .child(div().text_xs().text_color(cx.omarchy().secondary).child(if self.live_config.bind.is_loopback() {

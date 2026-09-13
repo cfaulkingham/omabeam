@@ -61,7 +61,7 @@ footer { flex-shrink: 0; padding: 12px 20px; font-size: 12px; display: flex; ali
 .diagnostic-body { max-height: 40dvh; overflow: auto; padding-top: 6px; }
 .diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 12px 20px; margin: 6px 0 14px; }
 .diagnostic-grid dt { font-size: 11px; }
-.diagnostic-grid dd { margin: 4px 0 0; color: var(--foreground); font-variant-numeric: tabular-nums; }
+.diagnostic-grid dd { margin: 4px 0 0; color: var(--foreground); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .diagnostic-note { line-height: 1.5; margin: 10px 0; max-width: 100ch; }
 .client-table { overflow-x: auto; }
 #clients { border-collapse: collapse; width: 100%; white-space: nowrap; text-align: left; font-variant-numeric: tabular-nums; }
@@ -113,6 +113,7 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
       </dl>
       <dl id="rtc-diagnostics" class="diagnostic-grid" hidden>
         <div><dt>H.264 encoder</dt><dd id="rtc-encoder">—</dd></div>
+        <div id="rtc-note-row" hidden><dt>Encoder fallback</dt><dd id="rtc-note">—</dd></div>
         <div><dt>H.264 encoded size / fps</dt><dd id="rtc-size">—</dd></div>
         <div><dt>Scale + H.264 · p50 / p95</dt><dd id="rtc-encode">—</dd></div>
         <div><dt>WebRTC peers / outgoing</dt><dd id="rtc-outgoing">—</dd></div>
@@ -307,6 +308,8 @@ function renderDiagnostics(stats) {
   document.getElementById('rtc-diagnostics').hidden = !rtc;
   document.getElementById('rtc-note').hidden = !rtc;
   if (rtc) {
+    document.getElementById('rtc-note-row').hidden = !rtc.encoder_note;
+    document.getElementById('rtc-note').textContent = rtc.encoder_note || '';
     const values = {
       encoder: `${rtc.encoder} · ${number(rtc.target_bitrate / 1e6)} Mbit/s target`,
       size: `${dimensions(rtc.width, rtc.height)} · ${number(rtc.encoded_fps)} fps`,

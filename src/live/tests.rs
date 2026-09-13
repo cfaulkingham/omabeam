@@ -63,6 +63,8 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
         "0",
         "--h264-bitrate",
         "8000000",
+        "--encoder",
+        "hardware",
         "--bind",
         "::1",
         "--port",
@@ -73,6 +75,7 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
     assert_eq!(config.fps, 30);
     assert!(config.cursor && config.webrtc);
     assert_eq!(config.h264_bitrate, 8_000_000);
+    assert_eq!(config.encoder, EncoderMode::Hardware);
     assert_eq!(config.webrtc_port, 0);
     assert_eq!(config.pixel_mode, omabeam_capture::PixelMode::Native);
     assert_eq!(
@@ -91,6 +94,8 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
         vec!["--webrtc-port", "65536"],
         vec!["--h264-bitrate", "0"],
         vec!["--h264-bitrate", "50000001"],
+        vec!["--encoder", "unknown"],
+        vec!["--encoder"],
     ] {
         assert!(LiveConfig::parse_args(&args(&input)).is_err(), "{input:?}");
     }

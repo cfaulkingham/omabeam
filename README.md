@@ -131,9 +131,15 @@ end-to-end latency. Capture wait includes waiting for screen changes, so a
 static source can report 0 FPS without a problem.
 
 Choose **Video transport → H.264 / WebRTC** for optional compressed video.
-JPEG remains the default. WebRTC uses a built-in OpenH264 software encoder
-with a 4 Mbit/s target; Advanced lets you adjust the target bitrate. There is
-no hardware acceleration yet. The browser automatically falls back to JPEG
+The encoder defaults to **Auto**: OmaBeam tries NVIDIA NVENC or VA-API
+(Intel/AMD and other compatible drivers) on Linux, and VideoToolbox in macOS
+demo builds. A backend is selected only after it encodes a compatible frame.
+If hardware is unavailable or fails during a share, Auto continues with the
+built-in OpenH264 software encoder. Stream diagnostics show the selected
+encoder and any fallback reason. Advanced settings also offer **Hardware**
+(require GPU encoding) and **Software**.
+JPEG remains the default transport. H.264 starts with a 4 Mbit/s target;
+Advanced lets you adjust the target bitrate. The browser automatically falls back to JPEG
 if H.264 negotiation or playback fails, and offers **Retry H.264**. Click
 **Video: Auto** to select JPEG manually. Pause releases the connection.
 
@@ -153,6 +159,19 @@ SSH tunnel uses JPEG fallback. Up to eight WebRTC viewers can connect.
 ```bash
 omabeam --webrtc --fps 30 --width 1280 --h264-bitrate 4000000
 ```
+
+To test encoder detection with generated frames, without capturing your desktop:
+
+```bash
+omabeam --check-encoders
+omabeam --check-encoders --encoder hardware
+```
+
+Hardware encoding uses the adjacent `omabeam-encoder` helper and system FFmpeg
+libraries. The installer builds the helper when its dependencies are available;
+on Omarchy these come from the `ffmpeg` package. Matching GPU drivers and device
+permissions are also required. The main app still runs with software encoding
+if the helper or its libraries are missing. `--encoder software` skips detection.
 
 Links use a fresh random token and plain HTTP. Anyone on the local network
 with the link can view the share. If a firewall blocks viewers, allow TCP 9847

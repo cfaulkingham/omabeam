@@ -223,9 +223,10 @@ def main():
     parser.add_argument('--browser-executable', default=os.environ.get('OMABEAM_TEST_CHROMIUM') or shutil.which('google-chrome') or shutil.which('chromium'))
     parser.add_argument('--capture-output')
     parser.add_argument('--sway-socket')
+    parser.add_argument('--encoder', choices=['auto', 'hardware', 'software'], default='auto')
     args = parser.parse_args()
     source = ['--live', 'output', args.capture_output] if args.capture_output else None
-    with Server(args.binary, ['--bind', '0.0.0.0', '--webrtc', '--webrtc-port', '0', '--fps', '15', '--native-pixels'], source) as server:
+    with Server(args.binary, ['--bind', '0.0.0.0', '--webrtc', '--webrtc-port', '0', '--fps', '15', '--native-pixels', '--encoder', args.encoder], source) as server:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, executable_path=args.browser_executable)
             try:
@@ -233,6 +234,10 @@ def main():
                     static_capture(server, browser, args.capture_output, args.sway_socket)
                 else:
                     checks(server, browser, args.screenshot)
+                    selected = server.stats()['webrtc']['encoder']
+                    if args.encoder == 'hardware':
+                        assert selected != 'OpenH264 software', selected
+                    print(f'PASS selected encoder: {selected}')
                     signaling(server, browser)
                     fallback(server, browser)
                     dimension_checks(args.binary, browser)

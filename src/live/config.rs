@@ -5,6 +5,37 @@ use std::{
     time::Duration,
 };
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EncoderMode {
+    #[default]
+    Auto,
+    Hardware,
+    Software,
+}
+impl EncoderMode {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Hardware, Self::Software];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Hardware => "hardware",
+            Self::Software => "software",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Hardware => "Hardware",
+            Self::Software => "Software",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.as_str() == value)
+            .context("encoder must be auto, hardware, or software")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveConfig {
     pub fps: u32,
@@ -14,6 +45,7 @@ pub struct LiveConfig {
     pub webrtc: bool,
     pub webrtc_port: u16,
     pub h264_bitrate: u32,
+    pub encoder: EncoderMode,
     pub cursor: bool,
     pub bind: IpAddr,
     pub port: u16,
@@ -29,6 +61,7 @@ impl Default for LiveConfig {
             webrtc: false,
             webrtc_port: 9848,
             h264_bitrate: 4_000_000,
+            encoder: EncoderMode::Auto,
             cursor: false,
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: super::LIVE_PORT,
@@ -80,11 +113,12 @@ impl LiveConfig {
                 "--native-pixels" => config.pixel_mode = PixelMode::Native,
                 "--webrtc" => config.webrtc = true,
                 "--fps" | "--quality" | "--width" | "--bind" | "--port" | "--webrtc-port"
-                | "--h264-bitrate" => {
+                | "--h264-bitrate" | "--encoder" => {
                     let value = args
                         .next()
                         .with_context(|| format!("{arg} needs a value"))?;
                     match arg.as_str() {
+                        "--encoder" => config.encoder = EncoderMode::parse(value)?,
                         "--webrtc-port" => {
                             config.webrtc_port = value.parse().context("invalid WebRTC UDP port")?
                         }
@@ -124,6 +158,7 @@ impl LiveConfig {
                                 | "--send-link"
                                 | "--hide"
                                 | "--hypr"
+                                | "--check-encoders"
                                 | "--help"
                                 | "-h"
                         ) =>
@@ -156,6 +191,8 @@ impl LiveConfig {
             self.webrtc_port.to_string(),
             "--h264-bitrate".into(),
             self.h264_bitrate.to_string(),
+            "--encoder".into(),
+            self.encoder.as_str().into(),
         ];
         if let Some(width) = self.max_width {
             args.extend(["--width".into(), width.to_string()]);
