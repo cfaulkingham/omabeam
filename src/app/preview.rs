@@ -153,6 +153,13 @@ impl super::OmaBeam {
     }
 
     pub(super) fn can_confirm(&self) -> bool {
+        if self.page == super::Page::Extend {
+            return !self.picker
+                && !self.screenshot_mode
+                && self.snapshot().is_some_and(|snapshot| {
+                    self.desktop_config.placement(&snapshot.monitors).is_ok()
+                });
+        }
         if self.picker {
             return self.portal_selection().is_some();
         }

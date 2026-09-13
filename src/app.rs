@@ -19,6 +19,7 @@ use crate::portal::{PortalWindow, Selection, parse_window_list};
 
 mod brand;
 mod demo;
+mod desktop;
 mod preview;
 mod send;
 mod settings;
@@ -45,6 +46,7 @@ enum Page {
     Windows,
     Outputs,
     Region,
+    Extend,
 }
 
 impl Page {
@@ -53,6 +55,7 @@ impl Page {
             0 => Self::Tiles,
             1 => Self::Outputs,
             2 => Self::Region,
+            3 => Self::Extend,
             _ => Self::Tiles,
         }
     }
@@ -62,6 +65,7 @@ impl Page {
             Self::Tiles | Self::Windows => 0,
             Self::Outputs => 1,
             Self::Region => 2,
+            Self::Extend => 3,
         }
     }
 }
@@ -120,6 +124,9 @@ Usage:
   omabeam --live output NAME
   omabeam --live window ADDRESS STABLE_ID [LABEL]
   omabeam --live region OUTPUT X Y W H
+  omabeam --live extend WIDTH HEIGHT SCALE POSITION
+                         Create an extra desktop; SCALE is 1 or 2;
+                         POSITION is right, left, above, or below
   omabeam --demo       Synthetic stream without a Wayland desktop (localhost)
   omabeam --demo-picker Preview the native picker with synthetic sources; no sharing
 
@@ -139,7 +146,7 @@ Live options (also apply when opening the picker):
 Keys:
   h/j/k/l or arrows      Move between tiles
   Tab / Shift+Tab        Move between controls
-  Ctrl+Tab               Cycle Window, Screen, Area
+  Ctrl+Tab               Cycle Window, Screen, Area, Extend desktop
   Enter                  Start sharing (or copy in Screenshot mode)
   c                      Copy a screenshot of the tile
   s                      Save a screenshot
@@ -170,6 +177,7 @@ pub struct OmaBeam {
     selected_window: Option<String>,
     selected_output: Option<String>,
     live_config: LiveConfig,
+    desktop_config: crate::hypr::desktop::DesktopConfig,
     follow_workspace: bool,
     status: SharedString,
     busy: bool,
@@ -383,6 +391,7 @@ impl OmaBeam {
             selected_window,
             selected_output,
             live_config: options.live_config,
+            desktop_config: Default::default(),
             follow_workspace: true,
             status: "".into(),
             busy: false,
@@ -552,7 +561,7 @@ impl OmaBeam {
                     self.outputs_scroll.scroll_to_item(index);
                 }
             }
-            Page::Region => {}
+            Page::Region | Page::Extend => {}
         }
     }
 
@@ -616,6 +625,7 @@ impl OmaBeam {
 
     fn portal_selection(&self) -> Option<Selection> {
         match self.page {
+            Page::Extend => None,
             Page::Outputs => self.selected_monitor().map(|monitor| Selection::Screen {
                 name: monitor.name.clone(),
             }),
@@ -674,6 +684,7 @@ impl OmaBeam {
 
     fn capture_request(&self) -> Option<anyhow::Result<CaptureRequest>> {
         match self.page {
+            Page::Extend => None,
             Page::Outputs => self.selected_monitor().map(|m| Ok(request_for_monitor(m))),
             Page::Region => self
                 .selected_region
@@ -759,6 +770,7 @@ impl OmaBeam {
 
     fn live_source(&self) -> Option<LiveSource> {
         match self.page {
+            Page::Extend => Some(LiveSource::Extend(self.desktop_config.clone())),
             Page::Tiles | Page::Windows => {
                 let client = self.selected_client()?;
                 if client.is_picker() {
@@ -815,7 +827,12 @@ impl OmaBeam {
 
     fn start_live_source(&mut self, source: LiveSource, cx: &mut Context<Self>) {
         self.busy = true;
-        self.status = "Starting live share…".into();
+        self.status = if self.page == Page::Extend {
+            "Creating your extended desktop…"
+        } else {
+            "Starting live share…"
+        }
+        .into();
         cx.notify();
         hide_picker();
         let config = self.live_config.clone();
@@ -853,9 +870,24 @@ impl OmaBeam {
     }
 
     fn cycle_page(&mut self, delta: i32) {
-        let next = (self.page.index() as i32 + delta).rem_euclid(3) as usize;
-        self.page = Page::from_index(next);
+        let count = if self.picker || self.screenshot_mode {
+            3
+        } else {
+            4
+        };
+        let next = (self.page.index() as i32 + delta).rem_euclid(count) as usize;
+        self.select_page(Page::from_index(next));
         self.status_for_page();
+    }
+
+    fn select_page(&mut self, page: Page) {
+        if page == Page::Extend && self.page != Page::Extend {
+            // A second screen should show the host pointer and retain its
+            // configured pixel resolution, including a 2× desktop scale.
+            self.live_config.cursor = true;
+            self.live_config.pixel_mode = omabeam_capture::PixelMode::Native;
+        }
+        self.page = page;
     }
 
     fn status_for_page(&mut self) {
@@ -1017,6 +1049,8 @@ mod tests {
         assert_eq!(Page::Outputs.index(), 1);
         assert_eq!(Page::Windows.index(), Page::Tiles.index());
         assert_eq!(Page::from_index(2), Page::Region);
+        assert_eq!(Page::from_index(3), Page::Extend);
+        assert_eq!(Page::Extend.index(), 3);
     }
 
     #[test]
@@ -1039,6 +1073,7 @@ mod tests {
             x: 0,
             y: 0,
             scale,
+            transform: 0,
             focused: true,
             reserved: [0, reserved_top, 0, 0],
             active_workspace: crate::hypr::Workspace {

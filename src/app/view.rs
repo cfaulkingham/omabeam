@@ -9,18 +9,22 @@ impl Render for OmaBeam {
                 return;
             }
             if *index != 0 || !matches!(this.page, Page::Tiles | Page::Windows) {
-                this.page = Page::from_index(*index);
+                this.select_page(Page::from_index(*index));
             }
             this.status_for_page();
             cx.notify();
         });
+        let mut choices = vec![
+            ChoiceItem::new("window", "Window").disabled(self.busy),
+            ChoiceItem::new("screen", "Screen").disabled(self.busy),
+            ChoiceItem::new("area", "Area").disabled(self.busy),
+        ];
+        if !self.picker && !self.screenshot_mode {
+            choices.push(ChoiceItem::new("extend", "Extend desktop").disabled(self.busy));
+        }
         let tabs = tab_list(
             "source-types",
-            vec![
-                ChoiceItem::new("window", "Window").disabled(self.busy),
-                ChoiceItem::new("screen", "Screen").disabled(self.busy),
-                ChoiceItem::new("area", "Area").disabled(self.busy),
-            ],
+            choices,
             Some(self.page.index()),
             move |index, window, cx| source_changed(&index, window, cx),
             window,
@@ -159,7 +163,13 @@ impl Render for OmaBeam {
                                             .child(self.render_source_toolbar(cx))
                                             .child(self.render_sources(cx)),
                                     )
-                                    .child(div().flex_1().min_w_0().child(self.render_preview(cx))),
+                                    .child(div().flex_1().min_w_0().child(
+                                        if self.page == Page::Extend {
+                                            self.render_desktop_preview(cx).into_any_element()
+                                        } else {
+                                            self.render_preview(cx).into_any_element()
+                                        },
+                                    )),
                             )
                             .when(!self.picker && !self.screenshot_mode, |d| {
                                 d.child(separator(cx))
@@ -239,6 +249,9 @@ impl OmaBeam {
                             .disabled(self.busy)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.screenshot_mode = !this.screenshot_mode;
+                                if this.page == Page::Extend {
+                                    this.page = Page::Outputs;
+                                }
                                 this.status = "".into();
                                 cx.notify();
                             })),
@@ -308,6 +321,8 @@ impl OmaBeam {
                         "Pick a window"
                     } else if self.page == Page::Outputs {
                         "Pick a display"
+                    } else if self.page == Page::Extend {
+                        "Set up an extra display"
                     } else {
                         "Select an area"
                     }),
@@ -328,6 +343,7 @@ impl OmaBeam {
             Page::Windows => self.render_windows(cx).into_any_element(),
             Page::Outputs => self.render_outputs(cx).into_any_element(),
             Page::Region => self.render_region(cx).into_any_element(),
+            Page::Extend => self.render_desktop_settings(cx).into_any_element(),
         }
     }
 
@@ -667,12 +683,14 @@ impl OmaBeam {
             Page::Tiles | Page::Windows => self.selected_client().map(client_label),
             Page::Outputs => self.selected_monitor().map(Monitor::label),
             Page::Region => self.selected_region.as_ref().map(|_| "Custom area".into()),
+            Page::Extend => Some("Extended desktop".into()),
         }
         .unwrap_or_else(|| "Nothing selected".into());
         let privacy = match self.page {
             Page::Tiles | Page::Windows => "Only this window. Other windows stay out of view.",
             Page::Outputs => "Everything on this display is visible, including notifications.",
             Page::Region => "Anything entering this rectangle will be visible.",
+            Page::Extend => "The extra display is created when you start sharing.",
         };
         let message = self.preview_error.clone().unwrap_or_else(|| {
             if self.preview_key.is_some() {
@@ -792,6 +810,8 @@ impl OmaBeam {
             "Share with app"
         } else if self.screenshot_mode {
             "Copy screenshot"
+        } else if self.page == Page::Extend {
+            "Extend desktop"
         } else {
             "Start sharing"
         };
@@ -818,6 +838,8 @@ impl OmaBeam {
                     .text_color(cx.omarchy().secondary)
                     .child(if self.busy {
                         "Preparing your source…"
+                    } else if self.demo {
+                        "Demo · sharing is disabled"
                     } else if ready {
                         "Ready to share"
                     } else {

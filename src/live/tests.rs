@@ -105,6 +105,7 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
 #[test]
 fn source_arguments_preserve_identity_and_never_fall_back_to_screen_pixels() {
     let sources = [
+        LiveSource::Extend(crate::hypr::desktop::DesktopConfig::default()),
         LiveSource::Output {
             name: "DP-1".into(),
         },

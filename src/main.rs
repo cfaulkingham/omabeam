@@ -34,7 +34,7 @@ fn run() -> anyhow::Result<()> {
     }
     if args.first().is_some_and(|arg| arg == "--stop") {
         anyhow::ensure!(args.len() == 1, "unexpected command argument");
-        if omabeam::live::stop_live_process() {
+        if omabeam::live::stop_and_cleanup()? {
             println!("stopped");
         } else {
             println!("not live");
@@ -84,7 +84,7 @@ fn run() -> anyhow::Result<()> {
                         .as_deref()
                         .unwrap_or("The previous share ended.")
                 );
-                omabeam::live::stop_live_process();
+                omabeam::live::stop_and_cleanup()?;
             } else {
                 let copied = omabeam::live::copy_text(&status.url);
                 if omabeam::localsend::spawn_window(&status.url).is_ok() {

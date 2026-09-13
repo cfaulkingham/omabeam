@@ -32,6 +32,7 @@ HTTP/WebRTC server. `--demo-picker` uses synthetic sources with sharing disabled
 | `src/live/webrtc.rs`, `src/live/webrtc/encoder.rs` | LAN ICE/DTLS/RTP peers and shared software H.264 encoder |
 | `src/localsend.rs` | Discovery and viewer-link sending |
 | `src/hypr/` and `src/hypr.rs` | Hyprland IPC and picker positioning |
+| `src/hypr/desktop.rs`, `src/app/desktop.rs` | Extended output ownership, recovery, placement, and picker controls |
 | `src/portal.rs` | Portal selection and stdout protocol |
 | `crates/omabeam-capture/` | Wayland capture, encoding, region selection |
 | `omarchy-plugin/` | Bar widget, panel, session model, native launcher |
@@ -56,7 +57,8 @@ their top-left corner. Coordinates are output-relative.
 
 Previews use one bounded background worker, stay in memory, and never start
 a listener. Changing the selection or settings invalidates the old preview.
-Live sharing requires a valid preview; portal mode can return a valid source
+Live sharing requires a valid preview; Extend desktop shows a proposed layout
+before creating a new output. Portal mode can return a valid source
 when a local preview is unavailable.
 
 Live sessions reuse their capture connection and buffers. JPEG streams default
@@ -78,6 +80,16 @@ rejected. Ended-session details remain until a new share or `--stop`.
 Hyprland queries use its command socket directly. `--stop` signals only a
 process whose pidfd still matches the recorded start time, uid, and `--live`
 or `--demo` command.
+
+Extended desktop sessions create a random `OMABEAM-` output through socket1,
+configure it with `eval hl.monitor(...)`, verify its layout, and capture that
+named output. A session lock serializes startup and recovery. A private
+`display.json` records the exact output and compositor instance before creation.
+Failed starts and graceful termination remove the owned output after capture
+stops. Recovery after a forced kill uses that record, never a prefix scan of
+monitors. If removal fails, the record remains for `omabeam --stop` to retry.
+The small `session.lock` file remains in the runtime directory; its inode must
+not be removed while a session might hold a lock.
 
 ```bash
 target/debug/omabeam --hypr monitors
@@ -181,6 +193,7 @@ cargo fmt --all --check
 cargo test --workspace --locked
 cargo build --locked
 python3 tests/firewall.py
+python3 tests/extended_desktop.py --binary target/debug/omabeam
 python3 tests/packaging.py
 python3 -m venv /tmp/omabeam-tests
 /tmp/omabeam-tests/bin/pip install 'Pillow>=10,<13' 'playwright>=1.50,<2' 'PySide6-Essentials>=6.8,<6.11'
@@ -202,6 +215,23 @@ boundary. Packaging tests use temporary homes and mock desktop commands.
 Firewall tests simulate UFW, sudo, and network discovery; they cover rule order,
 subnet and protocol matching, scoped opening, repeat runs, and failure warnings
 without reading or changing the host firewall.
+
+`tests/extended_desktop.py` runs the actual CLI against a temporary compositor
+socket. It checks rejected configuration, capture failure, failed cleanup,
+forced termination, recovery in the original compositor session, and lock
+contention. It never edits the host desktop.
+
+For real extended-display acceptance, run inside Hyprland with no active share:
+
+```bash
+/tmp/omabeam-tests/bin/python tests/extended_desktop_live.py --binary target/debug/omabeam --browser
+```
+
+This creates a temporary 1280×720 output, verifies unchanged physical monitor
+geometry and real captured pixels, checks browser playback and reconnection,
+and verifies removal after `--stop`. Artifacts go to `target/extended-review/live`.
+A GPU-backed Hyprland session is required; a Docker container with only a
+Pixman Sway backend cannot initialize Hyprland's allocator.
 
 ## Test on a Linux desktop
 

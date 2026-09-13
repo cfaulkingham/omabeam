@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
+pub mod desktop;
 mod ipc;
 
 use crate::portal::PortalWindow;
@@ -67,6 +68,7 @@ pub struct Monitor {
     pub x: i32,
     pub y: i32,
     pub scale: f32,
+    pub transform: u32,
     pub focused: bool,
     pub reserved: [i32; 4],
     pub active_workspace: Workspace,
@@ -76,7 +78,12 @@ pub struct Monitor {
 impl Monitor {
     pub fn logical_size(&self) -> (f32, f32) {
         let scale = self.scale.max(0.01);
-        (self.width as f32 / scale, self.height as f32 / scale)
+        let (width, height) = if self.transform % 2 == 1 {
+            (self.height, self.width)
+        } else {
+            (self.width, self.height)
+        };
+        (width as f32 / scale, height as f32 / scale)
     }
 
     /// Logical pixels left after reserved bar/insets. Used so the floating
@@ -486,6 +493,8 @@ struct RawMonitor {
     x: i32,
     y: i32,
     scale: f32,
+    #[serde(default)]
+    transform: u32,
     focused: bool,
     reserved: Option<[i32; 4]>,
     #[serde(rename = "activeWorkspace")]
@@ -540,6 +549,7 @@ pub fn parse_monitors(json: &str) -> Result<Vec<Monitor>> {
             x: monitor.x,
             y: monitor.y,
             scale: monitor.scale,
+            transform: monitor.transform,
             focused: monitor.focused,
             reserved: monitor.reserved.unwrap_or([0, 0, 0, 0]),
             active_workspace: Workspace {

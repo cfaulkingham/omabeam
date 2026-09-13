@@ -14,7 +14,9 @@ use rustix::process::geteuid;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::{fs, io, thread, time::Duration};
+use std::{fs, io};
+#[cfg(target_os = "linux")]
+use std::{thread, time::Duration};
 
 pub const MAX_STATUS_BYTES: usize = 8192;
 pub const MAX_TITLE_BYTES: usize = 200;
@@ -234,6 +236,43 @@ impl ReadExactBytes for fs::File {
 pub fn write_live_status(status: &LiveStatus) -> Result<()> {
     let status = bound_status(status.clone());
     let payload = serde_json::to_vec(&status)?;
+    write_record(STATUS_NAME, &payload)
+}
+
+pub(crate) fn write_display_state(payload: &[u8]) -> Result<()> {
+    write_record("display.json", payload)
+}
+
+pub(crate) fn read_display_state() -> Result<Option<Vec<u8>>> {
+    read_record("display.json")
+}
+
+pub(crate) fn clear_display_state() {
+    clear_record("display.json");
+}
+
+/// Keep the inode in place: unlinking a flock file permits concurrent owners.
+pub(crate) fn session_lock() -> Result<fs::File> {
+    let dirfd = open_omabeam_dir()?;
+    let fd = openat(
+        &dirfd,
+        "session.lock",
+        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o600),
+    )?;
+    let st = fstat(&fd)?;
+    ensure!(
+        FileType::from_raw_mode(st.st_mode).is_file()
+            && st.st_uid == geteuid().as_raw()
+            && st.st_nlink == 1,
+        "refusing an unsafe session lock"
+    );
+    rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .context("a share is already running or starting; stop it before starting another")?;
+    Ok(into_std_file(fd))
+}
+
+fn write_record(name: &str, payload: &[u8]) -> Result<()> {
     ensure!(
         payload.len() <= MAX_STATUS_BYTES,
         "session payload exceeds the byte limit"
@@ -250,7 +289,7 @@ pub fn write_live_status(status: &LiveStatus) -> Result<()> {
         fchmod(&fd, Mode::from_raw_mode(0o600))?;
         write_all_fd(&fd, &payload)?;
         fsync(&fd)?;
-        renameat(&dirfd, tmp_name.as_str(), &dirfd, STATUS_NAME)?;
+        renameat(&dirfd, tmp_name.as_str(), &dirfd, name)?;
         fsync(&dirfd)?;
         Ok(())
     })();
@@ -261,27 +300,35 @@ pub fn write_live_status(status: &LiveStatus) -> Result<()> {
 }
 
 pub fn clear_live_status() {
+    clear_record(STATUS_NAME);
+}
+
+fn clear_record(name: &str) {
     let Ok(dirfd) = open_omabeam_dir() else {
         return;
     };
     if let Ok(fd) = openat(
         &dirfd,
-        STATUS_NAME,
+        name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
         let Ok(st) = fstat(&fd) else { return };
         if FileType::from_raw_mode(st.st_mode).is_file() && st.st_uid == geteuid().as_raw() {
-            let _ = unlinkat(&dirfd, STATUS_NAME, AtFlags::empty());
+            let _ = unlinkat(&dirfd, name, AtFlags::empty());
         }
     }
 }
 
 fn read_status_raw() -> Result<Option<Vec<u8>>> {
+    read_record(STATUS_NAME)
+}
+
+fn read_record(name: &str) -> Result<Option<Vec<u8>>> {
     let dirfd = open_omabeam_dir()?;
     let fd = match openat(
         &dirfd,
-        STATUS_NAME,
+        name,
         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
@@ -375,6 +422,12 @@ pub fn process_identity(pid: u32) -> Option<ProcessIdentity> {
         .split(|&b| b == b' ' || b == b'\t')
         .filter(|f| !f.is_empty())
         .collect();
+    if fields
+        .first()
+        .is_some_and(|state| *state == b"Z" || *state == b"X")
+    {
+        return None;
+    }
     let starttime = std::str::from_utf8(*fields.get(19)?).ok()?.parse().ok()?;
     Some(ProcessIdentity {
         pid,
@@ -389,6 +442,7 @@ pub fn self_starttime() -> u64 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
 fn cmdline_is_session(pid: u32) -> bool {
     let Ok(data) = fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
@@ -400,6 +454,7 @@ fn cmdline_is_session(pid: u32) -> bool {
         .any(|arg| arg == b"--live" || arg == b"--demo")
 }
 
+#[cfg(target_os = "linux")]
 fn exe_is_omabeam(pid: u32) -> bool {
     let Ok(path) = fs::read_link(format!("/proc/{pid}/exe")) else {
         return false;
@@ -411,6 +466,7 @@ fn exe_is_omabeam(pid: u32) -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn matches_session(status: &LiveStatus, id: ProcessIdentity) -> bool {
     status.pid == id.pid
         && status.starttime != 0
@@ -420,11 +476,17 @@ fn matches_session(status: &LiveStatus, id: ProcessIdentity) -> bool {
         && cmdline_is_session(id.pid)
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn stop_live_process() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
 pub fn stop_live_process() -> bool {
     let Ok(Some(status)) = read_status() else {
         return false;
     };
-    if status.stats.state == "ended" || !pid_alive(status.pid) {
+    if !pid_alive(status.pid) {
         clear_live_status();
         return false;
     }
@@ -447,7 +509,9 @@ pub fn stop_live_process() -> bool {
         return false;
     }
     let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM);
-    for _ in 0..20 {
+    // Capture and HTTP workers must stop before a virtual output is removed.
+    // Allow the bounded compositor IPC cleanup to finish before forcing exit.
+    for _ in 0..200 {
         if process_identity(status.pid).is_none_or(|id| id != expected) {
             break;
         }
@@ -578,6 +642,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn stop_refuses_a_foreign_pid() {
         with_runtime(|_| {
             let mut child = std::process::Command::new("/usr/bin/sleep")

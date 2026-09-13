@@ -41,6 +41,7 @@ pub(super) fn snapshot() -> Snapshot {
             x: 0,
             y: 0,
             scale: 1.,
+            transform: 0,
             focused: true,
             reserved: [0; 4],
             active_workspace: workspace.clone(),

@@ -134,6 +134,7 @@ mod tests {
 
     fn monitor() -> Monitor {
         Monitor {
+            transform: 0,
             id: 0,
             name: "HDMI-A-1".into(),
             description: String::new(),

@@ -31,6 +31,21 @@ impl Ipc {
         })
     }
 
+    pub(super) fn for_instance(signature: &str) -> Result<Self> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        Ok(Self {
+            path: socket_path(
+                Some(OsStr::new(signature)),
+                runtime.as_deref(),
+                rustix::process::getuid().as_raw(),
+            )?,
+        })
+    }
+
+    pub(super) fn socket_exists(&self) -> Result<bool> {
+        Ok(self.path.try_exists()?)
+    }
+
     pub(super) fn query(&self, command: &str) -> Result<String> {
         self.request(&format!("j/{command}"))
     }

@@ -3,6 +3,7 @@
 mod config;
 mod diagnostics;
 mod http;
+mod signals;
 mod state;
 pub(crate) mod status;
 #[cfg(test)]
@@ -38,6 +39,7 @@ const ERROR_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveSource {
+    Extend(crate::hypr::desktop::DesktopConfig),
     Window {
         address: String,
         stable_id: String,
@@ -58,6 +60,12 @@ pub enum LiveSource {
 impl LiveSource {
     pub fn label(&self) -> String {
         match self {
+            Self::Extend(config) => format!(
+                "Extended desktop {}×{} · {}",
+                config.width,
+                config.height,
+                config.position.label()
+            ),
             Self::Window { label, .. } => label.clone(),
             Self::Output { name } => format!("Output {name}"),
             Self::Region { output, w, h, .. } => format!("Region {output} {w}×{h}"),
@@ -66,6 +74,7 @@ impl LiveSource {
 
     fn request(&self) -> Result<CaptureRequest> {
         match self {
+            Self::Extend(_) => bail!("extended display must be created before capture"),
             Self::Window { stable_id, .. } => {
                 ensure!(
                     !stable_id.is_empty(),
@@ -86,6 +95,13 @@ impl LiveSource {
 
     pub fn to_cli_args(&self) -> Vec<String> {
         match self {
+            Self::Extend(config) => vec![
+                "extend".into(),
+                config.width.to_string(),
+                config.height.to_string(),
+                config.scale.to_string(),
+                config.position.label().to_lowercase(),
+            ],
             Self::Output { name } => vec!["output".into(), name.clone()],
             Self::Window {
                 address,
@@ -113,6 +129,9 @@ impl LiveSource {
             bail!("missing live source");
         };
         match kind {
+            "extend" => Ok(Self::Extend(
+                crate::hypr::desktop::DesktopConfig::from_args(&args[1..])?,
+            )),
             "output" => {
                 ensure!(args.len() == 2, "output needs exactly one name");
                 let name = args
@@ -158,22 +177,26 @@ impl LiveSource {
 }
 
 pub fn run_headless(source: LiveSource, config: LiveConfig) -> Result<()> {
+    let signals = signals::SessionSignals::new()?;
     ensure!(
         current_status().is_none(),
         "a share is already running; stop it before starting another"
     );
     let session = LiveSession::start_with_config(source, config)?;
-    run_session(session)
+    run_session(session, &signals)
 }
 
 /// Synthetic frames use the real encoder, HTTP server, viewer accounting, and
 /// pacing. Useful for testing on a machine without a Wayland desktop.
 pub fn run_demo(config: LiveConfig) -> Result<()> {
+    let signals = signals::SessionSignals::new()?;
     ensure!(current_status().is_none(), "a share is already running");
+    let lock = status::session_lock()?;
+    crate::hypr::desktop::recover()?;
     let mut counter = 0u32;
     let started = Instant::now();
     let first = omabeam_capture::demo_frame(counter);
-    let session = LiveSession::start_frames(
+    let mut session = LiveSession::start_frames(
         "OmaBeam demo".into(),
         config,
         first,
@@ -183,10 +206,11 @@ pub fn run_demo(config: LiveConfig) -> Result<()> {
             Ok(Some(omabeam_capture::demo_frame(counter)))
         },
     )?;
-    run_session(session)
+    session.session_lock = Some(lock);
+    run_session(session, &signals)
 }
 
-fn run_session(session: LiveSession) -> Result<()> {
+fn run_session(session: LiveSession, signals: &signals::SessionSignals) -> Result<()> {
     println!("{}", session.url);
     loop {
         let status = session.status();
@@ -196,7 +220,7 @@ fn run_session(session: LiveSession) -> Result<()> {
                 bail!("{}", status.stats.error.as_deref().unwrap_or("share ended"));
             }
         }
-        if session.stop.load(Ordering::SeqCst) {
+        if session.stop.load(Ordering::SeqCst) || signals.stopped() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(250));
@@ -224,6 +248,7 @@ pub fn spawn_daemon(source: &LiveSource, config: &LiveConfig) -> Result<String> 
     for _ in 0..500 {
         if let Some(status) = current_status().filter(|status| status.pid == pid) {
             if let Some(error) = status.stats.error {
+                let _ = stop_and_cleanup();
                 bail!("{error}");
             }
             return Ok(status.url);
@@ -236,6 +261,13 @@ pub fn spawn_daemon(source: &LiveSource, config: &LiveConfig) -> Result<String> 
     }
     let _ = child.kill();
     let _ = child.wait();
+    // SIGKILL cannot run destructors. Recover an output created during a hung
+    // startup once the child has exited and released the session lock.
+    if let Ok(_lock) = status::session_lock() {
+        if let Err(error) = crate::hypr::desktop::recover() {
+            eprintln!("Extended display cleanup needs a retry with omabeam --stop: {error:#}");
+        }
+    }
     bail!(
         "live share did not become ready within 20 seconds; see {}",
         log_path.display()
@@ -250,6 +282,8 @@ pub struct LiveSession {
     capture: Option<JoinHandle<()>>,
     server: Option<JoinHandle<()>>,
     rtc_worker: Option<JoinHandle<()>>,
+    display: Option<crate::hypr::desktop::VirtualDisplay>,
+    session_lock: Option<std::fs::File>,
 }
 
 impl LiveSession {
@@ -259,18 +293,32 @@ impl LiveSession {
 
     pub fn start_with_config(source: LiveSource, config: LiveConfig) -> Result<Self> {
         config.validate()?;
-        let mut capturer =
-            CaptureSession::new_with_cursor(source.request()?.target()?, config.cursor)
-                .context("live share capture initialization failed")?;
+        let lock = status::session_lock()?;
+        crate::hypr::desktop::recover()?;
+        let display = match &source {
+            LiveSource::Extend(config) => {
+                Some(crate::hypr::desktop::VirtualDisplay::create(config)?)
+            }
+            _ => None,
+        };
+        let request = match &display {
+            Some(display) => CaptureRequest::Output(display.name().to_owned()),
+            None => source.request()?,
+        };
+        let mut capturer = CaptureSession::new_with_cursor(request.target()?, config.cursor)
+            .context("live share capture initialization failed")?;
         let started = Instant::now();
         let first = capturer.capture()?;
-        Self::start_frames(
+        let mut session = Self::start_frames(
             source.label(),
             config,
             first,
             started.elapsed(),
             move |timeout| capturer.next_frame(timeout),
-        )
+        )?;
+        session.display = display;
+        session.session_lock = Some(lock);
+        Ok(session)
     }
 
     fn start_frames(
@@ -345,6 +393,8 @@ impl LiveSession {
             capture: Some(capture),
             server: Some(server),
             rtc_worker,
+            display: None,
+            session_lock: None,
         };
         write_live_status(&session.status())?;
         Ok(session)
@@ -381,6 +431,8 @@ impl Drop for LiveSession {
         if let Some(worker) = self.rtc_worker.take() {
             let _ = worker.join();
         }
+        // Release capture before removing its output, while retaining the lock.
+        drop(self.display.take());
         if failed {
             let _ = write_live_status(&self.status());
         } else {
@@ -482,6 +534,12 @@ pub use status::{
     current_status, latest_status, latest_status_report, pid_alive, status_dir, status_path,
     stop_live_process, write_live_status,
 };
+
+pub fn stop_and_cleanup() -> Result<bool> {
+    let stopped = stop_live_process();
+    let _lock = status::session_lock()?;
+    Ok(crate::hypr::desktop::recover()? || stopped)
+}
 
 pub fn clear_live_status() {
     status::clear_live_status();

@@ -165,6 +165,40 @@ this computer, or forward the port over SSH for remote viewing.
 The viewer reads the host's Omarchy palette when opened; reload it after a
 theme change. Capture slows to about one frame per second when nobody watches.
 
+## Extend your desktop
+
+Choose **Extend desktop** in the standalone picker to use another device's
+browser as an extra display. Choose its resolution, 100% or 200% desktop scale,
+landscape or portrait orientation, and placement beside your existing screens.
+The layout preview shows where the new display will appear. It is created only
+when you click **Extend desktop**.
+
+Open the copied link on your other device and use the viewer's fullscreen
+button. Move windows onto the extra display using your Omarchy computer's mouse
+or keyboard. The extra display starts empty; windows and notifications placed
+there become visible to viewers. Native pixels and the host cursor are selected
+when entering this mode. JPEG and H.264/WebRTC use the same transport controls
+and firewall ports as other shares.
+
+Stop sharing from the bar, or run `omabeam --stop`, to remove the extra display.
+Closing or disconnecting the viewer leaves it available for reconnection.
+Hyprland returns its workspaces to remaining displays when the output is removed.
+OmaBeam leaves physical monitor settings and Hyprland configuration files alone.
+If the process is killed, `--stop` or the next share retries cleanup using the
+saved display record.
+
+The equivalent CLI command is:
+
+```bash
+omabeam --native-pixels --cursor --live extend 1920 1080 1 right
+```
+
+The four values are width, height, desktop scale (`1` or `2`), and placement
+(`right`, `left`, `above`, or `below`). This requires Hyprland with Lua monitor
+configuration and a working headless output backend. It is separate from the
+portal picker and screenshot mode. Input remains on the host computer; the
+browser is a display, with its usual viewing controls.
+
 ## Screenshots and keys
 
 Select **Screenshot** for Copy, Save, and LocalSend actions. Saved captures
