@@ -33,8 +33,29 @@ release bundle includes the app and needs no Rust.
 
 The installer builds or verifies the native app, installs and enables the bar
 plugin, adds a floating-window rule, and binds **Super + Shift + T** when available. It can be
-rerun. It does not change your firewall or portal configuration. `wl-copy`,
+rerun. It checks TCP **9847** and UDP **9848** against UFW's incoming rules
+and warns if LAN access is blocked or cannot be verified. Firewall changes
+require `--open-firewall`; portal configuration stays unchanged. `wl-copy`,
 `rsync`, `jq`, Python 3, and the Omarchy shell commands must be available.
+
+To install and allow viewers from your LAN, replace the example subnet with
+your viewer network:
+
+```bash
+./install.sh --open-firewall 192.168.1.0/24
+```
+
+Already installed? Check or open the ports without rebuilding:
+
+```bash
+./install.sh --check-ports
+./install.sh --check-ports --open-firewall 192.168.1.0/24
+```
+
+Opening ports requires sudo access and adds persistent, subnet-scoped UFW
+rules. A normal install only warns; an explicit check or open request exits
+unsuccessfully if access remains blocked or unverified. See
+[Firewall checks](RELEASING.md#firewall-checks) for detection limits.
 
 The plugin ID is `io.github.cfaulkingham.omabeam`. Its default location is:
 
@@ -72,7 +93,8 @@ Left on disk after removal:
   session. These go away at logout. There is no `/tmp` fallback.
 - Screenshots under `$OMARCHY_SCREENSHOT_DIR/omabeam`, `$XDG_PICTURES_DIR/omabeam`,
   or `~/Pictures/omabeam/`
-- Firewall or `xdph.conf` portal-picker lines you added yourself
+- Firewall rules (including ones added with `--open-firewall`) and any
+  `xdph.conf` portal-picker lines you added
 
 A detached live process keeps serving until you stop it or it loses its
 source. Stop sharing before `omarchy plugin remove` if you can still run
@@ -134,7 +156,10 @@ omabeam --webrtc --fps 30 --width 1280 --h264-bitrate 4000000
 
 Links use a fresh random token and plain HTTP. Anyone on the local network
 with the link can view the share. If a firewall blocks viewers, allow TCP 9847
-from your intended subnet only. Use `--bind 127.0.0.1` to keep the stream on
+and, for WebRTC, UDP 9848 from your intended subnet only. If JPEG works but
+H.264 reports a playback timeout or a lost WebRTC connection, check UDP 9848
+with the installer commands above. A missing H.264 decoder or encoder error
+needs a separate fix. Use `--bind 127.0.0.1` to keep the stream on
 this computer, or forward the port over SSH for remote viewing.
 
 The viewer reads the host's Omarchy palette when opened; reload it after a

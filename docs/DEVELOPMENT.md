@@ -180,6 +180,7 @@ network attacker; use this on a trusted LAN.
 cargo fmt --all --check
 cargo test --workspace --locked
 cargo build --locked
+python3 tests/firewall.py
 python3 tests/packaging.py
 python3 -m venv /tmp/omabeam-tests
 /tmp/omabeam-tests/bin/pip install 'Pillow>=10,<13' 'playwright>=1.50,<2' 'PySide6-Essentials>=6.8,<6.11'
@@ -198,6 +199,9 @@ Rust tests cover capture protocols, stable window identity, errors, buffer
 reuse, HTTP delivery, and IPC. Browser tests cover playback controls and
 source loss. QML tests render the actual UI with a simulated shell/process
 boundary. Packaging tests use temporary homes and mock desktop commands.
+Firewall tests simulate UFW, sudo, and network discovery; they cover rule order,
+subnet and protocol matching, scoped opening, repeat runs, and failure warnings
+without reading or changing the host firewall.
 
 ## Test on a Linux desktop
 

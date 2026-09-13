@@ -4,7 +4,8 @@
 #   2. float the picker (sized to the monitor) and bind SUPER+SHIFT+T
 #   3. copy and enable the Omarchy bar widget
 #
-# Safe to re-run. Does not change the portal picker or open the firewall.
+# Safe to re-run. Firewall changes require --open-firewall CIDR.
+# The portal picker is not changed.
 # --remove-desktop removes only the marked Hyprland blocks this script wrote.
 
 set -euo pipefail
@@ -17,19 +18,46 @@ BINDINGS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
 SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 BIN="$PLUGIN_DIR/omarchy-plugin/omabeam"
 BIND_KEYS="SUPER + SHIFT + T"
-USAGE="Usage: ./install.sh [--backend-only|--remove-desktop]"
+USAGE="Usage: ./install.sh [--backend-only|--remove-desktop|--check-ports] [--subnet CIDR|--open-firewall CIDR]"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
 BACKEND_ONLY=false
 REMOVE_DESKTOP=false
-case "${1:-}" in
-  --backend-only) BACKEND_ONLY=true ;;
-  --remove-desktop) REMOVE_DESKTOP=true ;;
-  "") ;;
-  *) echo "$USAGE" >&2; exit 2 ;;
-esac
-[[ $# -le 1 ]] || { echo "$USAGE" >&2; exit 2; }
+CHECK_PORTS=false
+OPEN_FIREWALL=false
+MODE=install
+FIREWALL_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend-only|--remove-desktop|--check-ports)
+      [[ $MODE == install ]] || { echo "$USAGE" >&2; exit 2; }
+      MODE=$1
+      case "$1" in
+        --backend-only) BACKEND_ONLY=true ;;
+        --remove-desktop) REMOVE_DESKTOP=true ;;
+        --check-ports) CHECK_PORTS=true ;;
+      esac
+      shift ;;
+    --subnet|--open-firewall)
+      [[ $# -ge 2 ]] || { echo "$1 requires a viewer subnet in CIDR notation." >&2; exit 2; }
+      [[ $1 != --open-firewall ]] || OPEN_FIREWALL=true
+      FIREWALL_ARGS+=("$1" "$2")
+      shift 2 ;;
+    --help|-h)
+      echo "$USAGE"
+      echo "Default installs check TCP 9847 and UDP 9848 and warn if access cannot be verified."
+      echo "--check-ports checks without building or installing; sudo authentication is available in a terminal."
+      echo "--subnet CIDR checks access from a specific viewer subnet."
+      echo "--open-firewall CIDR adds persistent UFW rules for that subnet and verifies them."
+      exit 0 ;;
+    *) echo "$USAGE" >&2; exit 2 ;;
+  esac
+done
+if $REMOVE_DESKTOP && [[ ${#FIREWALL_ARGS[@]} -gt 0 ]]; then
+  echo "--remove-desktop cannot be combined with firewall options." >&2
+  exit 2
+fi
 [[ $(uname -s) == Linux ]] || { echo "OmaBeam installation requires Linux with Omarchy / Hyprland." >&2; exit 1; }
 
 need() {
@@ -37,6 +65,19 @@ need() {
     echo "install.sh: missing required command: $1" >&2
     exit 1
   }
+}
+
+check_ports() {
+  local extra=()
+  if $CHECK_PORTS; then extra+=(--authenticate); fi
+  # The conditional expansions also support empty arrays under Bash 3's nounset.
+  if python3 "$ROOT/omarchy-plugin/firewall.py" ${FIREWALL_ARGS[@]+"${FIREWALL_ARGS[@]}"} ${extra[@]+"${extra[@]}"}; then
+    return 0
+  fi
+  # A warning must not turn a successful default install into a failed build.
+  # Explicit check/open requests report failure so automation can detect it.
+  if $CHECK_PORTS || $OPEN_FIREWALL; then return 1; fi
+  return 0
 }
 
 plugin_on_bar() {
@@ -235,6 +276,14 @@ if $REMOVE_DESKTOP; then
   exit 0
 fi
 
+need python3
+# Validate CIDRs before building, editing desktop files, or invoking sudo.
+python3 "$ROOT/omarchy-plugin/firewall.py" --validate-only ${FIREWALL_ARGS[@]+"${FIREWALL_ARGS[@]}"}
+if $CHECK_PORTS; then
+  check_ports
+  exit 0
+fi
+
 if ! $BACKEND_ONLY; then
   for tool in wl-copy rsync jq python3 omarchy omarchy-shell; do need "$tool"; done
   [[ -f $HYPRLAND_LUA && -f $BINDINGS_LUA ]] || {
@@ -265,6 +314,7 @@ fi
 }
 if $BACKEND_ONLY; then
   echo "OmaBeam native app ready. Open the bar panel and check status again."
+  check_ports
   exit 0
 fi
 
@@ -307,5 +357,5 @@ echo "  plugin:  $PLUGIN_DIR"
 echo "  launch:  $BIND_KEYS  or  $BIN"
 echo
 echo "Optional: set custom_picker_binary = $BIN in ~/.config/hypr/xdph.conf"
-echo "To allow LAN viewers through a firewall, open TCP 9847 from your local subnet."
+check_ports
 echo "Remove desktop bindings with: ./install.sh --remove-desktop"

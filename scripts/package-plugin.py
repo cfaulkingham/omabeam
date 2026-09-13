@@ -41,7 +41,7 @@ def package(binary, target, licenses, output, root=ROOT):
     for path in sorted((root / "docs").glob("*.md")):
         files[str(path.relative_to(root))] = path
     for path in sorted((root / "omarchy-plugin").iterdir()):
-        if path.suffix in (".qml", ".js") or path.name == "omabeam":
+        if path.suffix in (".qml", ".js") or path.name in ("omabeam", "firewall.py"):
             files[str(path.relative_to(root))] = path
     files["omarchy-plugin/native/bin/omabeam"] = binary
     files["licenses/THIRDPARTY.yml"] = licenses

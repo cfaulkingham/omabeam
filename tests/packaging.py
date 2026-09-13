@@ -11,6 +11,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from firewall import mock_firewall
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("package_plugin", ROOT / "scripts/package-plugin.py")
@@ -71,6 +72,7 @@ class Packaging(unittest.TestCase):
             self.assertEqual(tar.getmember(f"{PLUGIN_ID}/omarchy-plugin/omabeam").mode, 0o755)
             self.assertTrue(all(member.isfile() for member in tar.getmembers()))
             self.assertIn(f"{PLUGIN_ID}/docs/DEVELOPMENT.md", tar.getnames())
+            self.assertIn(f"{PLUGIN_ID}/omarchy-plugin/firewall.py", tar.getnames())
             self.assertIn(f"{PLUGIN_ID}/vendor/localsend/UPSTREAM.md", tar.getnames())
             self.assertFalse(any("old-binary" in name or "Cargo.toml" in name for name in tar.getnames()))
 
@@ -110,6 +112,7 @@ class Packaging(unittest.TestCase):
         home, tools = self.base / "home", self.base / "tools"
         tools.mkdir()
         config = home / "config with spaces"
+        _, firewall_log = mock_firewall(tools)
         hypr = config / "hypr"
         hypr.mkdir(parents=True)
         (hypr / "hyprland.lua").write_text("-- user config\n")
@@ -141,18 +144,22 @@ path.chmod(0o755)
             result = subprocess.run(["bash", str(path / "install.sh"), *args], env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
             return result
-        install(self.source, "--backend-only")
+        self.assertIn("WARNING: LAN viewing", install(self.source, "--backend-only").stdout)
         self.assertFalse((config / "omarchy").exists())
         install(self.source)
         installed = config / "omarchy/plugins" / PLUGIN_ID
         self.assertTrue((installed / "omarchy-plugin/native/bin/omabeam").is_file())
         self.assertTrue((installed / "RELEASING.md").is_file())
+        self.assertTrue((installed / "omarchy-plugin/firewall.py").is_file())
         self.assertIn(str(installed / "omarchy-plugin/omabeam"), (hypr / "bindings.lua").read_text())
         self.assertIn("json.dumps", Path(ROOT / "install.sh").read_text())  # launch path is quoted
         before = [(hypr / name).read_text() for name in ("hyprland.lua", "bindings.lua")]
         # Copied runtime-only installs can rerun without Cargo/source present.
         (tools / "cargo").unlink()
         install(installed)
+        self.assertIn("WARNING: LAN viewing", install(installed, "--check-ports", success=False).stdout)
+        self.assertTrue(all(json.loads(line) == ["status", "verbose"] for line in firewall_log.read_text().splitlines()))
+        self.assertIn("UDP 9848 (WebRTC): ALLOWED", install(installed, "--backend-only", "--open-firewall", "192.168.1.0/24").stdout)
         self.assertEqual(before, [(hypr / name).read_text() for name in ("hyprland.lua", "bindings.lua")])
         (installed / ".git").mkdir()
         (installed / ".git/sentinel").write_text("keep")
@@ -163,6 +170,42 @@ path.chmod(0o755)
         bindings = (hypr / "bindings.lua").read_text()
         self.assertNotIn("OmaBeam", bindings)
         self.assertNotIn("omabeam (install.sh)", (hypr / "hyprland.lua").read_text())
+
+    def test_installer_check_only_scoped_open_and_invalid_arguments(self):
+        home, tools = self.base / "home", self.base / "tools"
+        state, log = mock_firewall(tools)
+        executable(tools / "uname", "#!/bin/sh\necho Linux\n")
+        # Any accidental build or desktop command must fail this test.
+        for name in ("cargo", "omarchy", "omarchy-shell", "rsync", "wl-copy", "jq"):
+            executable(tools / name, "#!/bin/sh\necho unexpected-install-command >&2\nexit 99\n")
+        env = {**os.environ, "HOME": str(home), "XDG_CONFIG_HOME": str(home / "config"), "PATH": f"{tools}:{os.environ['PATH']}"}
+
+        def install(*args):
+            return subprocess.run(["bash", str(self.source / "install.sh"), *args], env=env, capture_output=True, text=True, timeout=10)
+
+        for args in (("--open-firewall", "0.0.0.0/0"), ("--subnet", "invalid"),
+                     ("--check-ports", "--backend-only"), ("--remove-desktop", "--open-firewall", "192.168.1.0/24"),
+                     ("--open-firewall",), ("--subnet", "10.0.0.0/8", "--open-firewall", "192.168.1.0/24")):
+            with self.subTest(args=args):
+                result = install(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("unexpected-install-command", result.stderr)
+                self.assertFalse(log.exists())
+        result = install("--check-ports")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("TCP 9847 (browser / JPEG): BLOCKED", result.stdout)
+        self.assertIn("UDP 9848 (WebRTC): BLOCKED", result.stdout)
+        self.assertEqual(json.loads(state.read_text()), [])
+        for _ in range(2):
+            result = install("--check-ports", "--open-firewall", "192.168.1.0/24")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("UDP 9848 (WebRTC): ALLOWED", result.stdout)
+        self.assertCountEqual(json.loads(state.read_text()), [
+            ["192.168.1.0/24", "9847", "tcp"], ["192.168.1.0/24", "9848", "udp"]])
+        mutations = [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)[0] != 'status']
+        self.assertEqual(len(mutations), 2)
+        self.assertFalse(home.exists())
+        self.assertFalse((self.source / "omarchy-plugin/native").exists())
 
 
 if __name__ == "__main__":

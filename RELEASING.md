@@ -26,6 +26,47 @@ The full `./install.sh` also adds a floating-window rule and shortcut.
 After `omarchy plugin update io.github.cfaulkingham.omabeam`, rerun that
 checkout's `./install.sh --backend-only` to rebuild the app.
 
+## Firewall checks
+
+Full and `--backend-only` installs check the default sharing ports: TCP 9847
+for the viewer page and JPEG, and UDP 9848 for H.264/WebRTC. The default check
+reads UFW rules without requesting a password and warns if they block access
+or cannot be inspected. A warning does not fail an otherwise successful install.
+
+Check again without building or changing desktop configuration:
+
+```bash
+./install.sh --check-ports
+./install.sh --check-ports --subnet 192.168.1.0/24
+```
+
+The check infers IPv4 subnets on default-route interfaces using `ip`, or uses
+the explicit `--subnet` CIDR. Check-only mode can request sudo authentication
+in a terminal. To allow the two ports from a specific viewer network:
+
+```bash
+./install.sh --check-ports --open-firewall 192.168.1.0/24
+```
+
+Replace the example with your viewer subnet. `--open-firewall CIDR` also works
+with a full or backend-only install. It adds only missing UFW allows, prepends
+them before conflicting user rules, and verifies access afterward. These rules
+persist across restart and plugin removal. The installer never enables a
+disabled firewall or changes its default policy. Invalid or unrestricted
+`/0` CIDRs are rejected before installation starts.
+
+Explicit check/open requests exit nonzero when access is blocked or unverified.
+If an update partly succeeds, added rules remain and the warning explains that
+setup is incomplete. Rerunning skips access that is already allowed.
+
+This checks UFW incoming user rules, not listening sockets or end-to-end packet
+delivery. The app need not be running. Unsupported firewall managers, missing
+permissions, and ambiguous rules produce warnings; custom nftables/iptables
+rules, Wi-Fi client isolation, or another device's firewall may still prevent
+viewing. After the check, start a share and test its link from another device.
+Custom `--port` or `--webrtc-port` values need their own rules. Blocked UDP can
+cause H.264 playback timeouts while the HTTP page and JPEG fallback still work.
+
 ## Build a release bundle
 
 Keep the versions aligned in `manifest.json` and `Cargo.toml`. Run the
