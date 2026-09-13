@@ -8,8 +8,9 @@ use super::{
     diagnostics::{Rate, TimingStats, Timings},
     state::FrameState,
 };
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use omabeam_capture::CapturedFrame;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -36,6 +37,34 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const MAX_QUEUE_AGE: Duration = Duration::from_millis(250);
 
+fn h264_profile_level_id(width: u32, height: u32, fps: u32, bitrate: u32) -> u32 {
+    let frame_mbs = u64::from(width.div_ceil(16)) * u64::from(height.div_ceil(16));
+    let mbs_per_second = frame_mbs * u64::from(fps);
+    // Keep level 3.1 as the floor because it is the baseline WebRTC profile
+    // browsers commonly offer. Higher levels must cover the actual stream or
+    // strict decoders can accept RTP but reject every frame.
+    let levels = [
+        (31, 3_600, 108_000, 14_000_000),
+        (32, 5_120, 216_000, 20_000_000),
+        (40, 8_192, 245_760, 20_000_000),
+        (41, 8_192, 245_760, 50_000_000),
+        (42, 8_704, 522_240, 50_000_000),
+        (50, 22_080, 589_824, 135_000_000),
+        (51, 36_864, 983_040, 240_000_000),
+        (52, 36_864, 2_073_600, 240_000_000),
+    ];
+    let level = levels
+        .into_iter()
+        .find(|(_, max_frame, max_rate, max_bitrate)| {
+            frame_mbs <= *max_frame
+                && mbs_per_second <= *max_rate
+                && u64::from(bitrate) <= *max_bitrate
+        })
+        .map(|(level, _, _, _)| level)
+        .unwrap_or(52);
+    0x42e000 | level
+}
+
 pub(super) struct RawFrame {
     pub frame: CapturedFrame,
     pub config: LiveConfig,
@@ -60,6 +89,8 @@ pub struct WebRtcStats {
     pub keyframes: u64,
     pub dropped_frames: u64,
     pub failed_peers: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_error: Option<String>,
     pub error: Option<String>,
 }
 struct Metrics {
@@ -75,6 +106,7 @@ pub(super) struct Service {
     keyframe: AtomicBool,
     metrics: Mutex<Metrics>,
     failed: AtomicBool,
+    fps: u32,
 }
 enum Command {
     Offer(
@@ -165,6 +197,7 @@ pub(super) fn start(
             output: Rate::new(Instant::now()),
             encoded: Rate::new(Instant::now()),
         }),
+        fps: config.fps.min(60),
     });
     *frames.rtc.lock().unwrap() = Some(service.clone());
     let (frames, stop, config) = (frames.clone(), stop.clone(), config.clone());
@@ -239,9 +272,14 @@ struct Peer {
     started: Instant,
     deadline: Instant,
     dead: bool,
+    failure: Option<String>,
 }
 impl Peer {
-    fn new(offer: SdpOffer, sockets: &[UdpSocket]) -> Result<(Self, serde_json::Value)> {
+    fn new(
+        offer: SdpOffer,
+        sockets: &[UdpSocket],
+        profile_level_id: u32,
+    ) -> Result<(Self, serde_json::Value)> {
         let mut config = RtcConfig::new()
             .clear_codecs()
             .set_ice_lite(true)
@@ -251,7 +289,7 @@ impl Peer {
         // packetization mode 0 and then feed it a different bitstream.
         config
             .codec_config()
-            .add_h264(108.into(), Some(109.into()), true, 0x42e01f);
+            .add_h264(108.into(), Some(109.into()), true, profile_level_id);
         let now = Instant::now();
         let mut peer = Self {
             id: super::random_token()?,
@@ -264,6 +302,7 @@ impl Peer {
             started: now,
             deadline: now,
             dead: false,
+            failure: None,
         };
         for socket in sockets {
             peer.rtc
@@ -291,8 +330,13 @@ impl Peer {
         let result = serde_json::json!({"id": peer.id, "answer": answer});
         Ok((peer, result))
     }
+    fn fail(&mut self, error: impl std::fmt::Display) {
+        self.dead = true;
+        self.failure = Some(format!("{error:#}").chars().take(600).collect());
+    }
     /// Drain after EVERY input/write/mutation, as required by str0m's API.
     fn drain(&mut self, sockets: &[UdpSocket], service: Option<&Service>) -> Result<()> {
+        let send_deadline = Instant::now() + MAX_QUEUE_AGE;
         loop {
             match self.rtc.poll_output()? {
                 Output::Timeout(at) => {
@@ -304,18 +348,32 @@ impl Peer {
                         .iter()
                         .find(|s| s.local_addr().ok() == Some(packet.source))
                         .context("unknown ICE source")?;
-                    match socket.send_to(&packet.contents, packet.destination) {
-                        Ok(n) => {
-                            if let Some(service) = service {
-                                let mut metrics = service.metrics.lock().unwrap();
-                                metrics.stats.bytes_sent += n as u64;
-                                metrics.output.record(Instant::now(), n as u64, 0);
+                    let sent = loop {
+                        match socket.send_to(&packet.contents, packet.destination) {
+                            Ok(n) => break n,
+                            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                                let remaining = send_deadline
+                                    .checked_duration_since(Instant::now())
+                                    .context("UDP send queue remained full for 250 ms")?;
+                                let timeout = Timespec::try_from(remaining)?;
+                                let mut fds = [PollFd::new(socket, PollFlags::OUT)];
+                                match poll(&mut fds, Some(&timeout)) {
+                                    Ok(0) => {
+                                        anyhow::bail!("UDP send queue remained full for 250 ms")
+                                    }
+                                    Ok(_) => {}
+                                    Err(rustix::io::Errno::INTR) => continue,
+                                    Err(error) => return Err(error.into()),
+                                }
                             }
+                            Err(error) => return Err(error.into()),
                         }
-                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                            bail!("UDP send queue full")
-                        }
-                        Err(error) => return Err(error.into()),
+                    };
+                    if let Some(service) = service {
+                        let mut metrics = service.metrics.lock().unwrap();
+                        metrics.stats.bytes_sent += sent as u64;
+                        metrics.output.record(Instant::now(), sent as u64, 0);
                     }
                 }
                 Output::Event(event) => match event {
@@ -336,7 +394,7 @@ impl Peer {
                         }
                     }
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
-                        self.dead = true
+                        self.fail("ICE disconnected")
                     }
                     Event::KeyframeRequest(_) => {
                         if let Some(service) = service {
@@ -414,7 +472,17 @@ fn run(
                         let _ = reply.send(Err(anyhow::anyhow!("WebRTC viewer limit reached")));
                         continue;
                     }
-                    match Peer::new(offer, &sockets) {
+                    let (width, height) = {
+                        let data = frames.inner.lock().unwrap();
+                        (data.width, data.height)
+                    };
+                    let profile_level_id = h264_profile_level_id(
+                        width,
+                        height,
+                        service.fps,
+                        service.metrics.lock().unwrap().stats.target_bitrate,
+                    );
+                    match Peer::new(offer, &sockets, profile_level_id) {
                         Ok((mut peer, answer)) => {
                             peer.connection = connection;
                             if reply.send(Ok(answer)).is_ok() {
@@ -449,10 +517,10 @@ fn run(
                             },
                         );
                         if let Some(peer) = peers.iter_mut().find(|peer| peer.rtc.accepts(&input)) {
-                            if peer.rtc.handle_input(input).is_err()
-                                || peer.drain(&sockets, Some(service)).is_err()
-                            {
-                                peer.dead = true;
+                            if let Err(error) = peer.rtc.handle_input(input) {
+                                peer.fail(format!("WebRTC input failed: {error}"));
+                            } else if let Err(error) = peer.drain(&sockets, Some(service)) {
+                                peer.fail(format!("WebRTC output failed: {error:#}"));
                             }
                         }
                     }
@@ -462,26 +530,29 @@ fn run(
             }
         }
         for peer in &mut peers {
-            if peer.deadline <= Instant::now()
-                && (peer
-                    .rtc
-                    .handle_input(Input::Timeout(Instant::now()))
-                    .is_err()
-                    || peer.drain(&sockets, Some(service)).is_err())
-            {
-                peer.dead = true;
+            if peer.deadline <= Instant::now() {
+                if let Err(error) = peer.rtc.handle_input(Input::Timeout(Instant::now())) {
+                    peer.fail(format!("WebRTC timeout handling failed: {error}"));
+                } else if let Err(error) = peer.drain(&sockets, Some(service)) {
+                    peer.fail(format!("WebRTC timeout output failed: {error:#}"));
+                }
             }
             if !peer.connected && peer.started.elapsed() > CONNECT_TIMEOUT {
-                peer.dead = true;
+                peer.fail("WebRTC connection timed out");
             }
         }
         if let Ok(frame) = encoded.try_recv() {
             for peer in peers.iter_mut().filter(|peer| !peer.dead) {
-                if peer.send(&frame, &sockets, service).is_err() {
-                    peer.dead = true;
+                if let Err(error) = peer.send(&frame, &sockets, service) {
+                    peer.fail(format!("WebRTC frame send failed: {error:#}"));
                 }
             }
         }
+        let peer_error = peers
+            .iter()
+            .filter(|peer| peer.dead)
+            .filter_map(|peer| peer.failure.clone())
+            .next_back();
         let failed = peers.iter().filter(|peer| peer.dead).count();
         peers.retain(|peer| !peer.dead);
         let count = peers.iter().filter(|peer| peer.connected).count();
@@ -492,6 +563,9 @@ fn run(
             let mut metrics = service.metrics.lock().unwrap();
             metrics.stats.peers = peers.len();
             metrics.stats.failed_peers += failed as u64;
+            if let Some(error) = peer_error {
+                metrics.stats.peer_error = Some(error);
+            }
         }
         thread::sleep(Duration::from_millis(if peers.is_empty() { 20 } else { 5 }));
     }
@@ -504,6 +578,14 @@ fn run(
 mod tests {
     use super::*;
     use str0m::media::Direction;
+
+    #[test]
+    fn h264_level_covers_the_encoded_dimensions_and_rate() {
+        assert_eq!(h264_profile_level_id(640, 360, 15, 4_000_000), 0x42e01f);
+        assert_eq!(h264_profile_level_id(1_896, 1_030, 15, 4_000_000), 0x42e028);
+        assert_eq!(h264_profile_level_id(1_920, 1_080, 60, 4_000_000), 0x42e02a);
+        assert_eq!(h264_profile_level_id(3_840, 2_160, 60, 4_000_000), 0x42e034);
+    }
 
     #[test]
     fn negotiates_h264_before_dtls_media_events_and_rejects_other_codecs() {
@@ -523,17 +605,14 @@ mod tests {
             let mut changes = rtc.sdp_api();
             changes.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
             let (offer, _) = changes.apply().unwrap();
-            let result = Peer::new(offer, &sockets);
+            let result = Peer::new(offer, &sockets, 0x42e028);
             if h264 {
                 let (peer, answer) = result.unwrap();
                 assert!(peer.mid.is_some() && peer.pt.is_some());
                 assert!(!peer.connected);
-                assert!(
-                    answer["answer"]["sdp"]
-                        .as_str()
-                        .unwrap()
-                        .contains("H264/90000")
-                );
+                let sdp = answer["answer"]["sdp"].as_str().unwrap();
+                assert!(sdp.contains("H264/90000"));
+                assert!(sdp.contains("profile-level-id=42e028"));
             } else {
                 assert!(result.is_err());
             }

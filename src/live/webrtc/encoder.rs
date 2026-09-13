@@ -350,6 +350,7 @@ mod static_tests {
                 output: Rate::new(Instant::now()),
                 encoded: Rate::new(Instant::now()),
             }),
+            fps: config.fps.min(60),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(1);

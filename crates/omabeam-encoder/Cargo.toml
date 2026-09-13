@@ -13,7 +13,7 @@ hardware = ["dep:ffmpeg-next"]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ffmpeg-next = { version = "8.1", default-features = false, features = ["codec", "format"], optional = true }
+ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format"], optional = true }
 
 [[bin]]
 name = "omabeam-encoder"
