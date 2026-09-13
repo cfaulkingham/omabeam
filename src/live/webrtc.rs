@@ -77,7 +77,12 @@ pub(super) struct Service {
     failed: AtomicBool,
 }
 enum Command {
-    Offer(SdpOffer, Instant, SyncSender<Result<serde_json::Value>>),
+    Offer(
+        SdpOffer,
+        Option<String>,
+        Instant,
+        SyncSender<Result<serde_json::Value>>,
+    ),
     Close(String),
 }
 impl Service {
@@ -93,7 +98,7 @@ impl Service {
         stats.encoded_fps = metrics.encoded.values(Instant::now()).1;
         stats
     }
-    pub fn offer(&self, body: &[u8]) -> Result<serde_json::Value> {
+    pub fn offer(&self, body: &[u8], connection: Option<String>) -> Result<serde_json::Value> {
         ensure!(
             !self.failed.load(Ordering::SeqCst),
             "H.264 is unavailable; use JPEG"
@@ -120,7 +125,7 @@ impl Service {
         let offer: SdpOffer = serde_json::from_slice(body)?;
         let (tx, rx) = mpsc::sync_channel(1);
         self.commands
-            .try_send(Command::Offer(offer, Instant::now(), tx))
+            .try_send(Command::Offer(offer, connection, Instant::now(), tx))
             .map_err(|_| anyhow::anyhow!("WebRTC busy"))?;
         rx.recv_timeout(Duration::from_secs(3))
             .context("WebRTC signaling timed out")?
@@ -225,6 +230,7 @@ fn bind_sockets(config: &LiveConfig) -> Result<Vec<UdpSocket>> {
 
 struct Peer {
     id: String,
+    connection: Option<String>,
     rtc: Rtc,
     mid: Option<Mid>,
     pt: Option<Pt>,
@@ -249,6 +255,7 @@ impl Peer {
         let now = Instant::now();
         let mut peer = Self {
             id: super::random_token()?,
+            connection: None,
             rtc: config.build(now),
             mid: None,
             pt: None,
@@ -395,8 +402,12 @@ fn run(
         for command in commands.try_iter().take(16) {
             match command {
                 Command::Close(id) => peers.retain(|peer| peer.id != id),
-                Command::Offer(offer, at, reply) => {
+                Command::Offer(offer, connection, at, reply) => {
                     if at.elapsed() > Duration::from_secs(2) {
+                        continue;
+                    }
+                    if !frames.authorized(connection.as_deref()) {
+                        let _ = reply.send(Err(anyhow::anyhow!(super::desktop::IN_USE)));
                         continue;
                     }
                     if peers.len() == MAX_PEERS {
@@ -404,8 +415,12 @@ fn run(
                         continue;
                     }
                     match Peer::new(offer, &sockets) {
-                        Ok((peer, answer)) => {
+                        Ok((mut peer, answer)) => {
+                            peer.connection = connection;
                             if reply.send(Ok(answer)).is_ok() {
+                                if frames.desktop.is_some() {
+                                    peers.clear();
+                                }
                                 peers.push(peer);
                             }
                         }
@@ -416,6 +431,7 @@ fn run(
                 }
             }
         }
+        peers.retain(|peer| frames.authorized(peer.connection.as_deref()));
         for socket in &sockets {
             for _ in 0..64 {
                 match socket.recv_from(&mut buf) {

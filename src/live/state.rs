@@ -26,6 +26,8 @@ pub struct StreamStats {
     pub diagnostics: StreamDiagnostics,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webrtc: Option<super::WebRtcStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<super::desktop::DesktopStats>,
 }
 
 pub(super) struct FrameData {
@@ -47,6 +49,7 @@ pub(super) struct FrameState {
     pub tick: Condvar,
     pub viewers: AtomicUsize,
     pub rtc: Mutex<Option<Arc<super::webrtc::Service>>>,
+    pub desktop: Option<Arc<super::desktop::DesktopControl>>,
     jpeg_encode: Mutex<()>,
     source: String,
 }
@@ -70,6 +73,7 @@ impl FrameState {
             tick: Condvar::new(),
             viewers: AtomicUsize::new(0),
             rtc: Mutex::new(None),
+            desktop: None,
             jpeg_encode: Mutex::new(()),
             source,
         }
@@ -123,6 +127,11 @@ impl FrameState {
                 .as_ref()
                 .map_or(0, |rtc| rtc.connected())
     }
+    pub fn authorized(&self, connection: Option<&str>) -> bool {
+        self.desktop
+            .as_ref()
+            .is_none_or(|d| d.authorized(connection))
+    }
     pub fn stats(&self) -> StreamStats {
         let data = self.inner.lock().unwrap();
         let now = Instant::now();
@@ -133,8 +142,25 @@ impl FrameState {
             height: data.height,
             frames: data.generation,
             uptime: data.started.elapsed().as_secs(),
-            viewers: self.viewer_count(),
-            source: self.source.clone(),
+            // A transport handoff can briefly have both sockets open for the
+            // same extended-display client; it is still one viewer.
+            viewers: if self.desktop.is_some() {
+                self.viewer_count().min(1)
+            } else {
+                self.viewer_count()
+            },
+            source: self.desktop.as_ref().map_or_else(
+                || self.source.clone(),
+                |desktop| {
+                    let config = desktop.stats().config;
+                    format!(
+                        "Extended desktop {}×{} · {}",
+                        config.width,
+                        config.height,
+                        config.position.label()
+                    )
+                },
+            ),
             state: if data.ended.is_some() {
                 "ended"
             } else {
@@ -144,6 +170,7 @@ impl FrameState {
             error: data.error.clone(),
             diagnostics: data.diagnostics.stats(now),
             webrtc: self.rtc.lock().unwrap().as_ref().map(|rtc| rtc.stats()),
+            desktop: self.desktop.as_ref().map(|d| d.stats()),
         }
     }
 

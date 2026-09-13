@@ -199,6 +199,23 @@ there become visible to viewers. Native pixels and the host cursor are selected
 when entering this mode. JPEG and H.264/WebRTC use the same transport controls
 and firewall ports as other shares.
 
+An extended display accepts **one active browser client**. Additional devices
+or tabs see “This display is already connected to another device.” Refreshing
+the connected tab, or switching between JPEG and H.264, keeps its place.
+Pausing, closing, or losing the client reserves its place for 15 seconds before
+another device can connect. Regular screen sharing still supports multiple viewers.
+
+Select **Match this device** in the viewer to resize the virtual desktop to its
+available viewing area, including changes to fullscreen, window size, and
+orientation. OmaBeam selects 100% or 200% desktop scale for the client's pixel
+density, within the supported display limits (minimum 640×480, maximum
+3840×2160 or portrait). Matching encodes at the display's native pixels,
+temporarily overriding the host's pixel-detail and maximum-width settings.
+Select **Device size: On** again to restore the resolution, scale, and encoding
+settings chosen on the host. The preference survives a refresh of that tab.
+If a requested mode cannot be applied or captured, OmaBeam attempts to restore
+the previous mode and reports the failure in the viewer.
+
 Stop sharing from the bar, or run `omabeam --stop`, to remove the extra display.
 Closing or disconnecting the viewer leaves it available for reconnection.
 Hyprland returns its workspaces to remaining displays when the output is removed.

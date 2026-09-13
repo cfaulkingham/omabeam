@@ -35,6 +35,7 @@ HTTP/WebRTC server. `--demo-picker` uses synthetic sources with sharing disabled
 | --- | --- |
 | `src/app/` | Picker, preview worker, branding, settings, nearby-device UI |
 | `src/live/` | Browser viewer, HTTP delivery, stream settings and state |
+| `src/live/desktop.rs` | Extended-display client lease and capture-worker resize transactions |
 | `src/live/webrtc.rs`, `src/live/webrtc/encoder.rs` | LAN ICE/DTLS/RTP peers and shared adaptive H.264 encoder |
 | `crates/omabeam-encoder/` | Bounded pipe protocol and isolated FFmpeg hardware encoder helper |
 | `src/localsend.rs` | Discovery and viewer-link sending |
@@ -99,6 +100,27 @@ stops. Recovery after a forced kill uses that record, never a prefix scan of
 monitors. If removal fails, the record remains for `omabeam --stop` to retry.
 The small `session.lock` file remains in the runtime directory; its inode must
 not be removed while a session might hold a lock.
+
+Each extended display has one in-memory browser lease, independent of its
+media transport. `/desktop/claim`, `/desktop/heartbeat`, `/desktop/release`, and
+`/desktop/size` accept bounded same-origin JSON under the share token. A random
+tab identity survives refresh in sessionStorage; a separate random page identity
+prevents a duplicated tab from replacing a live page. The page renews a 15-second
+lease. Page exit/pause invalidates its media immediately while reserving the
+tab's reconnection identity for that grace period. Both JPEG routes and WebRTC
+signaling require `?viewer=PAGE_ID`; ongoing JPEG and RTC delivery also checks
+the lease. Stats contain display configuration and occupancy, never either ID.
+
+Client sizing is opt-in and debounced. It uses the viewer stage's CSS dimensions
+and the nearest supported desktop density (1× or 2×), rounds to even pixels,
+and caps both edges for JPEG/H.264 compatibility. Requests run through one bounded
+pending resize slot. The capture worker reconfigures only the owned output,
+recomputes its placement against the other active monitors, reopens capture,
+and verifies the captured dimensions before committing the new mode. Failed
+changes restore and recapture the previous mode; failed restoration ends the
+share. Disconnecting leaves the last applied mode intact. Disabling matching
+restores the original host display and encoding settings. Regular shares have
+no lease requirement or sizing API.
 
 ```bash
 target/debug/omabeam --hypr monitors
@@ -229,6 +251,7 @@ python3 -m venv /tmp/omabeam-tests
 /tmp/omabeam-tests/bin/python -m playwright install chromium chrome
 /tmp/omabeam-tests/bin/python tests/smoke.py --binary target/debug/omabeam --browser
 /tmp/omabeam-tests/bin/python tests/webrtc.py --binary target/debug/omabeam
+/tmp/omabeam-tests/bin/python tests/extended_viewer.py --browser-executable /path/to/chrome
 /tmp/omabeam-tests/bin/python tests/omarchy_ui.py --screenshots target/omarchy-qa
 ```
 
@@ -263,6 +286,14 @@ without reading or changing the host firewall.
 socket. It checks rejected configuration, capture failure, failed cleanup,
 forced termination, recovery in the original compositor session, and lock
 contention. It never edits the host desktop.
+
+`tests/extended_viewer.py` uses the same private compositor socket with a Rust
+fixture that supplies synthetic pixels to the production media server and
+resize transaction. It checks competing devices/tabs, protected media routes,
+refresh, transport changes, pause/resume, lease expiry, HiDPI/portrait sizing,
+fullscreen, rejected-mode rollback, and restoration of the host size. It also
+checks that the physical monitor stays unchanged and the owned output is
+removed when the fixture stops. `--serve` starts this fixture for manual UI review.
 
 For real extended-display acceptance, run inside Hyprland with no active share:
 

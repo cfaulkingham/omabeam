@@ -1,6 +1,7 @@
 //! Capture orchestration and local session lifecycle. HTTP and viewer state are
 //! independent of the compositor, so the same path can be exercised by --demo.
 mod config;
+mod desktop;
 mod diagnostics;
 mod http;
 mod signals;
@@ -14,6 +15,7 @@ pub use webrtc::probe_encoder;
 use crate::{capture::CaptureRequest, portal::Selection};
 use anyhow::{Context, Result, bail, ensure};
 pub use config::{EncoderMode, LiveConfig};
+pub use desktop::DesktopStats;
 use diagnostics::FrameMeasurement;
 pub use diagnostics::{StreamDiagnostics, TimingStats, ViewerDiagnostics};
 pub use http::viewer_html;
@@ -26,7 +28,7 @@ use std::{
     net::{IpAddr, TcpListener},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
@@ -202,6 +204,7 @@ pub fn run_demo(config: LiveConfig) -> Result<()> {
         config,
         first,
         started.elapsed(),
+        None,
         move |_| {
             counter = counter.wrapping_add(1);
             Ok(Some(omabeam_capture::demo_frame(counter)))
@@ -283,7 +286,7 @@ pub struct LiveSession {
     capture: Option<JoinHandle<()>>,
     server: Option<JoinHandle<()>>,
     rtc_worker: Option<JoinHandle<()>>,
-    display: Option<crate::hypr::desktop::VirtualDisplay>,
+    display: Option<Arc<Mutex<crate::hypr::desktop::VirtualDisplay>>>,
     session_lock: Option<std::fs::File>,
 }
 
@@ -297,25 +300,55 @@ impl LiveSession {
         let lock = status::session_lock()?;
         crate::hypr::desktop::recover()?;
         let display = match &source {
-            LiveSource::Extend(config) => {
-                Some(crate::hypr::desktop::VirtualDisplay::create(config)?)
-            }
+            LiveSource::Extend(config) => Some(Arc::new(Mutex::new(
+                crate::hypr::desktop::VirtualDisplay::create(config)?,
+            ))),
             _ => None,
         };
         let request = match &display {
-            Some(display) => CaptureRequest::Output(display.name().to_owned()),
+            Some(display) => CaptureRequest::Output(display.lock().unwrap().name().to_owned()),
             None => source.request()?,
         };
         let mut capturer = CaptureSession::new_with_cursor(request.target()?, config.cursor)
             .context("live share capture initialization failed")?;
         let started = Instant::now();
         let first = capturer.capture()?;
+        let desktop = match &source {
+            LiveSource::Extend(config) => {
+                Some(Arc::new(desktop::DesktopControl::new(config.clone())))
+            }
+            _ => None,
+        };
+        let capture_desktop = desktop.clone();
+        let capture_display = display.clone();
+        let cursor = config.cursor;
         let mut session = Self::start_frames(
             source.label(),
             config,
             first,
             started.elapsed(),
-            move |timeout| capturer.next_frame(timeout),
+            desktop,
+            move |timeout| {
+                if let Some(control) = &capture_desktop
+                    && let Some(resize) = control.take_resize()
+                {
+                    let display = capture_display.as_ref().unwrap().lock().unwrap();
+                    let frame = control.apply_resize(resize, |size| {
+                        display.resize(size)?;
+                        // Reopen capture after a mode switch to discard in-flight
+                        // buffers from the old geometry on either capture protocol.
+                        capturer = CaptureSession::new_with_cursor(request.target()?, cursor)?;
+                        let frame = capturer.capture()?;
+                        ensure!(
+                            frame.image.dimensions() == (size.width, size.height),
+                            "capture did not match the requested display size"
+                        );
+                        Ok(frame)
+                    })?;
+                    return Ok(Some(frame));
+                }
+                capturer.next_frame(timeout)
+            },
         )?;
         session.display = display;
         session.session_lock = Some(lock);
@@ -327,6 +360,7 @@ impl LiveSession {
         config: LiveConfig,
         first: CapturedFrame,
         first_capture_wait: Duration,
+        desktop: Option<Arc<desktop::DesktopControl>>,
         next: impl FnMut(Duration) -> Result<Option<CapturedFrame>> + Send + 'static,
     ) -> Result<Self> {
         config.validate()?;
@@ -346,7 +380,9 @@ impl LiveSession {
             IpAddr::V4(ip) => ip.to_string(),
         };
         let url = format!("http://{host}:{port}/s/{token}/");
-        let frames = Arc::new(FrameState::new(title.clone()));
+        let mut frames = FrameState::new(title.clone());
+        frames.desktop = desktop;
+        let frames = Arc::new(frames);
         publish_frame(&frames, first, &config, first_capture_wait)?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut rtc_worker = if config.webrtc {
@@ -402,12 +438,17 @@ impl LiveSession {
     }
 
     fn status(&self) -> LiveStatus {
+        let stats = self.frames.stats();
         LiveStatus {
             pid: std::process::id(),
             starttime: status::self_starttime(),
             url: self.url.clone(),
-            title: self.title.clone(),
-            stats: self.frames.stats(),
+            title: if stats.desktop.is_some() {
+                stats.source.clone()
+            } else {
+                self.title.clone()
+            },
+            stats,
         }
     }
 
@@ -448,6 +489,11 @@ fn publish_frame(
     config: &LiveConfig,
     capture_wait: Duration,
 ) -> Result<()> {
+    let mut config = config.clone();
+    if frames.desktop.as_ref().is_some_and(|d| d.stats().matched) {
+        config.pixel_mode = omabeam_capture::PixelMode::Native;
+        config.max_width = None;
+    }
     let encode_started_at = Instant::now();
     let (width, height) = frame.stream_dimensions(config.max_width, config.pixel_mode)?;
     let jpeg = if !config.webrtc || frames.viewers.load(Ordering::SeqCst) > 0 {

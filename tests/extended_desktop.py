@@ -37,6 +37,7 @@ class Compositor:
         self.hold_create = False
         self.fail_create = False
         self.fail_config = False
+        self.fail_next_config = False
         self.fail_remove = False
         self.error = None
         self.thread = threading.Thread(target=self.serve)
@@ -70,7 +71,8 @@ class Compositor:
                         match = re.fullmatch(r'/eval hl.monitor\(\{ output = "(OMABEAM-[0-9a-f]{32})", mode = "(\d+)x(\d+)@60", position = "(-?\d+)x(-?\d+)", scale = (\d+) \}\)', request)
                         assert match, request
                         name, w, h, x, y, scale = match.groups()
-                        if self.fail_config:
+                        if self.fail_config or self.fail_next_config:
+                            self.fail_next_config = False
                             reply = 'configuration rejected'
                         else:
                             self.outputs[name] = monitor(name, int(w), int(h), int(scale), int(x), int(y))

@@ -258,6 +258,106 @@ pub(super) fn handle_client(
         let _ = response(&mut stream, "404 Not Found", "text/plain", b"not found", "");
         return;
     };
+    let connections: Vec<_> = fields[1]
+        .split_once('?')
+        .map_or("", |(_, q)| q)
+        .split('&')
+        .filter_map(|part| part.strip_prefix("viewer="))
+        .collect();
+    let connection = if connections.len() == 1 {
+        Some(connections[0])
+    } else {
+        None
+    };
+    if matches!(
+        route,
+        "/stream" | "/frame.jpg" | "/webrtc/offer" | "/webrtc/close"
+    ) && !frames.authorized(connection)
+    {
+        let _ = response(
+            &mut stream,
+            "409 Conflict",
+            "text/plain",
+            super::desktop::IN_USE.as_bytes(),
+            "",
+        );
+        return;
+    }
+    if fields[0] == "POST"
+        && matches!(
+            route,
+            "/desktop/claim" | "/desktop/heartbeat" | "/desktop/release" | "/desktop/size"
+        )
+    {
+        if stop.load(Ordering::SeqCst) || frames.inner.lock().unwrap().ended.is_some() {
+            let _ = response(&mut stream, "410 Gone", "text/plain", b"share ended", "");
+            return;
+        }
+        let Some(desktop) = &frames.desktop else {
+            let _ = response(
+                &mut stream,
+                "404 Not Found",
+                "text/plain",
+                b"not an extended desktop",
+                "",
+            );
+            return;
+        };
+        #[derive(serde::Deserialize)]
+        struct Command {
+            connection: String,
+            client: Option<String>,
+            size: Option<Size>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Size {
+            width: u32,
+            height: u32,
+            scale: u32,
+        }
+        let command = read_json_body(&mut stream, &request)
+            .and_then(|body| serde_json::from_slice::<Command>(&body).ok());
+        let Some(command) = command else {
+            let _ = response(
+                &mut stream,
+                "400 Bad Request",
+                "text/plain",
+                b"expected bounded, same-origin JSON",
+                "",
+            );
+            return;
+        };
+        let result = match route {
+            "/desktop/claim" => {
+                desktop.claim(command.client.as_deref().unwrap_or(""), &command.connection)
+            }
+            "/desktop/heartbeat" => desktop.heartbeat(&command.connection),
+            "/desktop/release" => {
+                desktop.release(&command.connection);
+                Ok(())
+            }
+            _ => desktop.request_size(
+                &command.connection,
+                command.size.map(|s| (s.width, s.height, s.scale)),
+            ),
+        };
+        match result {
+            Ok(()) => {
+                frames.tick.notify_all();
+                let _ = response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_vec(&desktop.stats()).unwrap(),
+                    "",
+                );
+            }
+            Err((status, message)) => {
+                let _ = response(&mut stream, status, "text/plain", message.as_bytes(), "");
+            }
+        }
+        return;
+    }
     if fields[0] == "POST" && matches!(route, "/webrtc/offer" | "/webrtc/close") {
         let rtc = frames.rtc.lock().unwrap().clone();
         let Some(rtc) = rtc else {
@@ -285,7 +385,7 @@ pub(super) fn handle_client(
             return;
         };
         let result = if route == "/webrtc/offer" {
-            rtc.offer(&body)
+            rtc.offer(&body, connection.map(str::to_owned))
         } else {
             #[derive(serde::Deserialize)]
             struct Close {
@@ -386,7 +486,7 @@ pub(super) fn handle_client(
             }
         }
         "/stream" => {
-            let _ = write_mjpeg(&mut stream, &frames, &stop);
+            let _ = write_mjpeg(&mut stream, &frames, &stop, connection);
         }
         _ => {
             let _ = response(&mut stream, "404 Not Found", "text/plain", b"not found", "");
@@ -411,14 +511,19 @@ fn peer_closed(stream: &TcpStream) -> bool {
     }
 }
 
-fn write_mjpeg(stream: &mut TcpStream, frames: &FrameState, stop: &AtomicBool) -> io::Result<()> {
+fn write_mjpeg(
+    stream: &mut TcpStream,
+    frames: &FrameState,
+    stop: &AtomicBool,
+    connection: Option<&str>,
+) -> io::Result<()> {
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary={BOUNDARY}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
     );
     write_parts(stream, &[header.as_bytes()], IO_DEADLINE)?;
     let viewer = Viewer::new(frames);
     let mut last = 0;
-    while !stop.load(Ordering::SeqCst) {
+    while !stop.load(Ordering::SeqCst) && frames.authorized(connection) {
         let data = frames.inner.lock().unwrap();
         let (data, _) = frames
             .tick
@@ -426,7 +531,7 @@ fn write_mjpeg(stream: &mut TcpStream, frames: &FrameState, stop: &AtomicBool) -
                 d.generation == last && d.ended.is_none() && !stop.load(Ordering::SeqCst)
             })
             .unwrap();
-        if data.ended.is_some() || stop.load(Ordering::SeqCst) {
+        if data.ended.is_some() || stop.load(Ordering::SeqCst) || !frames.authorized(connection) {
             break;
         }
         if data.generation == last {
@@ -519,7 +624,7 @@ mod tests {
             let (mut socket, _) = listener.accept().unwrap();
             let frames = frames.clone();
             let worker = thread::spawn(move || {
-                let _ = write_mjpeg(&mut socket, &frames, &AtomicBool::new(false));
+                let _ = write_mjpeg(&mut socket, &frames, &AtomicBool::new(false), None);
             });
             let mut reader = BufReader::new(client);
             loop {

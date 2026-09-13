@@ -8,6 +8,7 @@ import argparse
 import io
 import json
 import os
+import secrets
 from pathlib import Path
 import subprocess
 import time
@@ -67,11 +68,19 @@ def main():
         assert len(new) == 1 and (new[0]['width'], new[0]['height']) == (1280, 720), monitors
         assert {m['name']: (m['width'], m['height'], m['x'], m['y'], m['scale']) for m in monitors if m['name'] != owned_name} == baseline_layout
         (artifacts / 'monitors.json').write_text(json.dumps(monitors, indent=2))
-        with urllib.request.urlopen(status['url'] + 'frame.jpg', timeout=10) as response:
+        client, connection = secrets.token_hex(16), secrets.token_hex(16)
+        def desktop_post(route, body):
+            request = urllib.request.Request(status['url'] + 'desktop/' + route,
+                data=json.dumps(body).encode(), headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.load(response)
+        desktop_post('claim', dict(client=client, connection=connection))
+        with urllib.request.urlopen(status['url'] + 'frame.jpg?viewer=' + connection, timeout=10) as response:
             jpeg = response.read()
         frame = Image.open(io.BytesIO(jpeg))
         assert frame.size == (1280, 720), frame.size
         frame.save(artifacts / 'extended-display.png')
+        desktop_post('release', dict(connection=connection))
 
         if args.browser:
             from playwright.sync_api import sync_playwright
@@ -79,7 +88,7 @@ def main():
                 browser = playwright.chromium.launch(headless=True)
                 page = browser.new_page()
                 page.goto(status['url'])
-                page.wait_for_function("document.querySelector('img').naturalWidth === 1280")
+                page.wait_for_function("document.querySelector('img').naturalWidth === 1280", timeout=30000)
                 page.wait_for_function("document.querySelector('#source').textContent.includes('Extended desktop')")
                 page.screenshot(path=str(artifacts / 'viewer.png'))
                 page.close()
@@ -87,7 +96,7 @@ def main():
                 assert any(m['name'] == owned_name for m in json.loads(command('--hypr', 'monitors').stdout))
                 page = browser.new_page()
                 page.goto(status['url'])
-                page.wait_for_function("document.querySelector('img').naturalWidth === 1280")
+                page.wait_for_function("document.querySelector('img').naturalWidth === 1280", timeout=30000)
                 page.wait_for_function("document.querySelector('#source').textContent.includes('Extended desktop')")
                 browser.close()
             # Disconnecting the viewer must leave the desktop available.

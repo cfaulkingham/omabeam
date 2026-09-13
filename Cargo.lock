@@ -4896,6 +4896,7 @@ dependencies = [
  "gpui-kit",
  "gpui-omarchy",
  "if-addrs",
+ "image",
  "localsend",
  "omabeam-capture",
  "omabeam-encoder",

@@ -150,7 +150,7 @@ impl VirtualDisplay {
         config.validate()?;
         let ipc = Ipc::from_env()?;
         let monitors = parse_monitors(&ipc.query("monitors")?)?;
-        let (x, y) = config.placement(&monitors)?;
+        config.placement(&monitors)?;
         let name = format!("OMABEAM-{}", crate::live::random_token()?);
         ensure!(
             !parse_monitors(&ipc.query("monitors all")?)?
@@ -175,22 +175,41 @@ impl VirtualDisplay {
             .ipc
             .command(&format!("output create headless {}", guard.name()))
             .context("Hyprland could not create the extended display")?;
-        guard.ipc.command(&format!(
+        guard.resize(config)?;
+        Ok(guard)
+    }
+
+    /// Reconfigure only this session's output. Exclude it when calculating
+    /// placement so left/above displays remain attached after a size change.
+    pub fn resize(&self, config: &DesktopConfig) -> Result<()> {
+        config.validate()?;
+        self.owned.validate()?;
+        let monitors = parse_monitors(&self.ipc.query("monitors all")?)?;
+        ensure!(
+            monitors.iter().any(|m| m.name == self.name()),
+            "extended display was removed"
+        );
+        let others: Vec<_> = parse_monitors(&self.ipc.query("monitors")?)?
+            .into_iter()
+            .filter(|m| m.name != self.name())
+            .collect();
+        let (x, y) = config.placement(&others)?;
+        self.ipc.command(&format!(
             "eval hl.monitor({{ output = \"{}\", mode = \"{}x{}@60\", position = \"{}x{}\", scale = {} }})",
-            guard.name(), config.width, config.height, x, y, config.scale))
+            self.name(), config.width, config.height, x, y, config.scale))
             .context("Hyprland could not configure the extended display")?;
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let monitors = parse_monitors(&guard.ipc.query("monitors")?)?;
+            let monitors = parse_monitors(&self.ipc.query("monitors")?)?;
             if monitors.iter().any(|m| {
-                m.name == guard.name()
+                m.name == self.name()
                     && m.width == config.width
                     && m.height == config.height
                     && (m.scale - config.scale as f32).abs() < 0.01
                     && m.x == x
                     && m.y == y
             }) {
-                return Ok(guard);
+                return Ok(());
             }
             ensure!(
                 Instant::now() < deadline,

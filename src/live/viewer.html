@@ -51,6 +51,9 @@ button:disabled, a:not([href]) { opacity: 0.45; cursor: default; }
 #stage.ended #view, #stage.ended video, [hidden] { display: none !important; }
 #stage.ended { display: grid !important; place-items: center; }
 #stage.ended #disconnected { display: block; }
+#stage.blocked #disconnected { display: block; max-width: 28ch; font-size: clamp(1.4rem, 4vw, 2.5rem); }
+#desktop-note { overflow-wrap: anywhere; }
+button[aria-pressed="true"] { border-color: var(--accent); }
 footer { flex-shrink: 0; padding: 12px 20px; font-size: 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; border-top: 1px solid var(--outline); color: var(--muted); }
 #source, #error { overflow-wrap: anywhere; }
 #error { color: var(--urgent); }
@@ -89,11 +92,11 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
     <span class="brand-mark" aria-hidden="true"><svg width="17" height="17" viewBox="0 0 17 17" fill="currentColor"><rect width="7" height="7" rx="1"/><rect x="10" width="7" height="7" rx="1"/><rect y="10" width="7" height="7" rx="1"/><rect x="10" y="10" width="7" height="7" rx="1" opacity=".35"/></svg></span>
     <div><h1>OmaBeam</h1><p class="subtitle">Watch a shared window, screen, or area</p></div>
   </div>
-  <nav aria-label="Viewer controls"><button id="transport" hidden>Video: Auto</button><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
+  <nav aria-label="Viewer controls"><button id="match-device" aria-pressed="false" hidden>Match this device</button><button id="transport" hidden>Video: Auto</button><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
 </header>
 <main id="stage" class="contain"><img id="view" alt=""><video id="video" autoplay muted playsinline hidden></video><h2 id="disconnected">OmaBeam disconnected</h2><button id="exit">Exit fullscreen</button></main>
 <footer>
-  <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="transport-note"></span><span id="error" role="alert"></span>
+  <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="transport-note"></span><span id="desktop-note"></span><span id="error" role="alert"></span>
   <details id="diagnostics">
     <summary>Stream diagnostics</summary>
     <div class="diagnostic-body">
@@ -152,8 +155,126 @@ const fitLabels = ['contain', 'fill width', 'actual size'];
 let pc = null, peerId = null, epoch = 0, firstFrameTimer = null;
 let preferRtc = true, fallbackReason = '', playback = 'none', browserStats = null;
 let previousInbound = null, lastDecodedAt = 0;
+const matchDevice = document.getElementById('match-device');
+const desktopNote = document.getElementById('desktop-note');
+const identityKey = 'omabeam-client:' + location.pathname;
+const matchKey = 'omabeam-match:' + location.pathname;
+function randomId() {
+  return [...crypto.getRandomValues(new Uint8Array(16))].map(n => n.toString(16).padStart(2, '0')).join('');
+}
+let clientIdentity = randomId(), connectionIdentity = randomId();
+let ownsDesktop = false, desktopBlocked = false, claiming = null;
+let matchEnabled = false, matchTimer = null, lastSizeRequest = null, resizing = false;
+try {
+  clientIdentity = sessionStorage.getItem(identityKey) || clientIdentity;
+  sessionStorage.setItem(identityKey, clientIdentity);
+  matchEnabled = sessionStorage.getItem(matchKey) === 'true';
+} catch { /* Storage can be unavailable; ownership still works for this page. */ }
+function mediaUrl(path) {
+  return latestStats?.desktop ? `${path}?viewer=${connectionIdentity}` : path;
+}
+async function desktopRequest(action, body = {}, connection = connectionIdentity) {
+  return fetch('desktop/' + action, {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({...body, connection}), signal: AbortSignal.timeout(4000)});
+}
+function showDesktopBlocked() {
+  ownsDesktop = false; desktopBlocked = true;
+  stopPlayback(); clearTimeout(retry); retry = null;
+  stage.classList.add('blocked');
+  document.getElementById('disconnected').textContent = 'This display is already connected to another device.';
+  setStatus('Display in use', 'connecting');
+  desktopNote.textContent = 'Waiting for the display to become available…';
+  document.getElementById('snapshot').removeAttribute('href');
+  matchDevice.disabled = true; transport.disabled = true;
+}
+function releaseDesktop() {
+  const previous = connectionIdentity;
+  ownsDesktop = false; connectionIdentity = randomId(); lastSizeRequest = null;
+  if (latestStats?.desktop) fetch('desktop/release', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({connection: previous}), keepalive: true}).catch(() => {});
+}
+async function claimDesktop() {
+  if (!latestStats?.desktop || ownsDesktop) return true;
+  if (claiming) return claiming;
+  const connection = connectionIdentity;
+  claiming = (async () => {
+    const response = await desktopRequest('claim', {client: clientIdentity}, connection);
+    if (connection !== connectionIdentity || paused || ended) return false;
+    if (response.status === 409) { showDesktopBlocked(); return false; }
+    if (!response.ok) throw new Error(await response.text());
+    ownsDesktop = true; desktopBlocked = false; lastSizeRequest = null;
+    stage.classList.remove('blocked');
+    transport.disabled = false; matchDevice.disabled = false;
+    document.getElementById('snapshot').href = mediaUrl('frame.jpg');
+    renderDesktop(await response.json());
+    if (matchEnabled) scheduleMatch();
+    return true;
+  })();
+  try { return await claiming; } finally { claiming = null; }
+}
+function renderDesktop(desktop) {
+  matchDevice.hidden = !desktop;
+  if (!desktop) return;
+  matchDevice.disabled = !ownsDesktop || paused || ended;
+  matchDevice.setAttribute('aria-pressed', String(matchEnabled));
+  matchDevice.textContent = matchEnabled ? 'Device size: On' : 'Match this device';
+  matchDevice.title = matchEnabled ? 'Restore the size and scale selected on the host' : 'Resize the extended desktop to this viewing area';
+  if (!desktopBlocked) desktopNote.textContent = desktop.updating ? 'Resizing desktop…' :
+    (desktop.error || `Desktop ${desktop.config.width}×${desktop.config.height} · ${desktop.config.scale * 100}% scale`);
+}
+function requestedDeviceSize() {
+  const rect = stage.getBoundingClientRect();
+  // Hyprland's picker currently offers 100% and 200% desktop scale. Choose
+  // the nearest supported density, preserving usable desktop space on HiDPI.
+  const scale = devicePixelRatio >= 1.5 ? 2 : 1;
+  let width = Math.max(640, Math.round(rect.width * scale));
+  let height = Math.max(480, Math.round(rect.height * scale));
+  const ratio = Math.min(1, 3840 / Math.max(width, height), 2160 / Math.min(width, height));
+  width = Math.max(640, Math.floor(width * ratio / 2) * 2);
+  height = Math.max(480, Math.floor(height * ratio / 2) * 2);
+  return {width, height, scale};
+}
+function scheduleMatch() {
+  clearTimeout(matchTimer);
+  if (!ownsDesktop || paused || ended || !matchEnabled) return;
+  matchTimer = setTimeout(() => resizeDesktop(), 800);
+}
+async function resizeDesktop() {
+  if (!ownsDesktop || paused || ended || resizing) return;
+  const size = matchEnabled ? requestedDeviceSize() : null;
+  const key = JSON.stringify(size);
+  if (lastSizeRequest === key) return;
+  const connection = connectionIdentity;
+  resizing = true;
+  try {
+    const response = await desktopRequest('size', {size}, connection);
+    if (connection !== connectionIdentity || !ownsDesktop) return;
+    if (response.status === 409) { showDesktopBlocked(); return; }
+    if (response.status === 429) { matchTimer = setTimeout(() => resizeDesktop(), 1000); return; }
+    lastSizeRequest = key;
+    if (!response.ok) throw new Error(await response.text());
+    renderDesktop(await response.json());
+  } catch (failure) { desktopNote.textContent = failure.message || 'Could not resize the desktop.'; }
+  finally {
+    resizing = false;
+    // Preserve a toggle/viewport change made while an earlier request was in flight.
+    if (connection === connectionIdentity && ownsDesktop && !paused && !ended &&
+        JSON.stringify(matchEnabled ? requestedDeviceSize() : null) !== lastSizeRequest) {
+      clearTimeout(matchTimer); matchTimer = setTimeout(() => resizeDesktop(), 1000);
+    }
+  }
+}
+matchDevice.onclick = () => {
+  matchEnabled = !matchEnabled; lastSizeRequest = null;
+  try { sessionStorage.setItem(matchKey, String(matchEnabled)); } catch {}
+  renderDesktop(latestStats.desktop);
+  clearTimeout(matchTimer); matchTimer = setTimeout(() => resizeDesktop(), 800);
+};
+new ResizeObserver(scheduleMatch).observe(stage);
+addEventListener('resize', scheduleMatch);
+document.addEventListener('fullscreenchange', scheduleMatch);
 function releasePeer(id) {
-  if (id) fetch('webrtc/close', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}), keepalive: true}).catch(() => {});
+  if (id) fetch(mediaUrl('webrtc/close'), {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({id}), keepalive: true}).catch(() => {});
 }
 function stopPlayback() {
   epoch++; clearTimeout(firstFrameTimer); firstFrameTimer = null;
@@ -165,20 +286,23 @@ function stopPlayback() {
 }
 function connectJpeg(reason = '') {
   stopPlayback();
-  if (paused || ended) return;
+  if (paused || ended || (latestStats?.desktop && !ownsDesktop)) return;
   fallbackReason = reason; playback = 'jpeg';
   transport.textContent = reason && preferRtc ? 'Retry H.264' : (preferRtc ? 'Video: Auto' : 'Video: JPEG');
   transportNote.textContent = reason ? `JPEG fallback · ${reason}` : 'JPEG';
-  img.src = 'stream?t=' + Date.now(); setStatus('Connecting…', 'connecting');
+  const url = mediaUrl('stream');
+  img.src = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now(); setStatus('Connecting…', 'connecting');
 }
-function connect() {
+async function connect() {
   clearTimeout(retry); retry = null;
   if (paused || ended) return;
+  try { if (!(await claimDesktop()) || paused || ended) return; }
+  catch { setStatus('Reconnecting…', 'connecting'); return; }
   if (preferRtc && latestStats?.webrtc && !latestStats.webrtc.error) connectRtc();
   else connectJpeg(preferRtc && latestStats?.webrtc?.error ? latestStats.webrtc.error : '');
 }
 function reconnect() {
-  if (!paused && !ended && retry === null) retry = setTimeout(() => connectJpeg(fallbackReason), 1500);
+  if (!paused && !ended && !desktopBlocked && retry === null) retry = setTimeout(() => { retry = null; connect(); }, 1500);
 }
 async function connectRtc() {
   stopPlayback();
@@ -220,7 +344,7 @@ async function connectRtc() {
       connection.addEventListener('icegatheringstatechange', changed);
     });
     if (!active()) return;
-    const response = await fetch('webrtc/offer', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    const response = await fetch(mediaUrl('webrtc/offer'), {method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(connection.localDescription), signal: AbortSignal.timeout(4000)});
     if (!response.ok) throw new Error((await response.text()).slice(0, 180));
     const result = await response.json();
@@ -260,9 +384,12 @@ async function sampleBrowser() {
 }
 function finish(message) {
   ended = true; clearTimeout(retry); retry = null; stopPlayback();
+  releaseDesktop(); clearTimeout(matchTimer); matchDevice.disabled = true;
   pause.disabled = true; transport.disabled = true;
   document.getElementById('snapshot').removeAttribute('href');
   stage.classList.add('ended');
+  stage.classList.remove('blocked');
+  document.getElementById('disconnected').textContent = 'OmaBeam disconnected';
   setStatus('Share ended', 'ended'); error.textContent = message;
 }
 img.onerror = () => {
@@ -273,7 +400,8 @@ img.onerror = () => {
 pause.onclick = () => {
   paused = !paused; clearTimeout(retry); retry = null;
   pause.textContent = paused ? 'Resume' : 'Pause';
-  if (paused) { stopPlayback(); setStatus('Paused', 'paused'); } else connect();
+  if (paused) { stopPlayback(); releaseDesktop(); setStatus('Paused', 'paused'); } else connect();
+  renderDesktop(latestStats?.desktop);
 };
 transport.onclick = () => {
   if (!fallbackReason) preferRtc = !preferRtc;
@@ -282,7 +410,10 @@ transport.onclick = () => {
   if (!paused) connect();
   else transport.textContent = preferRtc ? 'Video: Auto' : 'Video: JPEG';
 };
-addEventListener('pagehide', () => { paused = true; stopPlayback(); });
+addEventListener('pagehide', () => { paused = true; stopPlayback(); releaseDesktop(); });
+addEventListener('pageshow', event => {
+  if (event.persisted && !ended) { paused = false; pause.textContent = 'Pause'; connect(); }
+});
 document.getElementById('fit').onclick = e => {
   stage.classList.remove(fits[fit]); fit = (fit + 1) % fits.length; stage.classList.add(fits[fit]);
   e.target.textContent = 'Fit: ' + fitLabels[fit];
@@ -364,15 +495,25 @@ async function poll() {
     const initial = latestStats === null;
     latestStats = stats;
     transport.hidden = !stats.webrtc;
+    renderDesktop(stats.desktop);
+    if (stats.desktop && stats.state !== 'ended' && !paused) {
+      if (ownsDesktop) {
+        const connection = connectionIdentity;
+        const heartbeat = await desktopRequest('heartbeat', {}, connection);
+        if (connection === connectionIdentity && heartbeat.status === 409) showDesktopBlocked();
+        else if (!heartbeat.ok) throw new Error('Could not renew display connection');
+      }
+      if (!ownsDesktop) await connect();
+    }
     await sampleBrowser();
-    if (initial && stats.state !== 'ended') connect();
+    if (initial && !stats.desktop && stats.state !== 'ended') connect();
     if (['webrtc', 'connecting'].includes(playback) && stats.webrtc?.error) connectJpeg(stats.webrtc.error);
     if (document.getElementById('diagnostics').open) renderDiagnostics(stats);
     document.getElementById('metrics').textContent = `${stats.width}×${stats.height} · ${stats.fps.toFixed(1)} capture fps · ${stats.viewers} viewer${stats.viewers === 1 ? '' : 's'}`;
     document.getElementById('source').textContent = stats.source;
     error.textContent = stats.error || '';
     if (stats.state === 'ended') finish(stats.error || 'The source is no longer available.');
-    else if (!paused && playback !== 'connecting') setStatus(stats.fps > 0 ? 'Live' : 'Live · waiting for changes', 'live');
+    else if (!paused && !desktopBlocked && playback !== 'connecting') setStatus(stats.fps > 0 ? 'Live' : 'Live · waiting for changes', 'live');
   } catch {
     if (!ended) {
       failures++;

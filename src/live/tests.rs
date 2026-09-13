@@ -39,6 +39,222 @@ fn exchange(frames: &Arc<FrameState>, request: &[u8]) -> Vec<u8> {
     response
 }
 
+fn desktop_post(frames: &Arc<FrameState>, path: &str, body: serde_json::Value) -> Vec<u8> {
+    let body = body.to_string();
+    exchange(frames, format!("POST /s/test/{path} HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes())
+}
+
+#[test]
+fn extended_media_cannot_bypass_the_display_claim() {
+    let mut frames = FrameState::new("extended".into());
+    frames.desktop = Some(Arc::new(desktop::DesktopControl::new(Default::default())));
+    let frames = Arc::new(frames);
+    publish_frame(
+        &frames,
+        omabeam_capture::demo_frame(0),
+        &LiveConfig::default(),
+        Duration::ZERO,
+    )
+    .unwrap();
+    let client = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let page = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let other = "cccccccccccccccccccccccccccccccc";
+    for route in ["frame.jpg", "stream", "webrtc/offer", "webrtc/close"] {
+        let reply = exchange(
+            &frames,
+            format!("GET /s/test/{route} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert!(reply.starts_with(b"HTTP/1.1 409"), "{route}");
+    }
+    assert!(
+        desktop_post(
+            &frames,
+            "desktop/claim",
+            serde_json::json!({"client": client, "connection": page})
+        )
+        .starts_with(b"HTTP/1.1 200")
+    );
+    assert!(
+        desktop_post(
+            &frames,
+            "desktop/claim",
+            serde_json::json!({"client": other, "connection": other})
+        )
+        .starts_with(b"HTTP/1.1 409")
+    );
+    assert!(
+        exchange(
+            &frames,
+            format!("GET /s/test/frame.jpg?viewer={page} HTTP/1.1\r\n\r\n").as_bytes()
+        )
+        .starts_with(b"HTTP/1.1 200")
+    );
+    assert!(
+        exchange(
+            &frames,
+            format!("GET /s/test/frame.jpg?viewer={other} HTTP/1.1\r\n\r\n").as_bytes()
+        )
+        .starts_with(b"HTTP/1.1 409")
+    );
+    let resize = serde_json::json!({"connection": other, "size": {"width": 1280, "height": 800, "scale": 1}});
+    assert!(desktop_post(&frames, "desktop/size", resize).starts_with(b"HTTP/1.1 409"));
+    let body = serde_json::json!({"client": client, "connection": page}).to_string();
+    let cross_origin = format!(
+        "POST /s/test/desktop/claim HTTP/1.1\r\nHost: localhost\r\nOrigin: http://other.example\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    assert!(exchange(&frames, cross_origin.as_bytes()).starts_with(b"HTTP/1.1 400"));
+    desktop_post(
+        &frames,
+        "desktop/release",
+        serde_json::json!({"connection": page}),
+    );
+    assert!(
+        exchange(
+            &frames,
+            format!("GET /s/test/frame.jpg?viewer={page} HTTP/1.1\r\n\r\n").as_bytes()
+        )
+        .starts_with(b"HTTP/1.1 409")
+    );
+    frames.fail("display removed".into());
+    assert!(
+        desktop_post(
+            &frames,
+            "desktop/claim",
+            serde_json::json!({"client": client, "connection": other})
+        )
+        .starts_with(b"HTTP/1.1 410")
+    );
+}
+
+#[test]
+fn matching_uses_native_pixels_and_restores_host_encoding_limits() {
+    let mut frames = FrameState::new("extended".into());
+    let control = Arc::new(desktop::DesktopControl::new(Default::default()));
+    frames.desktop = Some(control.clone());
+    let client = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    control.claim(client, client).unwrap();
+    control.request_size(client, Some((1280, 800, 2))).unwrap();
+    control
+        .apply_resize(control.take_resize().unwrap(), |_| Ok(()))
+        .unwrap();
+    let mut frame = omabeam_capture::demo_frame(0);
+    frame.logical_width = 320;
+    frame.logical_height = 180;
+    let config = LiveConfig {
+        max_width: Some(160),
+        webrtc: true,
+        ..Default::default()
+    };
+    publish_frame(
+        &frames,
+        CapturedFrame {
+            image: frame.image.clone(),
+            logical_width: frame.logical_width,
+            logical_height: frame.logical_height,
+        },
+        &config,
+        Duration::ZERO,
+    )
+    .unwrap();
+    assert_eq!((frames.stats().width, frames.stats().height), (640, 360));
+    assert_eq!(
+        frames
+            .inner
+            .lock()
+            .unwrap()
+            .raw
+            .as_ref()
+            .unwrap()
+            .config
+            .max_width,
+        None
+    );
+    assert!(control.request_size(client, None).is_err()); // Resize pacing applies.
+    thread::sleep(Duration::from_millis(760));
+    control.request_size(client, None).unwrap();
+    control
+        .apply_resize(control.take_resize().unwrap(), |_| Ok(()))
+        .unwrap();
+    publish_frame(&frames, frame, &config, Duration::ZERO).unwrap();
+    assert_eq!((frames.stats().width, frames.stats().height), (160, 90));
+    assert_eq!(
+        frames.inner.lock().unwrap().raw.as_ref().unwrap().config,
+        config
+    );
+}
+
+/// Invoked by tests/extended_viewer.py with a private mock compositor socket.
+/// Production HTTP, leases, resize transactions, IPC and encoders are used;
+/// only Wayland pixels are synthetic so the fixture also runs on macOS.
+#[test]
+#[ignore = "browser fixture; run tests/extended_viewer.py"]
+fn extended_desktop_browser_fixture() {
+    let directory = std::path::PathBuf::from(
+        std::env::var("OMABEAM_FIXTURE_DIR").expect("fixture directory required"),
+    );
+    let original = crate::hypr::desktop::DesktopConfig {
+        width: 1280,
+        height: 720,
+        ..Default::default()
+    };
+    let display = Arc::new(Mutex::new(
+        crate::hypr::desktop::VirtualDisplay::create(&original).unwrap(),
+    ));
+    let control = Arc::new(desktop::DesktopControl::new(original.clone()));
+    let next_control = control.clone();
+    let next_display = display.clone();
+    fn pixels(config: &crate::hypr::desktop::DesktopConfig, tick: u32) -> CapturedFrame {
+        CapturedFrame {
+            image: image::RgbaImage::from_fn(config.width, config.height, |x, y| {
+                image::Rgba([((x + tick * 7) % 256) as u8, (y % 256) as u8, 180, 255])
+            }),
+            logical_width: config.width / config.scale,
+            logical_height: config.height / config.scale,
+        }
+    }
+    let config = LiveConfig {
+        bind: "127.0.0.1".parse().unwrap(),
+        port: 0,
+        webrtc_port: 0,
+        webrtc: true,
+        encoder: EncoderMode::Software,
+        pixel_mode: omabeam_capture::PixelMode::Native,
+        fps: 10,
+        ..Default::default()
+    };
+    let mut counter = 0;
+    let mut session = LiveSession::start_frames(
+        "Extended desktop fixture".into(),
+        config,
+        pixels(&original, 0),
+        Duration::ZERO,
+        Some(control),
+        move |_| {
+            counter += 1;
+            if let Some(resize) = next_control.take_resize() {
+                return next_control.apply_resize(resize, |config| {
+                    next_display.lock().unwrap().resize(config)?;
+                    Ok(Some(pixels(config, counter)))
+                });
+            }
+            Ok(Some(pixels(&next_control.stats().config, counter)))
+        },
+    )
+    .unwrap();
+    session.display = Some(display);
+    std::fs::write(
+        directory.join("ready.json"),
+        serde_json::json!({"url": session.url}).to_string(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(600);
+    while !directory.join("stop").exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(session);
+}
+
 #[test]
 fn default_bind_is_local_network() {
     assert!(LiveConfig::default().bind.is_unspecified());
