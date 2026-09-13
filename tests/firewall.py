@@ -160,9 +160,10 @@ class Firewall(unittest.TestCase):
         for call, port, protocol in zip(admin.call_args_list[1:3], ('9847', '9848'), ('tcp', 'udp')):
             self.assertEqual(call.args[0], ['/usr/sbin/ufw', 'prepend', 'allow', 'in', 'proto', protocol,
                 'from', str(NETWORK), 'to', 'any', 'port', port, 'comment', f'OmaBeam {protocol.upper()} {port}'])
-        code, _, admin = self.invoke(['--open-firewall', str(NETWORK)], [completed(opened)])
+        code, _, admin = self.invoke(['--open-missing'], [completed(opened)])
         self.assertEqual(code, 0)
         self.assertEqual(admin.call_count, 1)
+        self.assertEqual(admin.call_args_list[0].args[1], True)
 
     def test_write_failure_and_failed_verification_are_not_success(self):
         code, output, admin = self.invoke(['--open-firewall', str(NETWORK)],
@@ -176,7 +177,7 @@ class Firewall(unittest.TestCase):
         self.assertIn('could not be verified', output)
 
     def test_inactive_unavailable_and_permission_denied_never_write(self):
-        for args, expected in (([], 0), (['--open-firewall', str(NETWORK)], 1)):
+        for args, expected in (([], 0), (['--open-missing'], 0), (['--open-firewall', str(NETWORK)], 1)):
             code, _, admin = self.invoke(args, [completed('Status: inactive\n')])
             self.assertEqual(code, expected)
             self.assertEqual(admin.call_count, 1)
@@ -203,6 +204,16 @@ class Firewall(unittest.TestCase):
             self.assertEqual(FW.local_networks(), [(NETWORK, 'wlan0')])
         with patch.object(FW, 'run', return_value=completed('invalid JSON')):
             self.assertEqual(FW.local_networks(), [])
+
+    def test_open_missing_opens_discovered_subnet(self):
+        opened = status(('9847/tcp', 'ALLOW IN', str(NETWORK)), ('9848/udp', 'ALLOW IN', str(NETWORK)))
+        code, output, admin = self.invoke(['--open-missing'],
+            [completed(status()), completed('added'), completed('added'), completed(opened)])
+        self.assertEqual(code, 0, output)
+        self.assertEqual(admin.call_args_list[0].args, (['/usr/sbin/ufw', 'status', 'verbose'], True))
+        for call, port, protocol in zip(admin.call_args_list[1:3], ('9847', '9848'), ('tcp', 'udp')):
+            self.assertEqual(call.args[0][7], str(NETWORK))
+            self.assertEqual(call.args[1], True)
 
     def test_read_only_does_not_prompt_for_sudo(self):
         with patch.object(FW.os, 'geteuid', return_value=1000), patch.object(FW.shutil, 'which', return_value='/usr/bin/sudo'), \

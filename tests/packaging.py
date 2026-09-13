@@ -165,7 +165,7 @@ path.chmod(0o755)
             return result
         env["OMABEAM_TEST_HELPER_FAIL"] = "1"
         result = install(self.source, "--backend-only")
-        self.assertIn("WARNING: LAN viewing", result.stdout)
+        self.assertIn("UDP 9848 (WebRTC): ALLOWED", result.stdout)
         self.assertIn("Hardware encoder helper could not be built", result.stdout)
         self.assertTrue((self.source / "omarchy-plugin/native/bin/omabeam").is_file())
         self.assertFalse((self.source / "omarchy-plugin/native/bin/omabeam-encoder").exists())
@@ -183,9 +183,11 @@ path.chmod(0o755)
         # Copied runtime-only installs can rerun without Cargo/source present.
         (tools / "cargo").unlink()
         install(installed)
-        self.assertIn("WARNING: LAN viewing", install(installed, "--check-ports", success=False).stdout)
-        self.assertTrue(all(json.loads(line) == ["status", "verbose"] for line in firewall_log.read_text().splitlines()))
+        self.assertIn("UDP 9848 (WebRTC): ALLOWED", install(installed, "--check-ports").stdout)
+        mutations = [json.loads(line) for line in firewall_log.read_text().splitlines() if json.loads(line)[0] != "status"]
+        self.assertEqual(len(mutations), 2)
         self.assertIn("UDP 9848 (WebRTC): ALLOWED", install(installed, "--backend-only", "--open-firewall", "192.168.1.0/24").stdout)
+        self.assertEqual(len([json.loads(line) for line in firewall_log.read_text().splitlines() if json.loads(line)[0] != "status"]), 2)
         self.assertEqual(before, [(hypr / name).read_text() for name in ("hyprland.lua", "bindings.lua")])
         (installed / ".git").mkdir()
         (installed / ".git/sentinel").write_text("keep")

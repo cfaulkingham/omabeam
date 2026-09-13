@@ -47,28 +47,31 @@ release bundle includes the app and needs no Rust.
 
 The installer builds or verifies the native app, installs and enables the bar
 plugin, adds a floating-window rule, and binds **Super + Shift + T** when available. It can be
-rerun. It checks TCP **9847** and UDP **9848** against UFW's incoming rules
-and warns if LAN access is blocked or cannot be verified. Firewall changes
-require `--open-firewall`; portal configuration stays unchanged. `wl-copy`,
-`rsync`, `jq`, Python 3, and the Omarchy shell commands must be available.
+rerun. It checks TCP **9847** and UDP **9848** against UFW's incoming rules for
+the detected LAN. If those ports are blocked, it prompts for sudo and adds
+persistent, subnet-scoped allows. `--check-ports` inspects without changing
+rules. `--open-firewall CIDR` still selects a specific viewer network and
+fails if access cannot be verified. Portal configuration stays unchanged.
+`wl-copy`, `rsync`, `jq`, Python 3, and the Omarchy shell commands must be
+available.
 
-To install and allow viewers from your LAN, replace the example subnet with
-your viewer network:
+To restrict or override the detected LAN, replace the example with your
+viewer network:
 
 ```bash
-./install.sh --open-firewall 192.168.1.0/24
+./install.sh --open-firewall 192.168.2.0/24
 ```
 
 Already installed? Check or open the ports without rebuilding:
 
 ```bash
 ./install.sh --check-ports
-./install.sh --check-ports --open-firewall 192.168.1.0/24
+./install.sh --check-ports --open-firewall 192.168.2.0/24
 ```
 
-Opening ports requires sudo access and adds persistent, subnet-scoped UFW
-rules. A normal install only warns; an explicit check or open request exits
-unsuccessfully if access remains blocked or unverified. See
+Opening ports requires sudo access. A normal install still succeeds if you
+decline sudo or UFW cannot be updated; an explicit check or `--open-firewall`
+request exits unsuccessfully if access remains blocked or unverified. See
 [Firewall checks](RELEASING.md#firewall-checks) for detection limits.
 
 The plugin ID is `io.github.cfaulkingham.omabeam`. Its default location is:
@@ -107,7 +110,7 @@ Left on disk after removal:
   session. These go away at logout. There is no `/tmp` fallback.
 - Screenshots under `$OMARCHY_SCREENSHOT_DIR/omabeam`, `$XDG_PICTURES_DIR/omabeam`,
   or `~/Pictures/omabeam/`
-- Firewall rules (including ones added with `--open-firewall`) and any
+- Firewall rules (including ones added during install or with `--open-firewall`) and any
   `xdph.conf` portal-picker lines you added
 
 A detached live process keeps serving until you stop it or it loses its

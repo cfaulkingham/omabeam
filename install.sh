@@ -4,7 +4,8 @@
 #   2. float the picker (sized to the monitor) and bind SUPER+SHIFT+T
 #   3. copy and enable the Omarchy bar widget
 #
-# Safe to re-run. Firewall changes require --open-firewall CIDR.
+# Safe to re-run. Missing UFW allows for the detected LAN are added after a
+# sudo prompt. --open-firewall CIDR still selects a specific viewer subnet.
 # The portal picker is not changed.
 # --remove-desktop removes only the marked Hyprland blocks this script wrote.
 
@@ -46,10 +47,10 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --help|-h)
       echo "$USAGE"
-      echo "Default installs check TCP 9847 and UDP 9848 and warn if access cannot be verified."
-      echo "--check-ports checks without building or installing; sudo authentication is available in a terminal."
-      echo "--subnet CIDR checks access from a specific viewer subnet."
-      echo "--open-firewall CIDR adds persistent UFW rules for that subnet and verifies them."
+      echo "Default installs check TCP 9847 and UDP 9848 and add missing UFW rules for the detected LAN after a sudo prompt."
+      echo "--check-ports checks without building, installing, or changing rules; sudo authentication is available in a terminal."
+      echo "--subnet CIDR checks (and, during install, opens) access from a specific viewer subnet."
+      echo "--open-firewall CIDR adds persistent UFW rules for that subnet and fails if they cannot be verified."
       exit 0 ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
@@ -68,8 +69,8 @@ need() {
 }
 
 check_ports() {
-  local extra=()
-  if $CHECK_PORTS; then extra+=(--authenticate); fi
+  local extra=(--authenticate)
+  if ! $CHECK_PORTS && ! $OPEN_FIREWALL; then extra+=(--open-missing); fi
   # The conditional expansions also support empty arrays under Bash 3's nounset.
   if python3 "$ROOT/omarchy-plugin/firewall.py" ${FIREWALL_ARGS[@]+"${FIREWALL_ARGS[@]}"} ${extra[@]+"${extra[@]}"}; then
     return 0

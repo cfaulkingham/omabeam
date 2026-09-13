@@ -29,31 +29,33 @@ checkout's `./install.sh --backend-only` to rebuild the app.
 ## Firewall checks
 
 Full and `--backend-only` installs check the default sharing ports: TCP 9847
-for the viewer page and JPEG, and UDP 9848 for H.264/WebRTC. The default check
-reads UFW rules without requesting a password and warns if they block access
-or cannot be inspected. A warning does not fail an otherwise successful install.
+for the viewer page and JPEG, and UDP 9848 for H.264/WebRTC. If UFW is active
+and those ports are blocked for the detected LAN, the installer prompts for
+sudo and adds only the missing allows. It prepends them before conflicting
+user rules and verifies access afterward. A declined password or unverifiable
+firewall does not fail an otherwise successful install.
 
-Check again without building or changing desktop configuration:
+Check again without building, installing, or changing rules:
 
 ```bash
 ./install.sh --check-ports
-./install.sh --check-ports --subnet 192.168.1.0/24
+./install.sh --check-ports --subnet 192.168.2.0/24
 ```
 
 The check infers IPv4 subnets on default-route interfaces using `ip`, or uses
 the explicit `--subnet` CIDR. Check-only mode can request sudo authentication
-in a terminal. To allow the two ports from a specific viewer network:
+in a terminal but does not write rules. To allow the two ports from a
+specific viewer network, and fail if they cannot be verified:
 
 ```bash
-./install.sh --check-ports --open-firewall 192.168.1.0/24
+./install.sh --check-ports --open-firewall 192.168.2.0/24
 ```
 
 Replace the example with your viewer subnet. `--open-firewall CIDR` also works
-with a full or backend-only install. It adds only missing UFW allows, prepends
-them before conflicting user rules, and verifies access afterward. These rules
-persist across restart and plugin removal. The installer never enables a
-disabled firewall or changes its default policy. Invalid or unrestricted
-`/0` CIDRs are rejected before installation starts.
+with a full or backend-only install. These rules persist across restart and
+plugin removal. The installer never enables a disabled firewall or changes
+its default policy. Invalid or unrestricted `/0` CIDRs are rejected before
+installation starts.
 
 Explicit check/open requests exit nonzero when access is blocked or unverified.
 If an update partly succeeds, added rules remain and the warning explains that

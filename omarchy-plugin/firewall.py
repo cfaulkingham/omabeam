@@ -50,7 +50,7 @@ def admin(args, authenticate=False):
 
 
 def local_networks():
-    """Default-route interfaces only; never automatically open inferred networks."""
+    """Default-route IPv4 interfaces only. Other NICs are never treated as viewer subnets."""
     try:
         routes = run(['ip', '-j', '-4', 'route', 'show', 'default'])
         addresses = run(['ip', '-j', '-4', 'address', 'show', 'up'])
@@ -176,6 +176,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--subnet', type=subnet)
     parser.add_argument('--open-firewall', type=subnet, metavar='CIDR')
+    parser.add_argument('--open-missing', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--validate-only', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--authenticate', action='store_true', help='allow sudo authentication in an interactive terminal')
     args = parser.parse_args(argv)
@@ -183,6 +184,7 @@ def main(argv=None):
         parser.error('--subnet and --open-firewall must name the same network')
     if args.validate_only:
         return 0
+    opening = bool(args.open_firewall or args.open_missing)
     print('==> checking sharing ports: TCP 9847 (HTTP) and UDP 9848 (WebRTC)')
     print('  This checks UFW user rules. Custom firewall rules and network equipment can still block viewers.')
     selected = args.open_firewall or args.subnet
@@ -204,7 +206,7 @@ def main(argv=None):
         if (firewalld.stdout + firewalld.stderr).strip() != 'not running':
             print('WARNING: firewalld is active or could not be inspected. Review its rules for TCP 9847 and UDP 9848; no UFW rules changed.')
             return 1
-    result = admin([ufw, 'status', 'verbose'], args.authenticate or bool(args.open_firewall))
+    result = admin([ufw, 'status', 'verbose'], args.authenticate or opening)
     if result.returncode:
         print('WARNING: Could not inspect UFW. Run ./install.sh --check-ports in a terminal with sudo access.')
         return 1
@@ -219,7 +221,7 @@ def main(argv=None):
             return 1
         return 0
     missing = [item for item in results if item[3] != 'allowed']
-    if missing and args.open_firewall:
+    if missing and opening:
         for network, port, protocol, _ in missing:
             command = [ufw, 'prepend', 'allow', 'in', 'proto', protocol, 'from', str(network), 'to', 'any', 'port', str(port), 'comment', f'OmaBeam {protocol.upper()} {port}']
             print('  Opening: ' + shlex.join(command), flush=True)
