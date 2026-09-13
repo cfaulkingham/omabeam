@@ -454,15 +454,28 @@ fn cmdline_is_session(pid: u32) -> bool {
         .any(|arg| arg == b"--live" || arg == b"--demo")
 }
 
+fn without_deleted_suffix(path: &std::path::Path) -> &std::path::Path {
+    path.to_str()
+        .and_then(|text| text.strip_suffix(" (deleted)"))
+        .map(std::path::Path::new)
+        .unwrap_or(path)
+}
+
+fn omabeam_exe_name(path: &std::path::Path) -> bool {
+    without_deleted_suffix(path)
+        .file_name()
+        .is_some_and(|name| name == "omabeam")
+}
+
 #[cfg(target_os = "linux")]
 fn exe_is_omabeam(pid: u32) -> bool {
     let Ok(path) = fs::read_link(format!("/proc/{pid}/exe")) else {
         return false;
     };
-    let file_name = path.file_name().is_some_and(|name| name == "omabeam");
+    let named = omabeam_exe_name(&path);
     match std::env::current_exe() {
-        Ok(me) => path == me || file_name,
-        Err(_) => file_name,
+        Ok(me) => path == me || without_deleted_suffix(&path) == me.as_path() || named,
+        Err(_) => named,
     }
 }
 
@@ -639,6 +652,43 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
             assert!(read_status().is_err());
         });
+    }
+
+    #[test]
+    fn treats_a_replaced_omabeam_binary_as_the_same_process() {
+        assert!(omabeam_exe_name(std::path::Path::new(
+            "/opt/plugin/native/bin/omabeam"
+        )));
+        assert!(omabeam_exe_name(std::path::Path::new(
+            "/opt/plugin/native/bin/omabeam (deleted)"
+        )));
+        assert!(!omabeam_exe_name(std::path::Path::new("/usr/bin/sleep")));
+        assert!(!omabeam_exe_name(std::path::Path::new(
+            "/usr/bin/sleep (deleted)"
+        )));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn exe_is_omabeam_after_the_file_is_unlinked() {
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|path| path.is_file())
+            .expect("sleep");
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("omabeam");
+        fs::copy(sleep, &bin).unwrap();
+        let mut child = std::process::Command::new(&bin).arg("8").spawn().unwrap();
+        let pid = child.id();
+        fs::remove_file(&bin).unwrap();
+        assert!(
+            exe_is_omabeam(pid),
+            "{:?}",
+            fs::read_link(format!("/proc/{pid}/exe"))
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

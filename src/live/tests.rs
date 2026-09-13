@@ -301,10 +301,7 @@ fn options_validate_and_round_trip_through_daemon_arguments() {
     assert!(LiveConfig::default().webrtc);
     let (jpeg, _) = LiveConfig::parse_args(&args(&["--jpeg"])).unwrap();
     assert!(!jpeg.webrtc);
-    assert_eq!(
-        LiveConfig::parse_args(&jpeg.to_cli_args()).unwrap().0,
-        jpeg
-    );
+    assert_eq!(LiveConfig::parse_args(&jpeg.to_cli_args()).unwrap().0, jpeg);
     assert!(
         LiveConfig::parse_args(&args(&["--jpeg", "--webrtc"]))
             .unwrap()

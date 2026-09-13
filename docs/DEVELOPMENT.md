@@ -89,7 +89,10 @@ required (no `/tmp` fallback). Incomplete or oversized session files are
 rejected. Ended-session details remain until a new share or `--stop`.
 Hyprland queries use its command socket directly. `--stop` signals only a
 process whose pidfd still matches the recorded start time, uid, and `--live`
-or `--demo` command.
+or `--demo` command. Replacing the plugin binary while a share is running
+leaves `/proc/<pid>/exe` as `omabeam (deleted)`; that still matches. The bar
+gives `--stop` 20 seconds so the 10-second graceful wait and display recovery
+can finish after a shell or plugin reload.
 
 Extended desktop sessions create a random `OMABEAM-` output through socket1,
 pin existing monitors to their current coordinates, configure the extra output

@@ -163,6 +163,8 @@ Shell.Panel {
   Command {
     id: stopCommand
     objectName: "stopCommand"
+    // Native --stop can wait 10s for a graceful exit, then recover the extra display.
+    timeoutMs: 20000
     onCompleted: function(code, exitStatus, output) {
       if (code !== 0 || exitStatus !== 0) {
         root.stopPending = false
