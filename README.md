@@ -1,14 +1,25 @@
-![OmaBeam — Your screen. One simple link. Screen sharing for Omarchy and Hyprland.](docs/assets/omabeam-marketing.png)
+![OmaBeam — Your extra display. One simple link. Extend desktop and hardware-accelerated sharing for Omarchy and Hyprland.](docs/assets/omabeam-marketing.png)
 
 # OmaBeam
 
-**Share a window, screen, or area. Watch in any browser.**
+**Turn any browser into an extra display. Share a window, screen, or area
+over one local-network link.**
 
-OmaBeam is a screen-sharing plugin for Omarchy and Hyprland. Choose a source,
-preview what others will see, and share a browser link over your local network.
+OmaBeam is a screen-sharing plugin for Omarchy and Hyprland. Use a tablet,
+laptop, or another device as a real extra desktop, or share what is already
+on screen. Preview first, then open the copied link in any browser. Optional
+H.264 uses GPU encoding when a compatible NVIDIA, Intel, or AMD encoder is
+available.
 
 ## Features
 
+- **Extend desktop:** use another device's browser as a real extra Hyprland
+  display. Choose resolution, 100% or 200% scale, landscape or portrait, and
+  placement beside your existing screens. Move windows onto it with this
+  computer's mouse and keyboard.
+- **Hardware-accelerated H.264:** NVIDIA NVENC or VA-API on Linux, and
+  VideoToolbox in macOS demo builds. Auto selects a working GPU encoder after
+  a test frame, then falls back to OpenH264. JPEG remains the default transport.
 - **Window, Screen, or Area:** choose from a workspace map, select a monitor,
   or drag a region. Preview the selection before sharing.
 - **Browser viewer:** pause/resume, snapshots, fullscreen, fit controls, and
@@ -100,7 +111,62 @@ A detached live process keeps serving until you stop it or it loses its
 source. Stop sharing before `omarchy plugin remove` if you can still run
 `omabeam --stop`.
 
+## Extend your desktop
+
+Choose **Extend desktop** in the standalone picker to use another device's
+browser as an extra display. Choose its resolution, 100% or 200% desktop scale,
+landscape or portrait orientation, and placement beside your existing screens.
+The layout preview shows where the new display will appear. It is created only
+when you click **Extend desktop**.
+
+Open the copied link on your other device and use the viewer's fullscreen
+button. Move windows onto the extra display using your Omarchy computer's mouse
+or keyboard. The extra display starts empty; windows and notifications placed
+there become visible to viewers. Native pixels and the host cursor are selected
+when entering this mode. Choose **Video transport → H.264 / WebRTC** for
+hardware-accelerated video. JPEG and H.264 use the same firewall ports as other
+shares.
+
+An extended display accepts **one active browser client**. Additional devices
+or tabs see “This display is already connected to another device.” Refreshing
+the connected tab, or switching between JPEG and H.264, keeps its place.
+Pausing, closing, or losing the client reserves its place for 15 seconds before
+another device can connect. Regular screen sharing still supports multiple viewers.
+
+Select **Match this device** in the viewer to resize the virtual desktop to its
+available viewing area, including changes to fullscreen, window size, and
+orientation. OmaBeam selects 100% or 200% desktop scale for the client's pixel
+density, within the supported display limits (minimum 640×480, maximum
+3840×2160 or portrait). Matching encodes at the display's native pixels,
+temporarily overriding the host's pixel-detail and maximum-width settings.
+Select **Device size: On** again to restore the resolution, scale, and encoding
+settings chosen on the host. The preference survives a refresh of that tab.
+If a requested mode cannot be applied or captured, OmaBeam attempts to restore
+the previous mode and reports the failure in the viewer.
+
+Stop sharing from the bar, or run `omabeam --stop`, to remove the extra display.
+Closing or disconnecting the viewer leaves it available for reconnection.
+Hyprland returns its workspaces to remaining displays when the output is removed.
+OmaBeam leaves physical monitor settings and Hyprland configuration files alone.
+If the process is killed, `--stop` or the next share retries cleanup using the
+saved display record.
+
+The equivalent CLI command is:
+
+```bash
+omabeam --native-pixels --cursor --live extend 1920 1080 1 right
+```
+
+The four values are width, height, desktop scale (`1` or `2`), and placement
+(`right`, `left`, `above`, or `below`). This requires Hyprland with Lua monitor
+configuration and a working headless output backend. It is separate from the
+portal picker and screenshot mode. Input remains on the host computer; the
+browser is a display, with its usual viewing controls.
+
 ## Share your screen
+
+To share a window, monitor, or region instead of adding a display, follow
+the steps below. Hardware-accelerated H.264 is available for every live share.
 
 1. Open OmaBeam from the bar or **Super + Shift + T**.
 2. Choose **Window**, **Screen**, or **Area**, then check the preview.
@@ -184,57 +250,6 @@ this computer, or forward the port over SSH for remote viewing.
 The viewer reads the host's Omarchy palette when opened; reload it after a
 theme change. Capture slows to about one frame per second when nobody watches.
 
-## Extend your desktop
-
-Choose **Extend desktop** in the standalone picker to use another device's
-browser as an extra display. Choose its resolution, 100% or 200% desktop scale,
-landscape or portrait orientation, and placement beside your existing screens.
-The layout preview shows where the new display will appear. It is created only
-when you click **Extend desktop**.
-
-Open the copied link on your other device and use the viewer's fullscreen
-button. Move windows onto the extra display using your Omarchy computer's mouse
-or keyboard. The extra display starts empty; windows and notifications placed
-there become visible to viewers. Native pixels and the host cursor are selected
-when entering this mode. JPEG and H.264/WebRTC use the same transport controls
-and firewall ports as other shares.
-
-An extended display accepts **one active browser client**. Additional devices
-or tabs see “This display is already connected to another device.” Refreshing
-the connected tab, or switching between JPEG and H.264, keeps its place.
-Pausing, closing, or losing the client reserves its place for 15 seconds before
-another device can connect. Regular screen sharing still supports multiple viewers.
-
-Select **Match this device** in the viewer to resize the virtual desktop to its
-available viewing area, including changes to fullscreen, window size, and
-orientation. OmaBeam selects 100% or 200% desktop scale for the client's pixel
-density, within the supported display limits (minimum 640×480, maximum
-3840×2160 or portrait). Matching encodes at the display's native pixels,
-temporarily overriding the host's pixel-detail and maximum-width settings.
-Select **Device size: On** again to restore the resolution, scale, and encoding
-settings chosen on the host. The preference survives a refresh of that tab.
-If a requested mode cannot be applied or captured, OmaBeam attempts to restore
-the previous mode and reports the failure in the viewer.
-
-Stop sharing from the bar, or run `omabeam --stop`, to remove the extra display.
-Closing or disconnecting the viewer leaves it available for reconnection.
-Hyprland returns its workspaces to remaining displays when the output is removed.
-OmaBeam leaves physical monitor settings and Hyprland configuration files alone.
-If the process is killed, `--stop` or the next share retries cleanup using the
-saved display record.
-
-The equivalent CLI command is:
-
-```bash
-omabeam --native-pixels --cursor --live extend 1920 1080 1 right
-```
-
-The four values are width, height, desktop scale (`1` or `2`), and placement
-(`right`, `left`, `above`, or `below`). This requires Hyprland with Lua monitor
-configuration and a working headless output backend. It is separate from the
-portal picker and screenshot mode. Input remains on the host computer; the
-browser is a display, with its usual viewing controls.
-
 ## Screenshots and keys
 
 Select **Screenshot** for Copy, Save, and LocalSend actions. Saved captures
@@ -245,7 +260,7 @@ with an `omabeam/` subdirectory.
 | --- | --- |
 | Arrows or `h j k l` | Select a source or panel action |
 | `Tab` / `Shift+Tab` | Move between controls |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch Window, Screen, Area |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Switch Window, Screen, Area, Extend desktop |
 | `Enter` | Start sharing; copy in Screenshot mode; confirm in portal mode |
 | `c` / `s` / `f` | Copy / save / share a screenshot |
 | `v` | Start live sharing |
