@@ -26,12 +26,11 @@ impl StreamPreset {
         }
     }
     pub fn apply(self, config: &mut LiveConfig) {
-        (
-            config.fps,
-            config.quality,
-            config.max_width,
-            config.pixel_mode,
-        ) = self.values();
+        let (fps, quality, max_width, pixel_mode) = self.values();
+        config.set_fps(fps);
+        config.quality = quality;
+        config.max_width = max_width;
+        config.pixel_mode = pixel_mode;
     }
     pub fn matching(config: &LiveConfig) -> Option<Self> {
         Self::ALL.into_iter().find(|p| {
@@ -166,7 +165,7 @@ impl OmaBeam {
         let fps_values = [15, 30, 60];
         let fps = self.live_config.fps;
         let changed = cx.listener(move |this, index: &usize, _, cx| {
-            this.live_config.fps = fps_values[*index];
+            this.live_config.set_fps(fps_values[*index]);
             this.fps_selected = true;
             cx.notify();
         });
@@ -367,7 +366,14 @@ mod tests {
             assert_eq!(StreamPreset::matching(&config), Some(preset));
             assert_eq!(config.port, 4321);
             assert!(config.cursor && config.bind.is_loopback());
+            assert_eq!(
+                config.h264_bitrate,
+                LiveConfig::default_h264_bitrate(config.fps)
+            );
         }
+        config.h264_bitrate = 8_000_000;
+        StreamPreset::Motion.apply(&mut config);
+        assert_eq!(config.h264_bitrate, 8_000_000);
         config.fps = 24;
         assert_eq!(StreamPreset::matching(&config), None);
         assert_eq!(config.fps, 24);

@@ -140,7 +140,8 @@ Live options (also apply when opening the picker):
   --webrtc              H.264 over WebRTC (default) with automatic JPEG fallback
   --jpeg                JPEG/MJPEG instead of H.264
   --webrtc-port N       UDP port for WebRTC (default 9848; 0 selects a port)
-  --h264-bitrate N      Target bits/s for H.264 (default 4000000)
+  --h264-bitrate N      Target bits/s for H.264 (default 4000000 at 15 FPS,
+                         scaled with FPS up to 16000000)
   --encoder MODE        auto (default), hardware, or software
   --check-encoders      Test H.264 encoding and report the selected backend
   --cursor              Include cursor
@@ -889,7 +890,8 @@ impl OmaBeam {
 
     fn select_page(&mut self, page: Page) {
         if !self.fps_selected {
-            self.live_config.fps = if page == Page::Extend { 60 } else { 15 };
+            self.live_config
+                .set_fps(if page == Page::Extend { 60 } else { 15 });
         }
         if page == Page::Extend && self.page != Page::Extend {
             // A second screen should show the host pointer and retain its

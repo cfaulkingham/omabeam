@@ -70,6 +70,21 @@ impl Default for LiveConfig {
 }
 
 impl LiveConfig {
+    /// 4 Mbit/s at 15 FPS, scaled linearly with H.264 FPS, capped at 16 Mbit/s.
+    pub fn default_h264_bitrate(fps: u32) -> u32 {
+        let fps = fps.min(60).max(1);
+        (4_000_000u64 * u64::from(fps) / 15).min(16_000_000) as u32
+    }
+
+    /// Change FPS and keep an automatic bitrate in lockstep. An explicit
+    /// `--h264-bitrate` or Advanced menu value is left alone.
+    pub fn set_fps(&mut self, fps: u32) {
+        if self.h264_bitrate == Self::default_h264_bitrate(self.fps) {
+            self.h264_bitrate = Self::default_h264_bitrate(fps);
+        }
+        self.fps = fps;
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             (100_000..=50_000_000).contains(&self.h264_bitrate),
@@ -109,6 +124,7 @@ impl LiveConfig {
     pub fn parse_args(args: &[String]) -> Result<(Self, Vec<String>)> {
         let mut config = Self::default();
         let mut fps_explicit = false;
+        let mut bitrate_explicit = false;
         let mut rest = Vec::new();
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -132,7 +148,8 @@ impl LiveConfig {
                             config.webrtc_port = value.parse().context("invalid WebRTC UDP port")?
                         }
                         "--h264-bitrate" => {
-                            config.h264_bitrate = value.parse().context("invalid H.264 bitrate")?
+                            config.h264_bitrate = value.parse().context("invalid H.264 bitrate")?;
+                            bitrate_explicit = true;
                         }
                         "--fps" => {
                             config.fps = value.parse().context("invalid FPS")?;
@@ -190,6 +207,9 @@ impl LiveConfig {
             && rest.get(1).is_some_and(|s| s == "extend")
         {
             config.fps = 60;
+        }
+        if !bitrate_explicit {
+            config.h264_bitrate = Self::default_h264_bitrate(config.fps);
         }
         config.validate()?;
         Ok((config, rest))

@@ -26,6 +26,7 @@ fn create(config: &LiveConfig) -> Result<Encoder> {
             .bitrate(BitRate::from_bps(config.h264_bitrate))
             .max_frame_rate(FrameRate::from_hz(config.fps as f32))
             .rate_control_mode(RateControlMode::Bitrate)
+            .skip_frames(false)
             .usage_type(UsageType::ScreenContentRealTime)
             .profile(Profile::Baseline)
             .complexity(Complexity::Low)
@@ -388,6 +389,30 @@ mod tests {
                 }
             }
             previous_storage = Some((actual.dimensions(), actual.y().as_ptr()));
+        }
+    }
+
+    #[test]
+    fn software_encoder_emits_a_bitstream_for_every_changed_frame() {
+        let config = LiveConfig {
+            fps: 60,
+            h264_bitrate: 100_000,
+            webrtc: true,
+            encoder: EncoderMode::Software,
+            ..Default::default()
+        };
+        let mut encoder = create(&config).unwrap();
+        for index in 0..24 {
+            let raw = RawFrame {
+                frame: omabeam_capture::demo_frame(index * 11),
+                config: config.clone(),
+                captured_at: Instant::now(),
+            };
+            let yuv = yuv(&raw).unwrap();
+            let bitstream = encoder
+                .encode_at(&yuv, Timestamp::from_millis(index as u64 * 16))
+                .unwrap();
+            assert!(!bitstream.to_vec().is_empty(), "frame {index} was skipped");
         }
     }
 

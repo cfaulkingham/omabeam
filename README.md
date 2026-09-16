@@ -188,7 +188,7 @@ it. If the compositor cannot capture it separately, select an area explicitly.
 A lost source ends the share and clears the viewer image.
 
 Defaults: 15 FPS (60 FPS for extended desktop), H.264 / WebRTC with JPEG fallback, JPEG quality 55, native
-logical width, cursor off, and local network (TCP **9847** and UDP **9848** on
+logical width, cursor off, 4 Mbit/s at 15 FPS (16 Mbit/s at 60 FPS), and local network (TCP **9847** and UDP **9848** on
 0.0.0.0). Presets offer Balanced, Crisp text, and Smooth motion. Advanced exposes
 individual settings.
 
@@ -214,7 +214,10 @@ If hardware is unavailable or fails during a share, Auto continues with the
 built-in OpenH264 software encoder. Stream diagnostics show the selected
 encoder and any fallback reason. Advanced settings also offer **Hardware**
 (require GPU encoding) and **Software**.
-H.264 starts with a 4 Mbit/s target;
+H.264 targets 4 Mbit/s at 15 FPS and scales with frame rate up to 16 Mbit/s
+(16 Mbit/s at 60 FPS). An explicit Advanced bitrate or `--h264-bitrate` is kept
+as-is. NVIDIA NVENC uses VBR with a 2× burst cap so quality can recover after
+fast motion without adding encode delay.
 Advanced lets you adjust the target bitrate. The browser automatically falls back to JPEG
 if H.264 negotiation or playback fails, and stays on JPEG. Click **Video: Auto**
 to select JPEG manually, or **Video: JPEG** to try Auto again. Pause releases

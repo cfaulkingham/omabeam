@@ -218,7 +218,11 @@ worker sends frames through a capacity-one queue; on a dropped encoded frame
 it forces an IDR before delivering another delta. New peers and PLI/FIR
 request an IDR even on a static screen. Static content repeats once a second.
 Capture owns frame pacing (capped at 60 FPS for H.264). A new capture wakes the
-encoder immediately, without another frame-period wait. While the encoded queue
+encoder immediately, without another frame-period wait. The default H.264 bitrate
+is 4 Mbit/s at 15 FPS and scales linearly with FPS up to 16 Mbit/s, unless
+`--h264-bitrate` or Advanced set it. OpenH264 does not skip frames to meet that
+budget. NVENC uses VBR with `maxrate` at twice the target, still `tune=ull` and
+zerolatency, so a motion burst can spend bits without adding encode delay. While the encoded queue
 is occupied, capture keeps replacing the latest raw frame and the encoder waits;
 it resumes with the newest capture when the network worker consumes the queue.
 Only static repeats/keyframe retries have an encoder deadline. Notifications wake

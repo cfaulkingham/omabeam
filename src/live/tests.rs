@@ -300,6 +300,87 @@ fn extended_desktop_defaults_to_sixty_fps_but_explicit_rates_survive_daemon_hand
 }
 
 #[test]
+fn h264_bitrate_scales_with_fps_unless_set_explicitly() {
+    for (input, fps, bitrate) in [
+        (
+            vec!["--live", "extend", "1920", "1080", "1", "right"],
+            60,
+            16_000_000,
+        ),
+        (
+            vec!["--live", "--", "extend", "1920", "1080", "1", "right"],
+            60,
+            16_000_000,
+        ),
+        (
+            vec![
+                "--fps", "15", "--live", "extend", "1920", "1080", "1", "right",
+            ],
+            15,
+            4_000_000,
+        ),
+        (
+            vec!["--fps", "30", "--live", "output", "DP-1"],
+            30,
+            8_000_000,
+        ),
+        (
+            vec![
+                "--fps",
+                "60",
+                "--h264-bitrate",
+                "4000000",
+                "--live",
+                "extend",
+                "1920",
+                "1080",
+                "1",
+                "right",
+            ],
+            60,
+            4_000_000,
+        ),
+        (
+            vec![
+                "--live",
+                "extend",
+                "1920",
+                "1080",
+                "1",
+                "right",
+                "--h264-bitrate",
+                "8000000",
+            ],
+            60,
+            8_000_000,
+        ),
+        (vec!["--live", "output", "extend"], 15, 4_000_000),
+        (vec!["--demo"], 15, 4_000_000),
+        (
+            vec!["--fps", "120", "--jpeg", "--live", "output", "DP-1"],
+            120,
+            16_000_000,
+        ),
+    ] {
+        let (config, rest) = LiveConfig::parse_args(&args(&input)).unwrap();
+        assert_eq!(config.fps, fps, "{input:?}");
+        assert_eq!(config.h264_bitrate, bitrate, "{input:?}");
+        let mut daemon = config.to_cli_args();
+        daemon.extend(rest);
+        assert_eq!(LiveConfig::parse_args(&daemon).unwrap().0, config);
+    }
+    let mut config = LiveConfig::default();
+    assert_eq!(config.h264_bitrate, 4_000_000);
+    config.set_fps(60);
+    assert_eq!(config.h264_bitrate, 16_000_000);
+    config.set_fps(15);
+    assert_eq!(config.h264_bitrate, 4_000_000);
+    config.h264_bitrate = 8_000_000;
+    config.set_fps(60);
+    assert_eq!(config.h264_bitrate, 8_000_000);
+}
+
+#[test]
 fn options_validate_and_round_trip_through_daemon_arguments() {
     let (config, rest) = LiveConfig::parse_args(&args(&[
         "--fps",

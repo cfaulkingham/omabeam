@@ -26,6 +26,10 @@ impl Candidate {
     }
 }
 
+fn nvenc_maxrate(bitrate: u32) -> u32 {
+    bitrate.saturating_mul(2)
+}
+
 pub fn candidates() -> Vec<Candidate> {
     // Probe encoders and devices, rather than trusting a PCI vendor name or a
     // compiled-in codec list. Multiple render nodes include hybrid laptops.
@@ -97,7 +101,8 @@ impl Hardware {
             Candidate::Nvenc => {
                 options.set("preset", "p1");
                 options.set("tune", "ull");
-                options.set("rc", "cbr");
+                options.set("rc", "vbr");
+                options.set("maxrate", &nvenc_maxrate(config.bitrate).to_string());
                 options.set("rc-lookahead", "0");
                 options.set("zerolatency", "1");
                 options.set("delay", "0");
@@ -221,5 +226,17 @@ impl Hardware {
             "hardware returned a delayed frame"
         );
         Ok(packet.data().context("empty encoded packet")?.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nvenc_maxrate_is_twice_the_target() {
+        assert_eq!(nvenc_maxrate(4_000_000), 8_000_000);
+        assert_eq!(nvenc_maxrate(16_000_000), 32_000_000);
+        assert_eq!(nvenc_maxrate(u32::MAX / 2 + 1), u32::MAX);
     }
 }
