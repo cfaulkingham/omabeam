@@ -28,7 +28,7 @@ falls back to JPEG automatically.
   sessions enter fullscreen when the browser allows, or when you tap the
   picture. Viewers do not need an app.
 - **Omarchy bar controls:** see the source and viewers, copy or open the link,
-  send it to a nearby device, or stop sharing.
+  show a scannable QR code, send it to a nearby device, or stop sharing.
 - **Nearby sharing:** send the link to OmaSend or LocalSend devices. OmaBeam
   includes the sending protocol; the receiver needs a LocalSend-compatible app.
 - **Screenshots:** copy, save, or share an image through `omarchy share file`.
@@ -125,7 +125,10 @@ landscape or portrait orientation, and placement beside your existing screens.
 The layout preview shows where the new display will appear. It is created only
 when you click **Extend desktop**.
 
-Open the copied link on your other device. The viewer hides the local pointer
+Open the copied link — or the QR code in the bar panel — on your other device.
+A first visit offers fullscreen and, for extended desktops, **Match this
+device**; choose **Keep watching** to skip it. The choice is remembered per
+tab. The viewer hides the local pointer
 when idle so it does not cover the host cursor, and enters fullscreen when the
 browser allows or when you tap the picture. Move windows onto the extra display
 using your Omarchy computer's mouse or keyboard. The extra display starts empty;
@@ -282,11 +285,12 @@ with an `omabeam/` subdirectory.
 | `Enter` | Start sharing; copy in Screenshot mode; confirm in portal mode |
 | `c` / `s` / `f` | Copy / save / share a screenshot |
 | `v` | Start live sharing |
+| `q` | Toggle the share QR code (live panel) |
 | `?` | Toggle keyboard help |
 | `Esc` | Close or cancel |
 
 In the bar panel, `c` copies the link, `o` opens the viewer, `n` sends nearby,
-and `r` refreshes status.
+`q` shows the QR code, and `r` refreshes status.
 
 ## Use as a portal picker
 

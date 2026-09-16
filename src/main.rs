@@ -73,6 +73,11 @@ fn run() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+    if args.first().is_some_and(|arg| arg == "--share-qr") {
+        anyhow::ensure!(args.len() == 1, "unexpected command argument");
+        println!("{}", serde_json::to_string(&omabeam::qr::current_share()?)?);
+        return Ok(());
+    }
     if args.first().is_some_and(|arg| arg == "--send-link") {
         anyhow::ensure!(args.len() == 1, "unexpected command argument");
         let url = omabeam::localsend::resolve_link(None, omabeam::live::current_status().as_ref())?;

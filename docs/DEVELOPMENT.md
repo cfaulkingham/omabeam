@@ -44,6 +44,7 @@ HTTP/WebRTC server. `--demo-picker` uses synthetic sources with sharing disabled
 | `src/portal.rs` | Portal selection and stdout protocol |
 | `crates/omabeam-capture/` | Wayland capture, encoding, region selection |
 | `omarchy-plugin/` | Bar widget, panel, session model, native launcher |
+| `src/qr.rs` | Local share QR module grid for the bar panel |
 | `vendor/localsend/` | Reviewed protocol dependency and its own tests |
 | `scripts/package-plugin.py` | Linux release archive assembly |
 | `tests/` | Streaming, compositor, QML, and packaging checks |

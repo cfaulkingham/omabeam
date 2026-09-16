@@ -173,6 +173,14 @@ def model_tests():
       assert(linkHost("https://example.com/s/" + token + "/") === "")
       assert(linkHost("http://8.8.8.8:9847/s/" + token + "/") === "")
       assert(plain("<img src=x>", 80) === "img src=x")
+      const url = "http://192.168.1.24:9847/s/" + token + "/"
+      const rows = Array(21).fill("1".repeat(21))
+      assert(readQr(JSON.stringify({url, rows}), url).length === 21)
+      for (const bad of ["{bad", "x".repeat(8193), JSON.stringify({url, rows: []}),
+          JSON.stringify({url, rows: Array(22).fill("1".repeat(22))}),
+          JSON.stringify({url, rows: Array(21).fill("x".repeat(21))}),
+          JSON.stringify({url, rows: Array(85).fill("1".repeat(85))}),
+          JSON.stringify({url: url + "other", rows})]) assert(readQr(bad, url).length === 0)
       for (const url of ["file:///tmp/test", "javascript:alert(1)", "http://user:pass@host/",
           "http://host:99999/", "http://host:0/", "http://host/has a space",
           "http://192.168.1.24:9847/s/abc/"])
@@ -193,7 +201,7 @@ def controller_tests(app, imports):
     component = QQmlComponent(engine, QUrl.fromLocalFile(str(ROOT / "omarchy-plugin/Panel.qml")))
     panel = component.create()
     assert panel, "\n".join(e.toString() for e in component.errors())
-    commands = {name: panel.findChild(QObject, name + "Command") for name in ("status", "copy", "stop", "picker", "send")}
+    commands = {name: panel.findChild(QObject, name + "Command") for name in ("status", "copy", "stop", "picker", "send", "qr")}
     check(engine, panel, 'subject.omabeamBin.endsWith("/omarchy-plugin/omabeam") && subject.omabeamBin.indexOf("file:") < 0')
 
     def call(code):
@@ -237,6 +245,29 @@ def controller_tests(app, imports):
     call('subject.copyUrl();')
     finish("copy")
     expect('!subject.feedbackError && subject.feedback === "Share link copied."')
+
+    # QR generation is explicit and never places the capability URL in argv.
+    rows = ["1" * 21] * 21
+    call('subject.toggleQr(); subject.toggleQr();')
+    expect('!subject.qrVisible')
+    finish("qr", dict(url=LIVE["url"], rows=rows))
+    expect('subject.qrRows.length === 0')  # Closed requests cannot reveal a code.
+    call('subject.toggleQr();')
+    check(engine, commands["qr"], 'subject.command.length === 2 && subject.command[1] === "--share-qr" && subject.stdinData === ""')
+    finish("qr", dict(url=LIVE["url"], rows=rows))
+    expect('subject.qrVisible && subject.qrRows.length === 21 && subject.qrError === ""')
+    call('subject.close();')
+    expect('!subject.qrVisible && subject.qrRows.length === 0 && subject.qrUrl === ""')
+    call('subject.open(); subject.toggleQr();')
+    changed = dict(LIVE, url=LIVE["url"].replace("0123456789abcdef", "abcdef0123456789"))
+    finish("status", changed)
+    finish("qr", dict(url=LIVE["url"], rows=rows))
+    expect('!subject.qrVisible && subject.qrRows.length === 0')
+    call('subject.toggleQr();')
+    finish("qr", dict(url=LIVE["url"], rows=rows))
+    expect('subject.qrVisible && subject.qrRows.length === 0 && subject.qrError !== ""')
+    call('subject.close(); subject.refresh();')
+    finish("status", LIVE)
 
     # Malformed output must not erase a known live session or expose stale links.
     call('subject.refresh();')
@@ -319,6 +350,9 @@ def presentation_tests(app, screenshots):
     app.processEvents()
     QTest.keyClick(view, Qt.Key_Return)
     check(engine, root, 'subject.copies === 1')
+    QTest.keyClick(view, Qt.Key_Down)
+    QTest.keyClick(view, Qt.Key_Return)
+    check(engine, root, 'subject.qrRequests === 1')
     QTest.keyClick(view, Qt.Key_Down)
     QTest.keyClick(view, Qt.Key_Return)
     check(engine, root, 'subject.viewers === 1')

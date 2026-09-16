@@ -140,6 +140,19 @@ function read(raw, code, exitStatus) {
   return session
 }
 
+// Only accept a small monochrome grid for the exact session requested.
+function readQr(raw, expectedUrl) {
+  if (typeof raw !== "string" || raw.length > MAX_STATUS || !parseShareUrl(expectedUrl)) return []
+  var data
+  try { data = JSON.parse(raw) } catch (e) { return [] }
+  if (!data || data.url !== expectedUrl || !Array.isArray(data.rows)) return []
+  var size = data.rows.length
+  if (size < 21 || size > 81 || (size - 21) % 4 !== 0) return []
+  for (var i = 0; i < size; ++i)
+    if (typeof data.rows[i] !== "string" || data.rows[i].length !== size || !/^[01]+$/.test(data.rows[i])) return []
+  return data.rows
+}
+
 function elapsed(seconds) {
   if (seconds === null) return "—"
   var total = Math.floor(seconds)

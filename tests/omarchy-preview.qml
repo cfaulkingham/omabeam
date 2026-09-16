@@ -7,6 +7,7 @@ Rectangle {
   height: content.implicitHeight + 36
   color: content.background
   property alias content: content
+  property int qrRequests: 0
   property int copies: 0
   property int stops: 0
   property int viewers: 0
@@ -22,6 +23,7 @@ Rectangle {
     fontFamily: previewFontFamily
     focus: true
     onCopyRequested: root.copies += 1
+    onQrRequested: root.qrRequests += 1
     onStopRequested: root.stops += 1
     onViewerRequested: root.viewers += 1
     onSendRequested: root.sends += 1

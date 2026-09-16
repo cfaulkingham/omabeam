@@ -32,8 +32,10 @@ openh264 = "0.9.8"
 str0m = "0.23.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+qrcode = { version = "0.14", default-features = false }
 
 [dev-dependencies]
 bytes = "1"
 image = { version = "0.25", default-features = false }
+quircs = "0.10"
 tempfile = "3"

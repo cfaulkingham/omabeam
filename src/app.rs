@@ -115,6 +115,7 @@ Usage:
   omabeam --allow-token
                          Same as --picker, with restore-token enabled
   omabeam --status     Print live-share JSON if a share is running
+  omabeam --share-qr   Print the running share's QR module grid as JSON
   omabeam --stop       End the running live share
   omabeam --send-link    Send the running live-share URL to a nearby OmaSend
                          or LocalSend device. The URL is read from the

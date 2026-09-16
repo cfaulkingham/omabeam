@@ -183,6 +183,7 @@ impl LiveConfig {
                                 | "--picker"
                                 | "--allow-token"
                                 | "--status"
+                                | "--share-qr"
                                 | "--stop"
                                 | "--send-link"
                                 | "--hide"

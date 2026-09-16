@@ -20,6 +20,27 @@ Shell.Panel {
   property int statusEpoch: 0
   property int pollEpoch: 0
   property string copiedUrl: ""
+  property string qrUrl: ""
+  property var qrRows: []
+  property string qrError: ""
+  property bool qrVisible: false
+
+  function clearQr() {
+    qrVisible = false
+    qrRows = []
+    qrUrl = ""
+    qrError = ""
+    qrCommand.output = ""
+  }
+  function toggleQr() {
+    if (qrVisible) { clearQr(); return }
+    if (!content.canShare || qrCommand.pending || qrCommand.running || !Session.parseShareUrl(session.url)) return
+    qrVisible = true
+    qrUrl = session.url
+    qrRows = []
+    qrError = ""
+    qrCommand.start([omabeamBin, "--share-qr"])
+  }
 
   readonly property var barIdentity: hostWidget || root
   readonly property bool sessionOn: session.state === "live"
@@ -39,6 +60,7 @@ Shell.Panel {
     Qt.callLater(function() { if (root.opened) root.setCenterHoverRevealSuppressed(true) })
   }
   function close() {
+    clearQr()
     root.setCenterHoverRevealSuppressed(false)
     root.controller.hide()
   }
@@ -78,6 +100,7 @@ Shell.Panel {
     statusCommand.start([omabeamBin, "--status"])
   }
   function statusFailed(reason) {
+    clearQr()
     ready = true
     statusError = reason
     if (stopPending) {
@@ -95,6 +118,7 @@ Shell.Panel {
     try { next = Session.read(raw, code, exitStatus) }
     catch (error) { statusFailed(error.message); return }
     if (next.url !== session.url || next.state !== session.state) {
+      clearQr()
       feedback = ""
       feedbackTimer.stop()
     }
@@ -133,6 +157,7 @@ Shell.Panel {
     if (!sessionOn || stopPending) return
     // Ignore any status request started before the stop command.
     statusEpoch += 1
+    clearQr()
     stopPending = true
     feedback = ""
     stopCommand.start([omabeamBin, "--stop"])
@@ -176,6 +201,22 @@ Shell.Panel {
       root.stopPending = false
       root.showFeedback("Could not stop sharing. " + reason, true)
       root.refresh()
+    }
+  }
+  Command {
+    id: qrCommand
+    objectName: "qrCommand"
+    maxBytes: 8192
+    onCompleted: function(code, exitStatus, output) {
+      var rows = code === 0 && exitStatus === 0 ? Session.readQr(output, root.qrUrl) : []
+      qrCommand.output = ""
+      if (!root.qrVisible || !content.canShare || root.qrUrl !== root.session.url) return
+      root.qrRows = rows
+      root.qrError = rows.length ? "" : "Could not create the QR code. Copy the link instead."
+    }
+    onFailed: {
+      qrCommand.output = ""
+      if (root.qrVisible) root.qrError = "Could not create the QR code. Copy the link instead."
     }
   }
   Command {
@@ -247,6 +288,7 @@ Shell.Panel {
         if (text === "c") root.copyUrl()
         if (text === "o") root.openViewer()
         if (text === "n") root.sendNearby()
+        if (text === "q") root.toggleQr()
         if (text === "r") root.refresh()
       }
       ShareContent {
@@ -261,6 +303,11 @@ Shell.Panel {
         stopping: root.stopPending
         launching: pickerCommand.pending
         sendingLink: sendCommand.pending
+        qrVisible: root.qrVisible
+        qrRows: root.qrRows
+        qrError: root.qrError
+        qrBusy: qrCommand.pending || qrCommand.running
+        onQrRequested: root.toggleQr()
         foreground: Color.popups.text
         background: Color.popups.background
         accent: Color.accent

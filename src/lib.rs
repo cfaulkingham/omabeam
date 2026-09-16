@@ -7,6 +7,7 @@ pub mod layout;
 pub mod live;
 pub mod localsend;
 pub mod portal;
+pub mod qr;
 
 pub use capture::{CaptureAction, CaptureRequest};
 pub use hypr::{Client, Monitor, Snapshot, Workspace};

@@ -15,6 +15,11 @@ Item {
   property bool stopping: false
   property bool launching: false
   property bool sendingLink: false
+  property bool qrVisible: false
+  property bool qrBusy: false
+  property var qrRows: []
+  property string qrError: ""
+  signal qrRequested()
   property color foreground: "#d6deeb"
   property color background: "#161b24"
   property color accent: "#a5c9ad"
@@ -45,7 +50,7 @@ Item {
 
   function resetCursor() { selectedAction = "primary"; scroller.contentY = 0 }
   function actions() {
-    var all = [primary, viewer, send, stop]
+    var all = [primary, qr, viewer, send, stop]
     return all.filter(function(button) { return button.visible && button.enabled })
   }
   function moveCursor(dx, dy) {
@@ -259,7 +264,7 @@ Item {
           }
           Text {
             width: parent.width
-            text: root.session.url ? "Copy the link or send it to a nearby OmaSend or LocalSend device. They can watch in their browser."
+            text: root.session.url ? "Scan the QR code, copy the link, or send it nearby. Open it on a device on the same network—no viewer app needed."
               : "The share is running, but its link could not be read. You can still stop it below."
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -267,6 +272,53 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: root.captionSize
             lineHeight: 1.25
+          }
+        }
+
+        Column {
+          id: qrCard
+          objectName: "qrCard"
+          visible: root.qrVisible && root.canShare
+          width: parent.width
+          spacing: 10 * root.unit
+          onVisibleChanged: if (visible) Qt.callLater(function() {
+            scroller.contentY = Math.max(0, Math.min(qrCard.y, scroller.contentHeight - scroller.height))
+          })
+          Canvas {
+            id: qrCanvas
+            objectName: "qrCanvas"
+            visible: root.qrRows.length > 0
+            readonly property var rows: root.qrRows
+            // Integer modules and a four-module white quiet zone, independent of theme.
+            readonly property int moduleSize: Math.max(1, Math.floor(Math.min(parent.width, 240 * root.unit) / (rows.length + 8)))
+            width: (rows.length + 8) * moduleSize
+            height: width
+            anchors.horizontalCenter: parent.horizontalCenter
+            antialiasing: false
+            Accessible.role: Accessible.Graphic
+            Accessible.name: "Scan to open the share on another device"
+            onRowsChanged: requestPaint()
+            onModuleSizeChanged: requestPaint()
+            onPaint: {
+              var ctx = getContext("2d")
+              ctx.fillStyle = "#ffffff"
+              ctx.fillRect(0, 0, width, height)
+              ctx.fillStyle = "#000000"
+              for (var y = 0; y < rows.length; ++y)
+                for (var x = 0; x < rows.length; ++x)
+                  if (rows[y].charAt(x) === "1")
+                    ctx.fillRect((x + 4) * moduleSize, (y + 4) * moduleSize, moduleSize, moduleSize)
+            }
+          }
+          Text {
+            width: parent.width
+            text: root.qrError || (root.qrRows.length ? "Scan with your camera on the same network. Anyone with this code can view your share." : "Creating QR code…")
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            horizontalAlignment: Text.AlignHCenter
+            color: root.qrError ? root.urgent : root.muted
+            font.family: root.fontFamily
+            font.pixelSize: root.captionSize
           }
         }
 
@@ -342,6 +394,22 @@ Item {
         enabled: root.uncertain ? !root.stopping : root.live ? root.canShare && !root.copying : root.ready && !root.launching
         onHovered: root.selectedAction = objectName
         onClicked: root.uncertain ? root.refreshRequested() : root.live ? root.copyRequested() : root.pickerRequested()
+      }
+      ShareButton {
+        id: qr
+        objectName: "qr"
+        width: parent.width
+        visible: root.live
+        unit: root.unit
+        cornerRadius: root.cornerRadius
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        fontSize: root.captionSize
+        text: root.qrVisible ? "Hide QR code" : "Show QR code"
+        enabled: root.canShare && (root.qrVisible || !root.qrBusy)
+        hasCursor: root.selectedAction === objectName
+        onHovered: root.selectedAction = objectName
+        onClicked: root.qrRequested()
       }
       Row {
         width: parent.width
