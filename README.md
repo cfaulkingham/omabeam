@@ -130,7 +130,8 @@ when idle so it does not cover the host cursor, and enters fullscreen when the
 browser allows or when you tap the picture. Move windows onto the extra display
 using your Omarchy computer's mouse or keyboard. The extra display starts empty;
 windows and notifications placed there become visible to viewers. Native pixels
-and the host cursor are selected when entering this mode. H.264 / WebRTC is
+and the host cursor are selected when entering this mode. Extended desktop defaults
+to 60 FPS; an explicitly selected frame rate or quality preset takes precedence. H.264 / WebRTC is
 the default video transport; choose **Video transport → JPEG** if you want
 MJPEG instead. JPEG and H.264 use
 the same firewall ports as other shares.
@@ -186,7 +187,7 @@ Window capture follows the selected window even when another window overlaps
 it. If the compositor cannot capture it separately, select an area explicitly.
 A lost source ends the share and clears the viewer image.
 
-Defaults: 15 FPS, H.264 / WebRTC with JPEG fallback, JPEG quality 55, native
+Defaults: 15 FPS (60 FPS for extended desktop), H.264 / WebRTC with JPEG fallback, JPEG quality 55, native
 logical width, cursor off, and local network (TCP **9847** and UDP **9848** on
 0.0.0.0). Presets offer Balanced, Crisp text, and Smooth motion. Advanced exposes
 individual settings.
@@ -224,7 +225,11 @@ snapshots remain JPEG; PNG screenshots are unchanged. Odd image dimensions
 are padded by one pixel for H.264. Unsupported sizes fall back to JPEG without
 silently lowering the selected resolution. WebRTC diagnostics show the
 encoder, connected peers, bandwidth, and this browser's decoded codec/FPS.
-Decode and jitter-buffer times do not measure end-to-end latency.
+Diagnostics separate capture-ready wait, scaling/color conversion, H.264 encoding,
+and the encoded-frame queue. Browser decode and jitter-buffer times cover the
+latest sampling interval. These do not measure end-to-end latency. The viewer
+requests minimal buffering where supported; the browser can retain more buffering
+for network conditions.
 
 WebRTC needs UDP **9848** as well as the HTTP port. `--webrtc-port` changes
 the UDP port; `0` selects an available one. Media uses encrypted DTLS-SRTP;

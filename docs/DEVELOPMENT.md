@@ -217,6 +217,23 @@ encoding is deferred until a snapshot/fallback asks for it. One encoder
 worker sends frames through a capacity-one queue; on a dropped encoded frame
 it forces an IDR before delivering another delta. New peers and PLI/FIR
 request an IDR even on a static screen. Static content repeats once a second.
+Capture owns frame pacing (capped at 60 FPS for H.264). A new capture wakes the
+encoder immediately, without another frame-period wait. While the encoded queue
+is occupied, capture keeps replacing the latest raw frame and the encoder waits;
+it resumes with the newest capture when the network worker consumes the queue.
+Only static repeats/keyframe retries have an encoder deadline. Notifications wake
+frame waiters on capture, connection changes, keyframe requests, and queue consumption.
+The network worker polls UDP sockets and a private wake socket for signaling and
+encoded frames, bounded by str0m's next timer and a 100 ms shutdown/lease check.
+
+Single-output/window capture transfers ownership of the decoded image instead of
+cloning it. Shared-memory read storage, I420 conversion storage, odd-edge padding,
+and the hardware helper's CPU NV12 frame are reused. Opaque native even-sized RGBA
+frames convert directly to I420; scaled, transparent, and odd-sized frames retain
+their previous scaling/compositing behavior. FFmpeg makes reused frames writable
+before modifying them, preserving frames still held by the encoder. Hardware
+encoding still uses the bounded I420 pipe protocol and GPU upload; this is not a
+zero-copy GPU capture pipeline.
 Resolution changes reinitialize OpenH264. I420 requires even dimensions;
 odd right/bottom edges are extended by one pixel. The encoder supports up to
 3840×2160 (or portrait), at least 16 pixels per edge, and at most 60 FPS; errors disable WebRTC for that share and leave JPEG
@@ -242,8 +259,17 @@ The `webrtc` stats object reports the selected encoder, fallback reason, timings
 encoded FPS/frames/keyframes, dropped frames, connected/pending peers,
 failures, and UDP bytes/rates (including DTLS/RTCP and retransmissions).
 Existing `diagnostics` delivery counters remain JPEG-only. Browser
+`capture_to_encode_ms` measures capture return to encoder start for changed frames
+(static repeats are excluded). `convert_ms` covers scaling/color conversion,
+`codec_ms` covers encoding including the helper exchange, and `send_queue_ms`
+covers encoded-frame readiness to network-worker dequeue. `encode_ms` retains
+the combined conversion/encoding meaning. Each reports bounded p50/p95 samples.
 `RTCPeerConnection.getStats()` supplies actual decoded FPS/codec, receive
-bitrate, loss, jitter, and average decode/jitter-buffer time. These are not
+bitrate, loss, jitter, and decode/jitter-buffer time over the latest sampling
+interval, with no timing sample on first connection, counter reset, or idle.
+The viewer feature-detects `RTCRtpReceiver.jitterBufferTarget` and requests 0 ms;
+unsupported or rejected hints leave playback working. Browsers may clamp this
+target to their required minimum. These are not
 synchronized capture-to-display latency measurements. HTTP signaling remains
 unencrypted, so DTLS-SRTP does not authenticate the link against an active
 network attacker; use this on a trusted LAN.

@@ -51,6 +51,7 @@ impl OmaBeam {
         let preset = StreamPreset::matching(&self.live_config);
         let preset_changed = cx.listener(|this, index: &usize, _, cx| {
             StreamPreset::ALL[*index].apply(&mut this.live_config);
+            this.fps_selected = true;
             cx.notify();
         });
         let preset_menu = menu(
@@ -166,6 +167,7 @@ impl OmaBeam {
         let fps = self.live_config.fps;
         let changed = cx.listener(move |this, index: &usize, _, cx| {
             this.live_config.fps = fps_values[*index];
+            this.fps_selected = true;
             cx.notify();
         });
         let fps_menu = menu(

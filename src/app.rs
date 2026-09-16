@@ -75,6 +75,7 @@ pub struct Options {
     pub demo: bool,
     pub allow_token: bool,
     pub live_config: LiveConfig,
+    pub fps_explicit: bool,
 }
 
 impl Options {
@@ -97,6 +98,7 @@ impl Options {
             demo,
             picker,
             allow_token,
+            fps_explicit: live_config.fps != LiveConfig::default().fps,
             live_config,
         })
     }
@@ -131,7 +133,7 @@ Usage:
   omabeam --demo-picker Preview the native picker with synthetic sources; no sharing
 
 Live options (also apply when opening the picker):
-  --fps N               1–120 (default 15; about 1 when nobody is watching)
+  --fps N               1–120 (H.264 max 60; default 60 for extend, 15 otherwise)
   --quality N           JPEG quality 1–95 (default 55)
   --width N             Limit encoded width in the selected pixel mode
   --native-pixels       Preserve captured pixels (default logical resolution)
@@ -180,6 +182,7 @@ pub struct OmaBeam {
     selected_window: Option<String>,
     selected_output: Option<String>,
     live_config: LiveConfig,
+    fps_selected: bool,
     desktop_config: crate::hypr::desktop::DesktopConfig,
     follow_workspace: bool,
     status: SharedString,
@@ -393,6 +396,7 @@ impl OmaBeam {
             workspace_id,
             selected_window,
             selected_output,
+            fps_selected: options.fps_explicit,
             live_config: options.live_config,
             desktop_config: Default::default(),
             follow_workspace: true,
@@ -884,6 +888,9 @@ impl OmaBeam {
     }
 
     fn select_page(&mut self, page: Page) {
+        if !self.fps_selected {
+            self.live_config.fps = if page == Page::Extend { 60 } else { 15 };
+        }
         if page == Page::Extend && self.page != Page::Extend {
             // A second screen should show the host pointer and retain its
             // configured pixel resolution, including a 2× desktop scale.

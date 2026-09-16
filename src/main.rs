@@ -7,6 +7,10 @@ fn main() {
 
 fn run() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let fps_explicit = args
+        .iter()
+        .take_while(|arg| *arg != "--")
+        .any(|arg| arg == "--fps");
     let (mut config, args) = omabeam::live::LiveConfig::parse_args(&args)?;
     if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
         omabeam::app::print_help();
@@ -80,7 +84,8 @@ fn run() -> anyhow::Result<()> {
         let source = omabeam::live::LiveSource::from_cli_args(&live_args)?;
         return omabeam::live::run_headless(source, config);
     }
-    let options = omabeam::app::Options::from_args(&args, config)?;
+    let mut options = omabeam::app::Options::from_args(&args, config)?;
+    options.fps_explicit = fps_explicit;
     if !options.picker && !options.demo {
         if let Some(status) = omabeam::live::current_status() {
             if status.stats.state == "ended" {

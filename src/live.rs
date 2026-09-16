@@ -517,6 +517,7 @@ fn publish_frame(
         Arc::new(webrtc::RawFrame {
             frame,
             config: config.clone(),
+            captured_at: encode_started_at,
         })
     });
     frames.publish_raw(jpeg, width, height, measurement, raw);

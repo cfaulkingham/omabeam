@@ -8,7 +8,7 @@ use openh264::{
         BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
         Profile, RateControlMode, UsageType,
     },
-    formats::{RgbSliceU8, YUVBuffer},
+    formats::{RgbSliceU8, RgbaSliceU8, YUVBuffer},
 };
 
 pub(super) struct Encoded {
@@ -16,6 +16,7 @@ pub(super) struct Encoded {
     pub keyframe: bool,
     pub at: Instant,
     pub timestamp: u64,
+    pub ready_at: Instant,
 }
 
 fn create(config: &LiveConfig) -> Result<Encoder> {
@@ -119,12 +120,14 @@ pub fn probe(config: &LiveConfig) -> Result<serde_json::Value> {
     let raw = RawFrame {
         frame: omabeam_capture::demo_frame(0),
         config: config.clone(),
+        captured_at: Instant::now(),
     };
-    let yuv = yuv(&raw)?;
+    let mut converter = YuvConverter::default();
+    let yuv = converter.convert(&raw)?;
     let mut encoder = AdaptiveEncoder::new(&config)?;
     // Verify first frame, a delta, and a forced IDR at the negotiated profile.
     for (pts, force) in [(0, true), (100_000, false), (200_000, true)] {
-        let (bytes, _) = encoder.encode(&yuv, pts, force)?;
+        let (bytes, _) = encoder.encode(yuv, pts, force)?;
         let idr = omabeam_encoder::inspect_h264(&bytes)?;
         ensure!(
             !force || idr,
@@ -137,45 +140,74 @@ pub fn probe(config: &LiveConfig) -> Result<serde_json::Value> {
     )
 }
 
-/// Pad odd edges by one pixel for I420 without rescaling native text.
-fn yuv(raw: &RawFrame) -> Result<YUVBuffer> {
-    let (width, height) = raw
-        .frame
-        .stream_dimensions(raw.config.max_width, raw.config.pixel_mode)?;
-    let (w, h) = (
-        width.next_multiple_of(2) as usize,
-        height.next_multiple_of(2) as usize,
-    );
-    ensure!(
-        w >= 16 && h >= 16,
-        "H.264 needs at least 16 pixels on each edge; use JPEG for this size"
-    );
-    ensure!(
-        w.max(h) <= 3840 && w.min(h) <= 2160,
-        "H.264 supports up to 3840×2160 (or portrait); choose a maximum width or use JPEG"
-    );
-    let rgb = raw
-        .frame
-        .stream_rgb(raw.config.max_width, raw.config.pixel_mode)?;
-    if (w, h) == (width as usize, height as usize) {
-        return Ok(YUVBuffer::from_rgb8_source(RgbSliceU8::new(
-            rgb.as_raw(),
-            (w, h),
-        )));
-    }
-    let mut padded = vec![0; w * h * 3];
-    for y in 0..h {
-        for x in 0..w {
-            padded[(y * w + x) * 3..(y * w + x + 1) * 3].copy_from_slice(
-                &rgb.get_pixel((x as u32).min(width - 1), (y as u32).min(height - 1))
-                    .0,
-            );
+/// Retain conversion buffers across frames. Opaque native captures go directly
+/// from RGBA to I420, without allocating/compositing an intermediate RGB image.
+#[derive(Default)]
+struct YuvConverter {
+    buffer: Option<YUVBuffer>,
+    padded: Vec<u8>,
+}
+
+impl YuvConverter {
+    fn convert(&mut self, raw: &RawFrame) -> Result<&YUVBuffer> {
+        let (width, height) = raw
+            .frame
+            .stream_dimensions(raw.config.max_width, raw.config.pixel_mode)?;
+        let (w, h) = (
+            width.next_multiple_of(2) as usize,
+            height.next_multiple_of(2) as usize,
+        );
+        ensure!(
+            w >= 16 && h >= 16,
+            "H.264 needs at least 16 pixels on each edge; use JPEG for this size"
+        );
+        ensure!(
+            w.max(h) <= 3840 && w.min(h) <= 2160,
+            "H.264 supports up to 3840×2160 (or portrait); choose a maximum width or use JPEG"
+        );
+        if self
+            .buffer
+            .as_ref()
+            .is_none_or(|buffer| buffer.dimensions() != (w, h))
+        {
+            self.buffer = Some(YUVBuffer::new(w, h));
         }
+        let buffer = self.buffer.as_mut().unwrap();
+        let image = &raw.frame.image;
+        if image.dimensions() == (w as u32, h as u32)
+            && (width as usize, height as usize) == (w, h)
+            && image.as_raw().chunks_exact(4).all(|p| p[3] == 255)
+        {
+            buffer.read_rgba8(RgbaSliceU8::new(image.as_raw(), (w, h)));
+            return Ok(buffer);
+        }
+        let rgb = raw
+            .frame
+            .stream_rgb(raw.config.max_width, raw.config.pixel_mode)?;
+        if (w, h) == (width as usize, height as usize) {
+            buffer.read_rgb8(RgbSliceU8::new(rgb.as_raw(), (w, h)));
+            return Ok(buffer);
+        }
+        // Replicate odd edges; never shrink native text to an even resolution.
+        self.padded.resize(w * h * 3, 0);
+        for y in 0..h {
+            for x in 0..w {
+                self.padded[(y * w + x) * 3..(y * w + x + 1) * 3].copy_from_slice(
+                    &rgb.get_pixel((x as u32).min(width - 1), (y as u32).min(height - 1))
+                        .0,
+                );
+            }
+        }
+        buffer.read_rgb8(RgbSliceU8::new(&self.padded, (w, h)));
+        Ok(buffer)
     }
-    Ok(YUVBuffer::from_rgb8_source(RgbSliceU8::new(
-        &padded,
-        (w, h),
-    )))
+}
+
+#[cfg(test)]
+fn yuv(raw: &RawFrame) -> Result<YUVBuffer> {
+    let mut converter = YuvConverter::default();
+    converter.convert(raw)?;
+    Ok(converter.buffer.unwrap())
 }
 
 pub(super) fn run(
@@ -187,40 +219,59 @@ pub(super) fn run(
 ) -> Result<()> {
     config.fps = config.fps.min(60);
     let mut encoder = AdaptiveEncoder::new(&config)?;
+    let mut converter = YuvConverter::default();
     let origin = Instant::now();
     let mut last_generation = 0;
     let mut last_frame = origin;
     let mut force = true;
     while !stop.load(Ordering::SeqCst) && !service.failed.load(Ordering::SeqCst) {
         let (generation, raw) = {
-            let data = frames.inner.lock().unwrap();
-            if data.ended.is_some() {
-                break;
+            let mut data = frames.inner.lock().unwrap();
+            loop {
+                if data.ended.is_some()
+                    || stop.load(Ordering::SeqCst)
+                    || service.failed.load(Ordering::SeqCst)
+                {
+                    return Ok(());
+                }
+                if service.connected() == 0 {
+                    force = true;
+                }
+                force |= service.keyframe.swap(false, Ordering::SeqCst);
+                let changed = data.generation != last_generation;
+                // Capture supplies the only cadence for new frames. Only
+                // repeated frames (PLI/join/keepalive) need an encoder deadline.
+                let repeat_after = if force {
+                    config.interval(1)
+                } else {
+                    Duration::from_secs(1)
+                };
+                let ready = changed || last_frame.elapsed() >= repeat_after;
+                if service.connected() > 0
+                    && !service.queued.load(Ordering::SeqCst)
+                    && ready
+                    && let Some(raw) = data.raw.clone()
+                {
+                    break (data.generation, raw);
+                }
+                let wait = if service.connected() == 0
+                    || service.queued.load(Ordering::SeqCst)
+                    || data.raw.is_none()
+                {
+                    Duration::from_millis(100)
+                } else {
+                    repeat_after
+                        .saturating_sub(last_frame.elapsed())
+                        .min(Duration::from_millis(100))
+                };
+                data = frames.tick.wait_timeout(data, wait).unwrap().0;
             }
-            (data.generation, data.raw.clone())
-        };
-        if service.connected() == 0 {
-            force = true;
-            thread::sleep(Duration::from_millis(20));
-            continue;
-        }
-        force |= service.keyframe.swap(false, Ordering::SeqCst);
-        // A static screen must still produce a new IDR after a join or PLI.
-        // A one-second repeat also detects receiver stalls without screen damage.
-        if (generation == last_generation
-            && !force
-            && last_frame.elapsed() < Duration::from_secs(1))
-            || last_frame.elapsed() < config.interval(1)
-        {
-            thread::sleep(Duration::from_millis(5));
-            continue;
-        }
-        let Some(raw) = raw else {
-            continue;
         };
         let at = Instant::now();
-        let yuv = yuv(&raw)?;
-        let (bytes, keyframe) = encoder.encode(&yuv, origin.elapsed().as_micros() as i64, force)?;
+        let changed = generation != last_generation;
+        let yuv = converter.convert(&raw)?;
+        let converted_at = Instant::now();
+        let (bytes, keyframe) = encoder.encode(yuv, origin.elapsed().as_micros() as i64, force)?;
         last_frame = at;
         last_generation = generation;
         if bytes.is_empty() {
@@ -240,16 +291,29 @@ pub(super) fn run(
             metrics.stats.encoded_frames += 1;
             metrics.stats.keyframes += u64::from(keyframe);
             metrics.encoded.record(Instant::now(), 0, 1);
-            metrics.encode.record(Instant::now(), at.elapsed());
+            let now = Instant::now();
+            metrics.encode.record(now, at.elapsed());
+            if changed {
+                metrics
+                    .capture_to_encode
+                    .record(now, at.saturating_duration_since(raw.captured_at));
+            }
+            metrics.convert.record(now, converted_at.duration_since(at));
+            metrics.codec.record(now, now.duration_since(converted_at));
         }
         let frame = Encoded {
             bytes: bytes.into(),
             keyframe,
             at,
             timestamp: at.duration_since(origin).as_micros() as u64,
+            ready_at: Instant::now(),
         };
+        service.queued.store(true, Ordering::SeqCst);
         match tx.try_send(frame) {
-            Ok(()) => force = false,
+            Ok(()) => {
+                force = false;
+                service.wake_network();
+            }
             Err(mpsc::TrySendError::Full(_)) => {
                 // The dropped encoded frame might be a reference. Restart the
                 // sequence with an IDR before delivering anything else.
@@ -266,6 +330,66 @@ pub(super) fn run(
 mod tests {
     use super::*;
     use openh264::{decoder::Decoder, formats::YUVSource};
+
+    #[test]
+    fn reusable_conversion_preserves_alpha_scaling_and_odd_edges() {
+        let mut converter = YuvConverter::default();
+        let mut previous_storage = None;
+        for (w, h, alpha, scaled) in [
+            (32, 18, 255, false),
+            (32, 18, 255, false),
+            (32, 18, 127, false),
+            (31, 17, 255, false),
+            (32, 18, 255, true),
+        ] {
+            let frame = CapturedFrame {
+                image: image::RgbaImage::from_fn(w, h, |x, y| {
+                    image::Rgba([(x * 7) as u8, (y * 11) as u8, 90, alpha])
+                }),
+                logical_width: if scaled { 16 } else { w },
+                logical_height: if scaled { 16 } else { h },
+            };
+            let raw = RawFrame {
+                frame,
+                config: LiveConfig::default(),
+                captured_at: Instant::now(),
+            };
+            let rgb = raw.frame.stream_rgb(None, raw.config.pixel_mode).unwrap();
+            let (ew, eh) = (
+                rgb.width().next_multiple_of(2),
+                rgb.height().next_multiple_of(2),
+            );
+            let padded = image::RgbImage::from_fn(ew, eh, |x, y| {
+                *rgb.get_pixel(x.min(rgb.width() - 1), y.min(rgb.height() - 1))
+            });
+            let expected = YUVBuffer::from_rgb8_source(RgbSliceU8::new(
+                padded.as_raw(),
+                (ew as usize, eh as usize),
+            ));
+            let actual = converter.convert(&raw).unwrap();
+            assert_eq!(actual.dimensions(), expected.dimensions());
+            for (a, b) in [
+                (actual.y(), expected.y()),
+                (actual.u(), expected.u()),
+                (actual.v(), expected.v()),
+            ] {
+                assert!(
+                    a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1),
+                    "color conversion changed"
+                );
+            }
+            if let Some((dimensions, address)) = previous_storage {
+                if dimensions == actual.dimensions() {
+                    assert_eq!(
+                        address,
+                        actual.y().as_ptr(),
+                        "same-size conversion reallocated"
+                    );
+                }
+            }
+            previous_storage = Some((actual.dimensions(), actual.y().as_ptr()));
+        }
+    }
 
     #[test]
     fn h264_decodes_odd_edges_keyframe_recovery_and_resolution_changes() {
@@ -285,6 +409,7 @@ mod tests {
             let raw = RawFrame {
                 frame,
                 config: config.clone(),
+                captured_at: Instant::now(),
             };
             let yuv = yuv(&raw).unwrap();
             encoder.force_intra_frame();
@@ -314,6 +439,7 @@ mod tests {
         let raw = RawFrame {
             frame,
             config: LiveConfig::default(),
+            captured_at: Instant::now(),
         };
         assert!(yuv(&raw).err().unwrap().to_string().contains("3840"));
     }
@@ -322,6 +448,92 @@ mod tests {
 #[cfg(test)]
 mod static_tests {
     use super::*;
+
+    fn service(frames: &Arc<FrameState>, config: &LiveConfig) -> Arc<Service> {
+        let (commands, _commands_rx) = mpsc::sync_channel(1);
+        let (wake, _wake_rx) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        Arc::new(Service {
+            commands,
+            connected: AtomicUsize::new(1),
+            keyframe: AtomicBool::new(true),
+            failed: AtomicBool::new(false),
+            metrics: Mutex::new(Metrics {
+                stats: WebRtcStats::default(),
+                encode: Timings::default(),
+                capture_to_encode: Timings::default(),
+                convert: Timings::default(),
+                codec: Timings::default(),
+                send_queue: Timings::default(),
+                output: Rate::new(Instant::now()),
+                encoded: Rate::new(Instant::now()),
+            }),
+            fps: config.fps.min(60),
+            frames: Arc::downgrade(&frames),
+            queued: AtomicBool::new(false),
+            wake,
+        })
+    }
+
+    #[test]
+    fn new_frames_have_no_second_fps_wait_and_backpressure_keeps_the_latest_capture() {
+        let config = LiveConfig {
+            fps: 1,
+            encoder: EncoderMode::Software,
+            ..Default::default()
+        };
+        let frames = Arc::new(FrameState::new("pacing fixture".into()));
+        let service = service(&frames, &config);
+        let publish = |width| {
+            let frame = CapturedFrame {
+                image: image::RgbaImage::from_pixel(width, 32, image::Rgba([80, 140, 200, 255])),
+                logical_width: width,
+                logical_height: 32,
+            };
+            crate::live::publish_frame(&frames, frame, &config, Duration::ZERO).unwrap();
+        };
+        publish(32);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (worker_frames, worker_service, worker_stop, worker_config) = (
+            frames.clone(),
+            service.clone(),
+            stop.clone(),
+            config.clone(),
+        );
+        let worker = thread::spawn(move || {
+            run(
+                worker_config,
+                worker_frames,
+                worker_stop,
+                worker_service,
+                tx,
+            )
+        });
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        publish(48);
+        service.queued.store(false, Ordering::SeqCst);
+        frames.wake();
+        // The old independent 1 FPS deadline would hold this frame for ~1 s.
+        rx.recv_timeout(Duration::from_millis(400))
+            .expect("new capture waited for another FPS interval");
+        for width in [64, 80, 96] {
+            publish(width);
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(
+            service.stats().encoded_frames,
+            2,
+            "encoded while network queue was full"
+        );
+        service.queued.store(false, Ordering::SeqCst);
+        frames.wake();
+        rx.recv_timeout(Duration::from_millis(400)).unwrap();
+        assert_eq!(service.stats().width, 96, "did not take newest capture");
+        assert_eq!(service.stats().capture_to_encode_ms.samples, 3);
+        frames.fail("test complete".into());
+        worker.join().unwrap().unwrap();
+    }
 
     #[test]
     fn a_new_peer_gets_an_idr_without_any_new_capture_and_source_loss_stops_encoding() {
@@ -338,20 +550,7 @@ mod static_tests {
             Duration::ZERO,
         )
         .unwrap();
-        let (commands, _commands_rx) = mpsc::sync_channel(1);
-        let service = Arc::new(Service {
-            commands,
-            connected: AtomicUsize::new(1),
-            keyframe: AtomicBool::new(true),
-            failed: AtomicBool::new(false),
-            metrics: Mutex::new(Metrics {
-                stats: WebRtcStats::default(),
-                encode: Timings::default(),
-                output: Rate::new(Instant::now()),
-                encoded: Rate::new(Instant::now()),
-            }),
-            fps: config.fps.min(60),
-        });
+        let service = service(&frames, &config);
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(1);
         let (worker_frames, worker_service, worker_stop) =
@@ -359,7 +558,8 @@ mod static_tests {
         let worker =
             thread::spawn(move || run(config, worker_frames, worker_stop, worker_service, tx));
         assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().keyframe);
-        service.keyframe.store(true, Ordering::SeqCst);
+        service.queued.store(false, Ordering::SeqCst);
+        service.request_keyframe();
         assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().keyframe);
         assert_eq!(frames.stats().frames, 1);
         assert!(frames.inner.lock().unwrap().jpeg.is_empty());
@@ -383,6 +583,7 @@ mod hardware_tests {
         let pixels = yuv(&RawFrame {
             frame,
             config: config.clone(),
+            captured_at: Instant::now(),
         })
         .unwrap();
         let mut software = create(&config).unwrap();

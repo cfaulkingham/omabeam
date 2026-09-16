@@ -70,6 +70,7 @@ pub struct Hardware {
     pub label: String,
     encoder: codec::encoder::video::Encoder,
     frames: Option<BufferRef>,
+    cpu: frame::Video,
     config: Config,
 }
 impl Hardware {
@@ -146,10 +147,18 @@ impl Hardware {
         let encoder = encoder
             .open_as_with(codec, options)
             .context("cannot open hardware encoder")?;
+        let mut cpu = frame::Video::empty();
+        cpu.set_format(Pixel::NV12);
+        cpu.set_width(config.width);
+        cpu.set_height(config.height);
+        unsafe {
+            checked(ffi::av_frame_get_buffer(cpu.as_mut_ptr(), 32))?;
+        }
         Ok(Self {
             label: candidate.label(),
             encoder,
             frames,
+            cpu,
             config: config.clone(),
         })
     }
@@ -160,12 +169,11 @@ impl Hardware {
             "wrong raw frame size"
         );
         let (w, h) = (self.config.width as usize, self.config.height as usize);
-        let mut cpu = frame::Video::empty();
-        cpu.set_format(Pixel::NV12);
-        cpu.set_width(w as u32);
-        cpu.set_height(h as u32);
+        let cpu = &mut self.cpu;
         unsafe {
-            checked(ffi::av_frame_get_buffer(cpu.as_mut_ptr(), 32))?;
+            // Reuse storage when the codec released it; copy on write if a
+            // driver still retains a reference to the previous frame.
+            checked(ffi::av_frame_make_writable(cpu.as_mut_ptr()))?;
         }
         let y_stride = cpu.stride(0);
         for y in 0..h {
@@ -181,8 +189,8 @@ impl Hardware {
                 row[x * 2 + 1] = i420[w * h + chroma + y * w / 2 + x];
             }
         }
-        let mut frame = if let Some(pool) = &self.frames {
-            let mut gpu = frame::Video::empty();
+        let mut gpu = frame::Video::empty();
+        let frame = if let Some(pool) = &self.frames {
             unsafe {
                 checked(ffi::av_hwframe_get_buffer(pool.0, gpu.as_mut_ptr(), 0))?;
                 checked(ffi::av_hwframe_transfer_data(
@@ -191,7 +199,7 @@ impl Hardware {
                     0,
                 ))?;
             }
-            gpu
+            &mut gpu
         } else {
             cpu
         };

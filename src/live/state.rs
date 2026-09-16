@@ -55,6 +55,13 @@ pub(super) struct FrameState {
 }
 
 impl FrameState {
+    /// Synchronize external predicate changes with waiters so a notification
+    /// cannot land between checking a predicate and entering the wait.
+    pub fn wake(&self) {
+        let _data = self.inner.lock().unwrap();
+        self.tick.notify_all();
+    }
+
     pub fn new(source: String) -> Self {
         Self {
             inner: Mutex::new(FrameData {

@@ -94,13 +94,21 @@ impl LiveConfig {
         if viewers == 0 {
             Duration::from_secs(1)
         } else {
-            Duration::from_secs_f64(1.0 / f64::from(self.fps))
+            // Capture owns pacing. H.264 supports at most 60 FPS; do not
+            // capture faster and then impose another deadline in the encoder.
+            let fps = if self.webrtc {
+                self.fps.min(60)
+            } else {
+                self.fps
+            };
+            Duration::from_secs_f64(1.0 / f64::from(fps))
         }
     }
 
     /// Strip streaming options from the command. `--` preserves literal targets.
     pub fn parse_args(args: &[String]) -> Result<(Self, Vec<String>)> {
         let mut config = Self::default();
+        let mut fps_explicit = false;
         let mut rest = Vec::new();
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -126,7 +134,10 @@ impl LiveConfig {
                         "--h264-bitrate" => {
                             config.h264_bitrate = value.parse().context("invalid H.264 bitrate")?
                         }
-                        "--fps" => config.fps = value.parse().context("invalid FPS")?,
+                        "--fps" => {
+                            config.fps = value.parse().context("invalid FPS")?;
+                            fps_explicit = true;
+                        }
                         "--quality" => {
                             config.quality = value.parse().context("invalid JPEG quality")?
                         }
@@ -173,6 +184,12 @@ impl LiveConfig {
                 }
                 _ => rest.push(arg.clone()),
             }
+        }
+        if !fps_explicit
+            && rest.first().is_some_and(|s| s == "--live")
+            && rest.get(1).is_some_and(|s| s == "extend")
+        {
+            config.fps = 60;
         }
         config.validate()?;
         Ok((config, rest))

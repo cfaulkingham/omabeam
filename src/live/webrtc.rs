@@ -68,6 +68,7 @@ fn h264_profile_level_id(width: u32, height: u32, fps: u32, bitrate: u32) -> u32
 pub(super) struct RawFrame {
     pub frame: CapturedFrame,
     pub config: LiveConfig,
+    pub captured_at: Instant,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -84,6 +85,14 @@ pub struct WebRtcStats {
     pub encoded_frames: u64,
     pub encoded_fps: f64,
     pub encode_ms: TimingStats,
+    #[serde(default)]
+    pub capture_to_encode_ms: TimingStats,
+    #[serde(default)]
+    pub convert_ms: TimingStats,
+    #[serde(default)]
+    pub codec_ms: TimingStats,
+    #[serde(default)]
+    pub send_queue_ms: TimingStats,
     pub bytes_sent: u64,
     pub outgoing_mbps: f64,
     pub keyframes: u64,
@@ -96,6 +105,10 @@ pub struct WebRtcStats {
 struct Metrics {
     stats: WebRtcStats,
     encode: Timings,
+    capture_to_encode: Timings,
+    convert: Timings,
+    codec: Timings,
+    send_queue: Timings,
     output: Rate,
     encoded: Rate,
 }
@@ -107,6 +120,9 @@ pub(super) struct Service {
     metrics: Mutex<Metrics>,
     failed: AtomicBool,
     fps: u32,
+    frames: std::sync::Weak<FrameState>,
+    queued: AtomicBool,
+    wake: std::os::unix::net::UnixDatagram,
 }
 enum Command {
     Offer(
@@ -118,6 +134,20 @@ enum Command {
     Close(String),
 }
 impl Service {
+    fn wake_network(&self) {
+        // A full socket already contains a wakeup. This must never block
+        // capture, encoding or HTTP signaling behind the network worker.
+        let _ = self.wake.send(&[1]);
+    }
+    fn wake_encoder(&self) {
+        if let Some(frames) = self.frames.upgrade() {
+            frames.wake();
+        }
+    }
+    fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::SeqCst);
+        self.wake_encoder();
+    }
     pub fn connected(&self) -> usize {
         self.connected.load(Ordering::SeqCst)
     }
@@ -126,6 +156,10 @@ impl Service {
         let mut stats = metrics.stats.clone();
         stats.connected = self.connected();
         stats.encode_ms = metrics.encode.stats(Instant::now());
+        stats.capture_to_encode_ms = metrics.capture_to_encode.stats(Instant::now());
+        stats.convert_ms = metrics.convert.stats(Instant::now());
+        stats.codec_ms = metrics.codec.stats(Instant::now());
+        stats.send_queue_ms = metrics.send_queue.stats(Instant::now());
         stats.outgoing_mbps = metrics.output.values(Instant::now()).0;
         stats.encoded_fps = metrics.encoded.values(Instant::now()).1;
         stats
@@ -159,6 +193,7 @@ impl Service {
         self.commands
             .try_send(Command::Offer(offer, connection, Instant::now(), tx))
             .map_err(|_| anyhow::anyhow!("WebRTC busy"))?;
+        self.wake_network();
         rx.recv_timeout(Duration::from_secs(3))
             .context("WebRTC signaling timed out")?
     }
@@ -169,7 +204,9 @@ impl Service {
         );
         self.commands
             .try_send(Command::Close(id))
-            .map_err(|_| anyhow::anyhow!("WebRTC busy"))
+            .map_err(|_| anyhow::anyhow!("WebRTC busy"))?;
+        self.wake_network();
+        Ok(())
     }
 }
 
@@ -181,6 +218,9 @@ pub(super) fn start(
     let sockets = bind_sockets(config)?;
     let port = sockets[0].local_addr()?.port();
     let (tx, rx) = mpsc::sync_channel(16);
+    let (wake, wake_rx) = std::os::unix::net::UnixDatagram::pair()?;
+    wake.set_nonblocking(true)?;
+    wake_rx.set_nonblocking(true)?;
     let service = Arc::new(Service {
         commands: tx,
         connected: AtomicUsize::new(0),
@@ -194,10 +234,17 @@ pub(super) fn start(
                 ..Default::default()
             },
             encode: Timings::default(),
+            capture_to_encode: Timings::default(),
+            convert: Timings::default(),
+            codec: Timings::default(),
+            send_queue: Timings::default(),
             output: Rate::new(Instant::now()),
             encoded: Rate::new(Instant::now()),
         }),
         fps: config.fps.min(60),
+        frames: Arc::downgrade(frames),
+        queued: AtomicBool::new(false),
+        wake,
     });
     *frames.rtc.lock().unwrap() = Some(service.clone());
     let (frames, stop, config) = (frames.clone(), stop.clone(), config.clone());
@@ -221,13 +268,15 @@ pub(super) fn start(
                         encoder_service.metrics.lock().unwrap().stats.error =
                             Some(format!("H.264 unavailable: {error:#}"));
                         encoder_service.failed.store(true, Ordering::SeqCst);
+                        encoder_service.wake_network();
                     }
                 });
             if encoder.is_err() {
                 service.failed.store(true, Ordering::SeqCst);
             }
-            run(sockets, &frames, &stop, &service, rx, encoded_rx);
+            run(sockets, &frames, &stop, &service, rx, encoded_rx, wake_rx);
             service.failed.store(true, Ordering::SeqCst);
+            frames.wake();
             if let Ok(encoder) = encoder {
                 let _ = encoder.join();
             }
@@ -390,7 +439,7 @@ impl Peer {
                         self.connected = true;
                         self.needs_keyframe = true;
                         if let Some(service) = service {
-                            service.keyframe.store(true, Ordering::SeqCst);
+                            service.request_keyframe();
                         }
                     }
                     Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
@@ -398,7 +447,7 @@ impl Peer {
                     }
                     Event::KeyframeRequest(_) => {
                         if let Some(service) = service {
-                            service.keyframe.store(true, Ordering::SeqCst);
+                            service.request_keyframe();
                         }
                     }
                     _ => {}
@@ -450,6 +499,7 @@ fn run(
     service: &Service,
     commands: Receiver<Command>,
     encoded: Receiver<encoder::Encoded>,
+    wake: std::os::unix::net::UnixDatagram,
 ) {
     let mut peers: Vec<Peer> = Vec::new();
     let mut buf = [0u8; 2048];
@@ -457,6 +507,9 @@ fn run(
         && !service.failed.load(Ordering::SeqCst)
         && frames.inner.lock().unwrap().ended.is_none()
     {
+        // Consume wakeups before work. A producer racing with this iteration
+        // leaves the fd readable, so poll cannot lose its notification.
+        while wake.recv(&mut [0; 64]).is_ok() {}
         for command in commands.try_iter().take(16) {
             match command {
                 Command::Close(id) => peers.retain(|peer| peer.id != id),
@@ -542,6 +595,14 @@ fn run(
             }
         }
         if let Ok(frame) = encoded.try_recv() {
+            service.queued.store(false, Ordering::SeqCst);
+            frames.wake();
+            service
+                .metrics
+                .lock()
+                .unwrap()
+                .send_queue
+                .record(Instant::now(), frame.ready_at.elapsed());
             for peer in peers.iter_mut().filter(|peer| !peer.dead) {
                 if let Err(error) = peer.send(&frame, &sockets, service) {
                     peer.fail(format!("WebRTC frame send failed: {error:#}"));
@@ -557,7 +618,7 @@ fn run(
         peers.retain(|peer| !peer.dead);
         let count = peers.iter().filter(|peer| peer.connected).count();
         if service.connected.swap(count, Ordering::SeqCst) != count {
-            frames.tick.notify_all();
+            frames.wake();
         }
         {
             let mut metrics = service.metrics.lock().unwrap();
@@ -567,11 +628,36 @@ fn run(
                 metrics.stats.peer_error = Some(error);
             }
         }
-        thread::sleep(Duration::from_millis(if peers.is_empty() { 20 } else { 5 }));
+        // Wake on UDP input, a new encoded frame, a signaling command, or the
+        // next protocol timer. Cap idle waits to keep shutdown/lease checks prompt.
+        let now = Instant::now();
+        let deadline = peers
+            .iter()
+            .map(|peer| peer.deadline)
+            .min()
+            .unwrap_or(now + Duration::from_millis(100));
+        let timeout = Timespec::try_from(
+            deadline
+                .saturating_duration_since(now)
+                .min(Duration::from_millis(100)),
+        )
+        .unwrap();
+        let mut fds: Vec<_> = sockets
+            .iter()
+            .map(|socket| PollFd::new(socket, PollFlags::IN))
+            .collect();
+        fds.push(PollFd::new(&wake, PollFlags::IN));
+        if let Err(error) = poll(&mut fds, Some(&timeout)) {
+            if error != rustix::io::Errno::INTR {
+                service.metrics.lock().unwrap().stats.error =
+                    Some(format!("WebRTC poll failed: {error}"));
+                break;
+            }
+        }
     }
     service.connected.store(0, Ordering::SeqCst);
     service.metrics.lock().unwrap().stats.peers = 0;
-    frames.tick.notify_all();
+    frames.wake();
 }
 
 #[cfg(test)]

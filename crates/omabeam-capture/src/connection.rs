@@ -465,6 +465,7 @@ pub(crate) struct Buffer {
     pub proxy: wl_buffer::WlBuffer,
     pub spec: BufferSpec,
     file: File,
+    pixels: Vec<u8>,
     pub busy: bool,
 }
 impl Buffer {
@@ -491,13 +492,13 @@ impl Buffer {
             proxy,
             spec,
             file,
+            pixels: vec![0; size],
             busy: false,
         })
     }
-    pub fn read(&self) -> Result<Vec<u8>> {
-        let mut bytes = vec![0; self.spec.byte_len()?];
-        self.file.read_exact_at(&mut bytes, 0)?;
-        Ok(bytes)
+    pub fn read(&mut self) -> Result<&[u8]> {
+        self.file.read_exact_at(&mut self.pixels, 0)?;
+        Ok(&self.pixels)
     }
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
         if bytes.len() != self.spec.byte_len()? {

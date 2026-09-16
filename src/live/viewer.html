@@ -142,13 +142,17 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
         <div id="rtc-note-row" hidden><dt>Encoder fallback</dt><dd id="rtc-note">—</dd></div>
         <div><dt>H.264 encoded size / fps</dt><dd id="rtc-size">—</dd></div>
         <div><dt>Scale + H.264 · p50 / p95</dt><dd id="rtc-encode">—</dd></div>
+        <div><dt>Capture ready → encoder · p50 / p95</dt><dd id="rtc-wait">—</dd></div>
+        <div><dt>Scale / color conversion · p50 / p95</dt><dd id="rtc-convert">—</dd></div>
+        <div><dt>H.264 encoding · p50 / p95</dt><dd id="rtc-codec-time">—</dd></div>
+        <div><dt>Encoded frame queue · p50 / p95</dt><dd id="rtc-queue">—</dd></div>
         <div><dt>WebRTC peers / outgoing</dt><dd id="rtc-outgoing">—</dd></div>
         <div><dt>This browser · codec / fps</dt><dd id="rtc-codec">—</dd></div>
         <div><dt>This browser · received</dt><dd id="rtc-received">—</dd></div>
         <div><dt>Packets lost / jitter</dt><dd id="rtc-loss">—</dd></div>
-        <div><dt>Average decode / jitter buffer</dt><dd id="rtc-decode">—</dd></div>
+        <div><dt>Recent decode / jitter buffer</dt><dd id="rtc-decode">—</dd></div>
       </dl>
-      <p id="rtc-note" class="diagnostic-note" hidden>WebRTC media uses encrypted UDP. Signaling and JPEG fallback use HTTP. Browser decode and jitter-buffer times are averages since connection and do not measure end-to-end latency. H.264 uses 4:2:0 color; JPEG may preserve small colored text better. Odd image edges are padded by one pixel.</p>
+      <p id="rtc-help" class="diagnostic-note" hidden>WebRTC media uses encrypted UDP. Signaling and JPEG fallback use HTTP. Browser decode and jitter-buffer times cover the latest sampling interval. Capture-ready timing starts after capture returns and excludes static-frame repeats. These measurements do not measure end-to-end latency. The viewer requests minimal buffering where supported; the browser may retain a larger buffer. H.264 uses 4:2:0 color; JPEG may preserve small colored text better. Odd image edges are padded by one pixel.</p>
       <div class="client-table">
         <table id="clients">
           <caption>Active JPEG connections</caption>
@@ -367,6 +371,12 @@ async function connect() {
 function reconnect() {
   if (!paused && !ended && !desktopBlocked && retry === null) retry = setTimeout(() => { retry = null; connect(); }, 1500);
 }
+function preferLowLatency(receiver) {
+  if (!receiver || !('jitterBufferTarget' in receiver)) return;
+  // A target, not a promise of zero buffering. Browsers retain their own
+  // minimum for packet recovery; unsupported setters must not cause fallback.
+  try { receiver.jitterBufferTarget = 0; } catch { /* Optional browser hint. */ }
+}
 async function connectRtc() {
   stopPlayback();
   if (!window.RTCPeerConnection) { connectJpeg('WebRTC unavailable in this browser'); return; }
@@ -381,6 +391,7 @@ async function connectRtc() {
     const connection = new RTCPeerConnection({iceServers: [], bundlePolicy: 'max-bundle'});
     pc = connection;
     const transceiver = connection.addTransceiver('video', {direction: 'recvonly'});
+    preferLowLatency(transceiver.receiver);
     const codecs = window.RTCRtpReceiver?.getCapabilities?.('video')?.codecs.filter(c => c.mimeType.toLowerCase() === 'video/h264');
     if (codecs && codecs.length === 0) throw new Error('This browser has no H.264 decoder');
     if (codecs?.length && transceiver.setCodecPreferences) transceiver.setCodecPreferences(codecs);
@@ -429,19 +440,26 @@ async function sampleBrowser() {
       if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) connectJpeg('H.264 playback stalled');
       return;
     }
-    const before = previousInbound;
+    const before = previousInbound?.id === inbound.id ? previousInbound : null;
     const seconds = before ? (inbound.timestamp - before.timestamp) / 1000 : 0;
     const frames = inbound.framesDecoded || 0;
     if (frames > (before?.framesDecoded || 0)) lastDecodedAt = performance.now();
+    const recentAverage = (total, count) => {
+      if (!before || !Number.isFinite(inbound[total]) || !Number.isFinite(before[total])) return null;
+      const samples = inbound[count] - before[count], elapsed = inbound[total] - before[total];
+      return samples > 0 && elapsed >= 0 ? elapsed * 1000 / samples : null;
+    };
     browserStats = {
       codec: report.get(inbound.codecId)?.mimeType || 'H.264',
       fps: seconds > 0 ? (frames - before.framesDecoded) / seconds : null,
       mbps: seconds > 0 ? (inbound.bytesReceived - before.bytesReceived) * 8 / seconds / 1e6 : null,
       frames, lost: inbound.packetsLost, jitter: inbound.jitter * 1000,
-      decode: frames > 0 ? inbound.totalDecodeTime * 1000 / frames : null,
-      buffer: inbound.jitterBufferEmittedCount > 0 ? inbound.jitterBufferDelay * 1000 / inbound.jitterBufferEmittedCount : null,
+      decode: recentAverage('totalDecodeTime', 'framesDecoded'),
+      buffer: recentAverage('jitterBufferDelay', 'jitterBufferEmittedCount'),
     };
-    previousInbound = {timestamp: inbound.timestamp, framesDecoded: frames, bytesReceived: inbound.bytesReceived};
+    previousInbound = {id: inbound.id, timestamp: inbound.timestamp, framesDecoded: frames,
+      bytesReceived: inbound.bytesReceived, totalDecodeTime: inbound.totalDecodeTime,
+      jitterBufferDelay: inbound.jitterBufferDelay, jitterBufferEmittedCount: inbound.jitterBufferEmittedCount};
     if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) connectJpeg('H.264 playback stalled');
   } catch { /* A pause can close the peer while getStats is pending. */ }
 }
@@ -503,7 +521,7 @@ function renderDiagnostics(stats) {
   const d = stats.diagnostics || {};
   const rtc = stats.webrtc;
   document.getElementById('rtc-diagnostics').hidden = !rtc;
-  document.getElementById('rtc-note').hidden = !rtc;
+  document.getElementById('rtc-help').hidden = !rtc;
   if (rtc) {
     document.getElementById('rtc-note-row').hidden = !rtc.encoder_note;
     document.getElementById('rtc-note').textContent = rtc.encoder_note || '';
@@ -511,6 +529,10 @@ function renderDiagnostics(stats) {
       encoder: `${rtc.encoder} · ${number(rtc.target_bitrate / 1e6)} Mbit/s target`,
       size: `${dimensions(rtc.width, rtc.height)} · ${number(rtc.encoded_fps)} fps`,
       encode: timing(rtc.encode_ms),
+      wait: timing(rtc.capture_to_encode_ms),
+      convert: timing(rtc.convert_ms),
+      'codec-time': timing(rtc.codec_ms),
+      queue: timing(rtc.send_queue_ms),
       outgoing: `${rtc.connected} connected · ${number(rtc.outgoing_mbps, 2)} Mbit/s`,
       codec: browserStats ? `${browserStats.codec} · ${number(browserStats.fps)} fps` : '—',
       received: browserStats ? `${number(browserStats.mbps, 2)} Mbit/s · ${browserStats.frames} decoded` : '—',

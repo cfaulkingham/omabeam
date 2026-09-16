@@ -261,6 +261,45 @@ fn default_bind_is_local_network() {
 }
 
 #[test]
+fn extended_desktop_defaults_to_sixty_fps_but_explicit_rates_survive_daemon_handoff() {
+    for (input, expected) in [
+        (vec!["--live", "extend", "1920", "1080", "1", "right"], 60),
+        (
+            vec!["--live", "--", "extend", "1920", "1080", "1", "right"],
+            60,
+        ),
+        (
+            vec![
+                "--fps", "15", "--live", "extend", "1920", "1080", "1", "right",
+            ],
+            15,
+        ),
+        (
+            vec![
+                "--live", "extend", "1920", "1080", "1", "right", "--fps", "30",
+            ],
+            30,
+        ),
+        (vec!["--live", "output", "extend"], 15),
+        (vec!["--demo"], 15),
+    ] {
+        let (config, rest) = LiveConfig::parse_args(&args(&input)).unwrap();
+        assert_eq!(config.fps, expected, "{input:?}");
+        let mut daemon = config.to_cli_args();
+        daemon.extend(rest);
+        assert_eq!(LiveConfig::parse_args(&daemon).unwrap().0, config);
+    }
+    let mut config = LiveConfig {
+        fps: 120,
+        ..Default::default()
+    };
+    assert_eq!(config.interval(1), Duration::from_secs_f64(1.0 / 60.0));
+    config.webrtc = false;
+    assert_eq!(config.interval(1), Duration::from_secs_f64(1.0 / 120.0));
+    assert_eq!(config.interval(0), Duration::from_secs(1));
+}
+
+#[test]
 fn options_validate_and_round_trip_through_daemon_arguments() {
     let (config, rest) = LiveConfig::parse_args(&args(&[
         "--fps",

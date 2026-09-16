@@ -259,11 +259,12 @@ impl CaptureSession {
             slot.retries = 0;
             let buffer = slot
                 .buffer
-                .as_ref()
+                .as_mut()
                 .context("capture completed without a buffer")?;
+            let spec = buffer.spec;
             slot.last = Some(pixels::decode(
-                &buffer.read()?,
-                buffer.spec,
+                buffer.read()?,
+                spec,
                 slot.inverted,
                 slot.transform,
             )?);
@@ -272,26 +273,28 @@ impl CaptureSession {
         Ok(changed)
     }
 
-    fn render(&self) -> Result<CapturedFrame> {
-        let state = &self.runtime.state;
-        let slot = &state.slots[0];
-        let image = slot.last.as_ref().unwrap();
+    fn render(&mut self) -> Result<CapturedFrame> {
+        let state = &mut self.runtime.state;
+        let slot = &mut state.slots[0];
         match &self.target {
-            CaptureTarget::Toplevel(_) => Ok(CapturedFrame {
-                logical_width: image.width(),
-                logical_height: image.height(),
-                image: image.clone(),
-            }),
+            CaptureTarget::Toplevel(_) => {
+                let image = slot.last.take().unwrap();
+                Ok(CapturedFrame {
+                    logical_width: image.width(),
+                    logical_height: image.height(),
+                    image,
+                })
+            }
             CaptureTarget::Output(_) => {
                 let rect = state.outputs[&slot.output.unwrap()].rect();
                 Ok(CapturedFrame {
-                    image: image.clone(),
+                    image: slot.last.take().unwrap(),
                     logical_width: rect.width,
                     logical_height: rect.height,
                 })
             }
             CaptureTarget::Region(region) => pixels::crop(
-                image,
+                slot.last.as_ref().unwrap(),
                 state.outputs[&slot.output.unwrap()].rect(),
                 region.rect,
             ),

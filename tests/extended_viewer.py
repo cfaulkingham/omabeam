@@ -80,6 +80,15 @@ class Fixture:
         return json.loads(body)
 
 
+def leave_fullscreen(page):
+    # Chrome can retain user activation across refresh/resume, allowing the
+    # viewer's automatic fullscreen request. Header controls are then covered.
+    if page.evaluate("document.fullscreenElement === stage || stage.classList.contains('expanded')"):
+        page.mouse.move(20, 20)
+        page.locator('#exit').click()
+        page.wait_for_function("document.fullscreenElement === null && !stage.classList.contains('expanded')")
+
+
 def check_browser(fixture, browser, artifacts):
     errors = []
     first_context = browser.new_context(viewport={'width': 1000, 'height': 800}, device_scale_factor=1)
@@ -88,6 +97,7 @@ def check_browser(fixture, browser, artifacts):
     first.on('pageerror', lambda error: errors.append(str(error)))
     first.goto(fixture.url, wait_until='domcontentloaded')
     first.wait_for_function("playback === 'webrtc' && video.videoWidth === 1280", timeout=20000)
+    leave_fullscreen(first)
     second = second_context.new_page()
     second.on('pageerror', lambda error: errors.append(str(error)))
     second.goto(fixture.url, wait_until='domcontentloaded')
@@ -113,6 +123,7 @@ def check_browser(fixture, browser, artifacts):
     first.screenshot(path=str(artifacts / 'matched-desktop.png'))
     first.reload(wait_until='domcontentloaded')
     first.wait_for_function("ownsDesktop && playback === 'webrtc' && video.videoWidth === 1180", timeout=20000)
+    leave_fullscreen(first)
     assert second.locator('#stage').get_attribute('class').find('blocked') >= 0
 
     # JPEG uses the same ownership and tracks both dimensions when resizing.
@@ -136,6 +147,7 @@ def check_browser(fixture, browser, artifacts):
     eventually(lambda: fixture.stats()['viewers'] == 0)
     first.locator('#pause').click()
     first.wait_for_function("ownsDesktop && playback === 'webrtc'", timeout=20000)
+    leave_fullscreen(first)
 
     # A rejected IPC mode leaves the previous capture alive and reports the failure.
     previous = fixture.stats()['desktop']['config']

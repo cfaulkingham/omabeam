@@ -40,15 +40,59 @@ def playing(page):
     assert pixels > 3, pixels
 
 
+def latency_controls(page):
+    page.evaluate("""async () => {
+        const absent = {};
+        preferLowLatency(absent);
+        if ('jitterBufferTarget' in absent) throw new Error('created unsupported property');
+        preferLowLatency({get jitterBufferTarget() { return null; }, set jitterBufferTarget(v) { throw new Error('unsupported'); }});
+        const receiver = pc.getReceivers().find(r => r.track.kind === 'video');
+        if ('jitterBufferTarget' in receiver && receiver.jitterBufferTarget !== 0)
+            throw new Error('low-latency target was not requested');
+        const connection = pc, getStats = connection.getStats;
+        const savedPrevious = previousInbound, savedStats = browserStats;
+        try {
+            previousInbound = null;
+            let inbound = {id: 'latency-fixture', type: 'inbound-rtp', kind: 'video', timestamp: 1000,
+                framesDecoded: 100, bytesReceived: 1000, packetsLost: 0, jitter: 0,
+                totalDecodeTime: 5, jitterBufferDelay: 20, jitterBufferEmittedCount: 100};
+            connection.getStats = async () => new Map([['inbound', inbound]]);
+            await sampleBrowser();
+            if (browserStats.decode !== null || browserStats.buffer !== null)
+                throw new Error('first sample used lifetime averages');
+            inbound = {...inbound, timestamp: 2000, framesDecoded: 104, bytesReceived: 2000,
+                totalDecodeTime: 5.008, jitterBufferDelay: 20.04, jitterBufferEmittedCount: 104};
+            await sampleBrowser();
+            if (Math.abs(browserStats.decode - 2) > 0.001 || Math.abs(browserStats.buffer - 10) > 0.001)
+                throw new Error('recent timing did not use interval deltas');
+            await sampleBrowser();
+            if (browserStats.decode !== null || browserStats.buffer !== null)
+                throw new Error('idle interval should have no timing samples');
+            inbound = {...inbound, id: 'replacement-stream', framesDecoded: 1};
+            await sampleBrowser();
+            if (browserStats.decode !== null || browserStats.buffer !== null || browserStats.fps !== null)
+                throw new Error('new stream reused previous counters');
+        } finally {
+            connection.getStats = getStats;
+            previousInbound = savedPrevious;
+            browserStats = savedStats;
+        }
+    }""")
+
+
 def checks(server, browser, screenshot):
     page = browser.new_page(viewport={'width': 1280, 'height': 900})
     errors = []
     page.on('pageerror', lambda error: errors.append(str(error)))
     page.goto(server.url, wait_until='domcontentloaded')
     playing(page)
+    latency_controls(page)
     assert not page.evaluate('isSecureContext'), 'Use the LAN HTTP origin to avoid localhost-only WebRTC success'
     eventually(lambda: server.stats()['webrtc']['connected'] == 1)
     assert server.stats()['clients'] == []
+    for stage in ['capture_to_encode_ms', 'convert_ms', 'codec_ms', 'send_queue_ms']:
+        eventually(lambda: server.stats()['webrtc'][stage]['samples'] > 0)
+        assert server.stats()['webrtc'][stage]['p95'] >= 0
     assert server.stats()['diagnostics']['encode_ms']['samples'] == 0, 'RTC-only playback should not encode JPEG'
     page.locator('#fit').click()
     assert round(page.locator('#video').bounding_box()['width']) == 1280
@@ -60,6 +104,9 @@ def checks(server, browser, screenshot):
     page.locator('#exit').click()
     page.locator('#diagnostics summary').click()
     page.wait_for_function("document.querySelector('#rtc-codec').textContent.includes('video/H264')")
+    for element in ['rtc-wait', 'rtc-convert', 'rtc-codec-time', 'rtc-queue']:
+        page.wait_for_function('(id) => document.getElementById(id).textContent.includes("ms")', arg=element)
+    assert page.locator('#rtc-help').is_visible()
     if screenshot:
         page.screenshot(path=str(screenshot))
         page.set_viewport_size({'width': 390, 'height': 650})
@@ -226,10 +273,11 @@ def main():
     parser.add_argument('--browser-executable', default=os.environ.get('OMABEAM_TEST_CHROMIUM') or shutil.which('google-chrome') or shutil.which('chromium'))
     parser.add_argument('--capture-output')
     parser.add_argument('--sway-socket')
+    parser.add_argument('--fps', type=int, default=60)
     parser.add_argument('--encoder', choices=['auto', 'hardware', 'software'], default='auto')
     args = parser.parse_args()
     source = ['--live', 'output', args.capture_output] if args.capture_output else None
-    with Server(args.binary, ['--bind', '0.0.0.0', '--webrtc', '--webrtc-port', '0', '--fps', '15', '--native-pixels', '--encoder', args.encoder], source) as server:
+    with Server(args.binary, ['--bind', '0.0.0.0', '--webrtc', '--webrtc-port', '0', '--fps', str(args.fps), '--native-pixels', '--encoder', args.encoder], source) as server:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True, executable_path=args.browser_executable)
             try:
