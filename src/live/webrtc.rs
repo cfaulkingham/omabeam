@@ -1,7 +1,6 @@
 //! LAN-only, receive-only H.264. One encoder feeds at most eight peers through
 //! a one-frame channel. ICE/DTLS/RTP run independently of capture and encoding.
 mod encoder;
-pub use encoder::probe as probe_encoder;
 
 use super::{
     LiveConfig,
@@ -9,6 +8,7 @@ use super::{
     state::FrameState,
 };
 use anyhow::{Context, Result, ensure};
+#[cfg(test)]
 use omabeam_capture::CapturedFrame;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use serde::{Deserialize, Serialize};
@@ -63,12 +63,6 @@ fn h264_profile_level_id(width: u32, height: u32, fps: u32, bitrate: u32) -> u32
         .map(|(level, _, _, _)| level)
         .unwrap_or(52);
     0x42e000 | level
-}
-
-pub(super) struct RawFrame {
-    pub frame: CapturedFrame,
-    pub config: LiveConfig,
-    pub captured_at: Instant,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

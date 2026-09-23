@@ -37,6 +37,48 @@ fn run() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    if args.first().is_some_and(|arg| arg == "--cast-devices") {
+        anyhow::ensure!(args.len() == 1, "unexpected Cast discovery argument");
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&omabeam::live::cast::discover(
+                std::time::Duration::from_secs(5)
+            )?)?
+        );
+        return Ok(());
+    }
+    if args.first().is_some_and(|arg| arg == "--cast-demo") {
+        anyhow::ensure!(args.len() == 2, "--cast-demo needs one receiver ID");
+        if !fps_explicit {
+            config.set_fps(30);
+        }
+        return omabeam::live::cast::run_receiver_demo(&args[1], config);
+    }
+    if args.first().is_some_and(|arg| arg == "--cast") {
+        anyhow::ensure!(
+            args.len() >= 4,
+            "--cast needs a receiver ID and source, e.g. --cast ID -- output DP-1"
+        );
+        if !fps_explicit {
+            config.set_fps(30);
+        }
+        let source = omabeam::live::LiveSource::from_cli_args(&args[2..])?;
+        return omabeam::live::cast::run_source(&args[1], source, config);
+    }
+    if args.first().is_some_and(|arg| arg == "--cast-test") {
+        anyhow::ensure!(
+            args.len() == 3,
+            "--cast-test needs a receiver IP:port and developer certificate"
+        );
+        if !fps_explicit {
+            config.set_fps(30);
+        }
+        return omabeam::live::cast::run_demo(
+            args[1].parse()?,
+            std::path::Path::new(&args[2]),
+            config,
+        );
+    }
     if args.first().is_some_and(|arg| arg == "--demo") {
         anyhow::ensure!(args.len() == 1, "unexpected command argument");
         if !std::env::args().any(|arg| arg == "--bind") {
@@ -93,6 +135,20 @@ fn run() -> anyhow::Result<()> {
     options.fps_explicit = fps_explicit;
     if !options.picker && !options.demo {
         if let Some(status) = omabeam::live::current_status() {
+            if status.stats.state != "ended"
+                && let Some(cast) = &status.stats.cast
+            {
+                let _ = std::process::Command::new("/usr/bin/notify-send")
+                    .args([
+                        "OmaBeam",
+                        &format!(
+                            "Casting to {}. Use the OmaBeam bar icon to stop.",
+                            cast.receiver_name
+                        ),
+                    ])
+                    .status();
+                return Ok(());
+            }
             if status.stats.state == "ended" {
                 eprintln!(
                     "{}",

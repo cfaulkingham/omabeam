@@ -1,0 +1,44 @@
+name: Native Cast qualification
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'native/**'
+      - 'crates/omabeam-cast/**'
+      - 'src/live/**'
+      - 'src/live.rs'
+      - 'src/main.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/build-cast.py'
+      - 'tests/native_cast*.py'
+      - '.github/workflows/native-cast.yml'
+permissions:
+  contents: read
+jobs:
+  software-receiver:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake nasm pkg-config libfontconfig1-dev libfreetype6-dev libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libopus-dev libvpx-dev libsdl2-dev libdbus-1-dev
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/native-cast
+          key: native-cast-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('native/omabeam-cast/upstream.json', 'scripts/build-cast.py') }}
+      - run: cargo build --locked
+      - run: python scripts/build-cast.py --sync --upstream
+      - run: cargo test --locked -p omabeam-cast --all-targets
+      - run: python tests/native_cast.py target/native-cast/openscreen/out/omabeam/omabeam-cast
+      - run: python tests/native_cast_stream.py --app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cast-software-receiver-qualification
+          path: target/native-cast/qualification.json

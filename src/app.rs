@@ -18,6 +18,7 @@ use crate::live::{LiveConfig, LiveSource, spawn_daemon};
 use crate::portal::{PortalWindow, Selection, parse_window_list};
 
 mod brand;
+mod cast;
 mod demo;
 mod desktop;
 mod preview;
@@ -130,6 +131,12 @@ Usage:
   omabeam --live extend WIDTH HEIGHT SCALE POSITION
                          Create an extra desktop; SCALE is 1 or 2;
                          POSITION is right, left, above, or below
+  omabeam --cast-devices                 Discover native Cast receivers (JSON)
+  omabeam --cast-demo RECEIVER_ID        Cast synthetic video for qualification
+  omabeam --cast RECEIVER_ID -- output NAME
+  omabeam --cast RECEIVER_ID -- extend WIDTH HEIGHT SCALE POSITION
+    Cast accepts the same window/region sources. Default canvas is 720p;
+    --width 1920 selects 1080p. Native Cast is under device qualification.
   omabeam --demo       Synthetic stream without a Wayland desktop (localhost)
   omabeam --demo-picker Preview the native picker with synthetic sources; no sharing
 
@@ -184,6 +191,12 @@ pub struct OmaBeam {
     selected_window: Option<String>,
     selected_output: Option<String>,
     live_config: LiveConfig,
+    cast_mode: bool,
+    browser_config: Option<(LiveConfig, crate::hypr::desktop::DesktopConfig, bool)>,
+    cast_receivers: Vec<omabeam_cast::Receiver>,
+    cast_receiver_id: Option<String>,
+    cast_scanning: bool,
+    cast_error: Option<String>,
     fps_selected: bool,
     desktop_config: crate::hypr::desktop::DesktopConfig,
     follow_workspace: bool,
@@ -400,6 +413,12 @@ impl OmaBeam {
             selected_output,
             fps_selected: options.fps_explicit,
             live_config: options.live_config,
+            cast_mode: false,
+            browser_config: None,
+            cast_receivers: Vec::new(),
+            cast_receiver_id: None,
+            cast_scanning: false,
+            cast_error: None,
             desktop_config: Default::default(),
             follow_workspace: true,
             status: "".into(),
@@ -835,8 +854,15 @@ impl OmaBeam {
     }
 
     fn start_live_source(&mut self, source: LiveSource, cx: &mut Context<Self>) {
+        if self.cast_mode && self.cast_receiver_id.is_none() {
+            self.status = "Choose a Cast receiver before starting.".into();
+            cx.notify();
+            return;
+        }
         self.busy = true;
-        self.status = if self.page == Page::Extend {
+        self.status = if self.cast_mode {
+            "Connecting to your Cast receiver…"
+        } else if self.page == Page::Extend {
             "Creating your extended desktop…"
         } else {
             "Starting live share…"
@@ -845,15 +871,20 @@ impl OmaBeam {
         cx.notify();
         hide_picker();
         let config = self.live_config.clone();
-        let operation = cx
-            .background_executor()
-            .spawn(async move { spawn_daemon(&source, &config) });
+        let cast_id = self.cast_receiver_id.clone().filter(|_| self.cast_mode);
+        let operation = cx.background_executor().spawn(async move {
+            if let Some(id) = cast_id {
+                crate::live::cast::spawn_daemon(&id, &source, &config).map(|_| None)
+            } else {
+                spawn_daemon(&source, &config).map(Some)
+            }
+        });
         cx.spawn(async move |view, cx| {
             let result = operation.await;
             let _ = view.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok(url) => {
+                    Ok(Some(url)) => {
                         cx.write_to_clipboard(ClipboardItem::new_string(url.clone()));
                         let sent = crate::localsend::spawn_window(&url);
                         desktop_notify(if sent.is_ok() {
@@ -861,6 +892,10 @@ impl OmaBeam {
                         } else {
                             "Live share started and its URL was copied. Use the OmaBeam bar icon to send it, copy it again, or stop sharing."
                         });
+                        cx.quit();
+                    }
+                    Ok(None) => {
+                        desktop_notify("Casting started. Use the OmaBeam bar icon to stop.");
                         cx.quit();
                     }
                     Err(err) => {
@@ -891,8 +926,13 @@ impl OmaBeam {
 
     fn select_page(&mut self, page: Page) {
         if !self.fps_selected {
-            self.live_config
-                .set_fps(if page == Page::Extend { 60 } else { 15 });
+            self.live_config.set_fps(if self.cast_mode {
+                30
+            } else if page == Page::Extend {
+                60
+            } else {
+                15
+            });
         }
         if page == Page::Extend && self.page != Page::Extend {
             // A second screen should show the host pointer and retain its

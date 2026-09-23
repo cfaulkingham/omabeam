@@ -4899,6 +4899,7 @@ dependencies = [
  "image",
  "localsend",
  "omabeam-capture",
+ "omabeam-cast",
  "omabeam-encoder",
  "openh264",
  "qrcode",
@@ -4925,6 +4926,18 @@ dependencies = [
  "wayland-protocols",
  "wayland-protocols-wlr",
  "wayland-server",
+]
+
+[[package]]
+name = "omabeam-cast"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "omabeam-encoder",
+ "openh264",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

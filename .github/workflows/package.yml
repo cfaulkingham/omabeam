@@ -19,6 +19,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Build pinned native Cast helper and notices
+        run: python scripts/build-cast.py --sync
+      - run: python tests/native_cast.py target/release/omabeam-cast
       - run: python tests/firewall.py
       - run: python tests/extended_desktop.py --binary target/release/omabeam
       - run: python tests/hardware_encoding.py --binary target/release/omabeam
@@ -33,8 +36,8 @@ jobs:
           cargo bundle-licenses --format yaml --output target/THIRDPARTY.yml
       - name: Assemble plugin and native app
         run: |
-          python scripts/package-plugin.py --binary target/release/omabeam --encoder-helper target/release/omabeam-encoder --target x86_64-unknown-linux-gnu --licenses target/THIRDPARTY.yml
-          ldd target/release/omabeam target/release/omabeam-encoder > dist/linux-runtime-libraries.txt
+          python scripts/package-plugin.py --binary target/release/omabeam --encoder-helper target/release/omabeam-encoder --cast-helper target/release/omabeam-cast --cast-licenses target/native-cast/notices --target x86_64-unknown-linux-gnu --licenses target/THIRDPARTY.yml
+          ldd target/release/omabeam target/release/omabeam-encoder target/release/omabeam-cast > dist/linux-runtime-libraries.txt
       - uses: actions/upload-artifact@v4
         with:
           name: omabeam-omarchy-linux-x86_64

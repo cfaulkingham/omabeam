@@ -28,11 +28,13 @@ pub struct StreamStats {
     pub webrtc: Option<super::WebRtcStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<super::desktop::DesktopStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast: Option<super::cast::CastStats>,
 }
 
 pub(super) struct FrameData {
     pub jpeg: Arc<[u8]>,
-    pub raw: Option<Arc<super::webrtc::RawFrame>>,
+    pub raw: Option<Arc<super::h264::RawFrame>>,
     pub generation: u64,
     pub width: u32,
     pub height: u32,
@@ -48,6 +50,7 @@ pub(super) struct FrameState {
     pub inner: Mutex<FrameData>,
     pub tick: Condvar,
     pub viewers: AtomicUsize,
+    pub cast_viewers: AtomicUsize,
     pub rtc: Mutex<Option<Arc<super::webrtc::Service>>>,
     pub desktop: Option<Arc<super::desktop::DesktopControl>>,
     jpeg_encode: Mutex<()>,
@@ -79,6 +82,7 @@ impl FrameState {
             }),
             tick: Condvar::new(),
             viewers: AtomicUsize::new(0),
+            cast_viewers: AtomicUsize::new(0),
             rtc: Mutex::new(None),
             desktop: None,
             jpeg_encode: Mutex::new(()),
@@ -95,7 +99,7 @@ impl FrameState {
         width: u32,
         height: u32,
         measurement: FrameMeasurement,
-        raw: Option<Arc<super::webrtc::RawFrame>>,
+        raw: Option<Arc<super::h264::RawFrame>>,
     ) {
         let mut data = self.inner.lock().unwrap();
         if data.ended.is_some() {
@@ -127,6 +131,7 @@ impl FrameState {
     }
     pub fn viewer_count(&self) -> usize {
         self.viewers.load(Ordering::SeqCst)
+            + self.cast_viewers.load(Ordering::SeqCst)
             + self
                 .rtc
                 .lock()
@@ -178,6 +183,7 @@ impl FrameState {
             diagnostics: data.diagnostics.stats(now),
             webrtc: self.rtc.lock().unwrap().as_ref().map(|rtc| rtc.stats()),
             desktop: self.desktop.as_ref().map(|d| d.stats()),
+            cast: None,
         }
     }
 

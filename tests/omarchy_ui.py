@@ -173,6 +173,16 @@ def model_tests():
       assert(linkHost("https://example.com/s/" + token + "/") === "")
       assert(linkHost("http://8.8.8.8:9847/s/" + token + "/") === "")
       assert(plain("<img src=x>", 80) === "img src=x")
+      const casting = {pid:12,state:"live",title:"Screen",url:"",cast:{session_id:token,
+        receiver_id:"tv-id",receiver_name:"Living Room",connection:"negotiating"}}
+      const cast = read(JSON.stringify(casting), 0, 0)
+      assert(cast.destination === "cast" && cast.receiver === "Living Room" && cast.url === "")
+      casting.cast.connection = "streaming"
+      assert(read(JSON.stringify(casting), 0, 0).connection === "streaming")
+      casting.cast.session_id = "bad"
+      let badCast = false
+      try { read(JSON.stringify(casting), 0, 0) } catch (error) { badCast = true }
+      assert(badCast)
       const url = "http://192.168.1.24:9847/s/" + token + "/"
       const rows = Array(21).fill("1".repeat(21))
       assert(readQr(JSON.stringify({url, rows}), url).length === 21)
@@ -406,6 +416,16 @@ def presentation_tests(app, screenshots):
     # A real pointer click on Stop remains usable after the details overflow.
     QTest.mouseClick(view, Qt.LeftButton, pos=QPoint(int(point.x() + stop.width() / 2), int(point.y() + stop.height() / 2)))
     check(engine, root, 'subject.stops === 2')
+    cast_session = dict(LIVE, destination="cast", receiver="Living Room TV",
+                        connection="negotiating", url="", viewers=0, width=1280, height=720)
+    capture("cast-connecting", cast_session)
+    check(engine, root, 'subject.content.connecting && !subject.content.canShare && subject.content.actions().length === 1 && subject.content.selectedAction === "stop"')
+    capture("cast-streaming", dict(cast_session, connection="streaming", viewers=1))
+    check(engine, root, '!subject.content.connecting && subject.content.heading === "Casting to Living Room TV"')
+    QTest.keyClick(view, Qt.Key_Return)
+    check(engine, root, 'subject.stops === 3 && subject.copies === 1')
+    capture("cast-reconnecting", dict(cast_session, connection="reconnecting"))
+    check(engine, root, 'subject.content.reconnecting && subject.content.heading === "Reconnecting to Living Room TV" && subject.content.actions().length === 1')
     view.close()
     print("PASS: keyboard and pointer actions, ready/live/waiting/ended/error states, light theme, compact scrolling")
 

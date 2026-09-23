@@ -108,6 +108,38 @@ class Packaging(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "executable"):
             package()
 
+    def test_cast_helper_requires_matching_binary_and_notice_inventory(self):
+        notices = self.base / "cast-notices"
+        notices.mkdir()
+        license_file = notices / "LICENSE"
+        license_file.write_text("test-only native license\n")
+        manifest = {"upstream":{"fixture":"test"}, "binary":{"protocol":1,
+            "sha256":hashlib.sha256(self.binary.read_bytes()).hexdigest()}, "files":[{
+            "path":"LICENSE", "sha256":hashlib.sha256(license_file.read_bytes()).hexdigest()}]}
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        def package(license_dir=notices):
+            return PACKAGER.package(self.binary, "x86_64-unknown-linux-gnu", self.licenses,
+                self.base / "dist", root=self.source, encoder_helper=self.binary,
+                cast_helper=self.binary, cast_licenses=license_dir)
+        with tarfile.open(package()) as tar:
+            self.assertEqual(tar.getmember(f"{PLUGIN_ID}/omarchy-plugin/native/bin/omabeam-cast").mode, 0o755)
+            self.assertIn(f"{PLUGIN_ID}/licenses/cast/LICENSE", tar.getnames())
+        with self.assertRaisesRegex(ValueError, "together"):
+            package(None)
+        manifest["binary"]["sha256"] = "wrong"
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            package()
+        manifest["binary"]["sha256"] = hashlib.sha256(self.binary.read_bytes()).hexdigest()
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        license_file.write_text("modified notice")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            package()
+        manifest["files"][0]["path"] = "../THIRDPARTY.yml"
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "Unsafe"):
+            package()
+
     def test_launcher_requires_plugin_binary_and_preserves_literal_arguments(self):
         home, tools = self.base / "home", self.base / "tools"
         tools.mkdir()

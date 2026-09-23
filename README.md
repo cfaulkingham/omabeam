@@ -87,6 +87,20 @@ See [Installation and releases](RELEASING.md) for Git-managed installs,
 bundles, updates, and removal. Run `./install.sh --backend-only` inside a
 plugin checkout to build the app without changing desktop configuration.
 
+## Experimental Google Cast
+
+This branch adds a **Google Cast** destination for native, video-only H.264
+mirroring to one receiver. Build the optional helper with
+`./install.sh --backend-only --with-cast`, then select Google Cast and a receiver
+in the picker. The bar shows the receiver and a Stop action. Cast sessions do
+not need a browser link.
+
+The initial profiles are 720p and 1080p at up to 30 fps, subject to receiver
+limits. Real Hyprland extended-display playback has been confirmed at 720p on a
+Google Nest Hub and 1080p on an E65-E1 TV. Sustained performance and broader
+device behavior still need qualification; see [current results and commands](docs/NATIVE-CAST-STATUS.md).
+System audio is a later milestone.
+
 ## Removing
 
 Stop an active share from the bar (or `omabeam --stop`), then:

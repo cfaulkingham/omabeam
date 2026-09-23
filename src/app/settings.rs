@@ -47,6 +47,14 @@ impl StreamPreset {
 
 impl OmaBeam {
     pub(super) fn render_stream_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.cast_mode {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(self.render_destination(cx))
+                .child(self.render_cast_settings(cx));
+        }
         let preset = StreamPreset::matching(&self.live_config);
         let preset_changed = cx.listener(|this, index: &usize, _, cx| {
             StreamPreset::ALL[*index].apply(&mut this.live_config);
@@ -105,6 +113,7 @@ impl OmaBeam {
             .flex()
             .flex_col()
             .gap_2()
+            .child(self.render_destination(cx))
             .child(
                 div()
                     .flex()

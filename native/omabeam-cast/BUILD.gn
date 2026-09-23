@@ -1,0 +1,20 @@
+import("../gni/openscreen.gni")
+
+openscreen_executable("omabeam-cast") {
+  sources = [ "main.cc", "cast_agent.cc", "cast_agent.h", "discovery.cc", "discovery.h", "wire.cc", "wire.h" ]
+  deps = [
+    "../discovery:dnssd",
+    "../discovery:public",
+    "../platform",
+    "../platform:standalone_impl",
+    "../third_party/jsoncpp",
+    "../util",
+    "../cast/common:certificate_boringssl",
+    "../cast/common:public",
+    "../cast/common/channel/proto:channel_proto",
+    "../cast/sender:channel",
+    "../cast/streaming:common",
+    "../cast/streaming:sender",
+  ]
+  configs = [ "../cast/common:certificate_config" ]
+}

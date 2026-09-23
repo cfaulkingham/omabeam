@@ -450,8 +450,12 @@ fn cmdline_is_session(pid: u32) -> bool {
     if data.len() > 8192 {
         return false;
     }
-    data.split(|b| *b == 0)
-        .any(|arg| arg == b"--live" || arg == b"--demo")
+    data.split(|b| *b == 0).any(|arg| {
+        matches!(
+            arg,
+            b"--live" | b"--demo" | b"--cast" | b"--cast-test" | b"--cast-demo"
+        )
+    })
 }
 
 fn without_deleted_suffix(path: &std::path::Path) -> &std::path::Path {

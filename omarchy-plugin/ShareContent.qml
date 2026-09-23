@@ -32,11 +32,17 @@ Item {
   property string selectedAction: "primary"
   readonly property bool live: session.state === "live"
   readonly property bool ended: session.state === "ended"
+  readonly property bool casting: session.destination === "cast"
+  readonly property bool connecting: live && casting && session.connection !== "streaming"
+  readonly property bool reconnecting: live && casting && session.connection === "reconnecting"
   readonly property bool uncertain: statusError !== ""
   readonly property bool canShare: live && !uncertain && session.url !== "" && !stopping
   readonly property color muted: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.68)
   readonly property color outline: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.12)
   readonly property string heading: uncertain ? "Status unavailable" : !ready ? "Checking your share…"
+    : reconnecting ? "Reconnecting to " + session.receiver
+    : connecting ? "Connecting to " + session.receiver
+    : live && casting ? "Casting to " + session.receiver
     : live ? "You're sharing" : ended ? "Your share has ended" : "Ready when you are"
   signal copyRequested()
   signal viewerRequested()
@@ -48,7 +54,7 @@ Item {
   implicitHeight: Math.ceil(header.implicitHeight) + Math.ceil(details.implicitHeight)
     + Math.ceil(footer.implicitHeight) + 32 * unit
 
-  function resetCursor() { selectedAction = "primary"; scroller.contentY = 0 }
+  function resetCursor() { selectedAction = live && casting && !uncertain ? "stop" : "primary"; scroller.contentY = 0 }
   function actions() {
     var all = [primary, qr, viewer, send, stop]
     return all.filter(function(button) { return button.visible && button.enabled })
@@ -68,6 +74,7 @@ Item {
       if (list[i].objectName === selectedAction) { list[i].clicked(); return }
   }
   onLiveChanged: resetCursor()
+  onCastingChanged: resetCursor()
   onUncertainChanged: resetCursor()
 
   ColumnLayout {
@@ -119,7 +126,7 @@ Item {
         Text {
           id: badge
           anchors.centerIn: parent
-          text: root.stopping ? "STOPPING" : root.uncertain ? "CHECK" : root.live ? "● LIVE" : "ENDED"
+          text: root.stopping ? "STOPPING" : root.uncertain ? "CHECK" : root.reconnecting ? "RECONNECTING" : root.connecting ? "CONNECTING" : root.live ? "● LIVE" : "ENDED"
           textFormat: Text.PlainText
           color: root.urgent
           font.family: root.fontFamily
@@ -218,7 +225,7 @@ Item {
           Repeater {
             model: [
               { value: root.uncertain || root.session.viewers === null ? "—" : String(Math.floor(root.session.viewers)),
-                label: root.session.viewers === 1 ? "viewer connected" : "viewers connected" },
+                label: root.casting ? "receiver connected" : root.session.viewers === 1 ? "viewer connected" : "viewers connected" },
               { value: root.uncertain ? "—" : Session.elapsed(root.session.uptime), label: "time sharing" }
             ]
             Column {
@@ -255,7 +262,7 @@ Item {
           Rectangle { width: parent.width; height: root.unit; color: root.outline }
           Text {
             width: parent.width
-            text: root.session.url ? Session.linkHost(root.session.url) : "Share link unavailable"
+            text: root.casting ? root.session.receiver : root.session.url ? Session.linkHost(root.session.url) : "Share link unavailable"
             textFormat: Text.PlainText
             elide: Text.ElideMiddle
             color: root.foreground
@@ -264,7 +271,10 @@ Item {
           }
           Text {
             width: parent.width
-            text: root.session.url ? "Scan the QR code, copy the link, or send it nearby. Open it on a device on the same network—no viewer app needed."
+            text: root.casting ? (root.reconnecting ? "Trying to resume this screen for up to 15 seconds."
+                : root.connecting ? "Waiting for the receiver to accept the screen."
+              : "Your selected source is being sent directly to this receiver.")
+              : root.session.url ? "Scan the QR code, copy the link, or send it nearby. Open it on a device on the same network—no viewer app needed."
               : "The share is running, but its link could not be read. You can still stop it below."
             textFormat: Text.PlainText
             wrapMode: Text.Wrap
@@ -366,7 +376,7 @@ Item {
         objectName: "actionFeedback"
         width: parent.width
         // Reserve one line so copying never shifts the buttons under the mouse.
-        text: root.feedback || (root.live && root.session.viewers === 0 && !root.uncertain ? "Waiting for your first viewer" : " ")
+        text: root.feedback || (root.live && !root.casting && root.session.viewers === 0 && !root.uncertain ? "Waiting for your first viewer" : " ")
         textFormat: Text.PlainText
         wrapMode: Text.Wrap
         color: root.feedbackError ? root.urgent : root.muted
@@ -379,6 +389,7 @@ Item {
 
       ShareButton {
         id: primary
+        visible: !root.casting || !root.live || root.uncertain
         objectName: "primary"
         width: parent.width
         unit: root.unit
@@ -399,7 +410,7 @@ Item {
         id: qr
         objectName: "qr"
         width: parent.width
-        visible: root.live
+        visible: root.live && !root.casting
         unit: root.unit
         cornerRadius: root.cornerRadius
         foreground: root.foreground
@@ -418,7 +429,7 @@ Item {
         ShareButton {
           id: viewer
           objectName: "viewer"
-          visible: root.live
+          visible: root.live && !root.casting
           width: (parent.width - parent.spacing * 2) / 3
           unit: root.unit
           cornerRadius: root.cornerRadius
@@ -434,7 +445,7 @@ Item {
         ShareButton {
           id: send
           objectName: "send"
-          visible: root.live
+          visible: root.live && !root.casting
           width: (parent.width - parent.spacing * 2) / 3
           unit: root.unit
           cornerRadius: root.cornerRadius
@@ -451,13 +462,13 @@ Item {
           id: stop
           objectName: "stop"
           visible: root.live
-          width: (parent.width - parent.spacing * 2) / 3
+          width: root.casting ? parent.width : (parent.width - parent.spacing * 2) / 3
           unit: root.unit
           cornerRadius: root.cornerRadius
           foreground: root.urgent
           fontFamily: root.fontFamily
           fontSize: root.captionSize
-          text: root.stopping ? "Stopping…" : "Stop sharing"
+          text: root.stopping ? "Stopping…" : root.casting ? "Stop casting" : "Stop sharing"
           enabled: !root.stopping
           hasCursor: root.selectedAction === objectName
           onHovered: root.selectedAction = objectName

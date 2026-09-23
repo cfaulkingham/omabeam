@@ -1,5 +1,11 @@
 # Developing OmaBeam
 
+Native Google Cast video mirroring is implemented on the development branch.
+See [build commands and qualification status](NATIVE-CAST-STATUS.md) and the
+[design and release gates](NATIVE-CAST.md). The status document records
+user-confirmed Hyprland extended-display playback at 720p on a Nest Hub and
+1080p on an E65-E1 TV, plus the remaining performance and release checks.
+
 ## Build and run
 
 Use a current stable Rust toolchain with edition 2024 support. Linux builds
@@ -36,7 +42,10 @@ HTTP/WebRTC server. `--demo-picker` uses synthetic sources with sharing disabled
 | `src/app/` | Picker, preview worker, branding, settings, nearby-device UI |
 | `src/live/` | Browser viewer, HTTP delivery, stream settings and state |
 | `src/live/desktop.rs` | Extended-display client lease and capture-worker resize transactions |
-| `src/live/webrtc.rs`, `src/live/webrtc/encoder.rs` | LAN ICE/DTLS/RTP peers and shared adaptive H.264 encoder |
+| `src/live/webrtc.rs`, `src/live/webrtc/encoder.rs` | Browser LAN ICE/DTLS/RTP peers and encode worker |
+| `src/live/h264.rs` | Shared adaptive H.264 encoder and frame conversion |
+| `src/live/cast.rs`, `crates/omabeam-cast/` | Cast session/capture ownership and bounded helper IPC |
+| `native/omabeam-cast/` | Pinned Open Screen discovery, authentication and native mirroring transport |
 | `crates/omabeam-encoder/` | Bounded pipe protocol and isolated FFmpeg hardware encoder helper |
 | `src/localsend.rs` | Discovery and viewer-link sending |
 | `src/hypr/` and `src/hypr.rs` | Hyprland IPC and picker positioning |
@@ -89,8 +98,8 @@ State and logs live under `$XDG_RUNTIME_DIR/omabeam/`. The directory is created
 required (no `/tmp` fallback). Incomplete or oversized session files are
 rejected. Ended-session details remain until a new share or `--stop`.
 Hyprland queries use its command socket directly. `--stop` signals only a
-process whose pidfd still matches the recorded start time, uid, and `--live`
-or `--demo` command. Replacing the plugin binary while a share is running
+process whose pidfd still matches the recorded start time, uid, and `--live`,
+`--demo`, `--cast`, `--cast-demo` or `--cast-test` command. Replacing the plugin binary while a share is running
 leaves `/proc/<pid>/exe` as `omabeam (deleted)`; that still matches. The bar
 gives `--stop` 20 seconds so the 10-second graceful wait and display recovery
 can finish after a shell or plugin reload.

@@ -178,6 +178,10 @@ impl LiveConfig {
                         && !matches!(
                             other,
                             "--live"
+                                | "--cast"
+                                | "--cast-devices"
+                                | "--cast-demo"
+                                | "--cast-test"
                                 | "--demo"
                                 | "--demo-picker"
                                 | "--picker"

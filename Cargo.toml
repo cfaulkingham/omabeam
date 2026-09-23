@@ -9,7 +9,7 @@ repository = "https://github.com/cfaulkingham/omabeam"
 readme = "README.md"
 
 [workspace]
-members = ["crates/omabeam-capture", "crates/omabeam-encoder"]
+members = ["crates/omabeam-capture", "crates/omabeam-encoder", "crates/omabeam-cast"]
 default-members = [".", "crates/omabeam-encoder"]
 exclude = ["vendor/localsend"]
 resolver = "3"
@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
 omabeam-capture = { path = "crates/omabeam-capture" }
+omabeam-cast = { path = "crates/omabeam-cast" }
 omabeam-encoder = { path = "crates/omabeam-encoder", default-features = false }
 openh264 = "0.9.8"
 str0m = "0.23.1"

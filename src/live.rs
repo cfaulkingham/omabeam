@@ -1,8 +1,10 @@
 //! Capture orchestration and local session lifecycle. HTTP and viewer state are
 //! independent of the compositor, so the same path can be exercised by --demo.
+pub mod cast;
 mod config;
 mod desktop;
 mod diagnostics;
+mod h264;
 mod http;
 mod signals;
 mod state;
@@ -10,7 +12,7 @@ pub(crate) mod status;
 #[cfg(test)]
 mod tests;
 mod webrtc;
-pub use webrtc::probe_encoder;
+pub use h264::probe as probe_encoder;
 
 use crate::{capture::CaptureRequest, portal::Selection};
 use anyhow::{Context, Result, bail, ensure};
@@ -514,7 +516,7 @@ fn publish_frame(
         encode_started_at,
     };
     let raw = config.webrtc.then(|| {
-        Arc::new(webrtc::RawFrame {
+        Arc::new(h264::RawFrame {
             frame,
             config: config.clone(),
             captured_at: encode_started_at,

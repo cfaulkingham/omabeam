@@ -19,7 +19,7 @@ BINDINGS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
 SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 BIN="$PLUGIN_DIR/omarchy-plugin/omabeam"
 BIND_KEYS="SUPER + SHIFT + T"
-USAGE="Usage: ./install.sh [--backend-only|--remove-desktop|--check-ports] [--subnet CIDR|--open-firewall CIDR]"
+USAGE="Usage: ./install.sh [--backend-only|--remove-desktop|--check-ports] [--with-cast] [--subnet CIDR|--open-firewall CIDR]"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -27,10 +27,12 @@ BACKEND_ONLY=false
 REMOVE_DESKTOP=false
 CHECK_PORTS=false
 OPEN_FIREWALL=false
+WITH_CAST=false
 MODE=install
 FIREWALL_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --with-cast) WITH_CAST=true; shift ;;
     --backend-only|--remove-desktop|--check-ports)
       [[ $MODE == install ]] || { echo "$USAGE" >&2; exit 2; }
       MODE=$1
@@ -51,10 +53,15 @@ while [[ $# -gt 0 ]]; do
       echo "--check-ports checks without building, installing, or changing rules; sudo authentication is available in a terminal."
       echo "--subnet CIDR checks (and, during install, opens) access from a specific viewer subnet."
       echo "--open-firewall CIDR adds persistent UFW rules for that subnet and fails if they cannot be verified."
+      echo "--with-cast builds the optional native Google Cast helper from pinned sources (large download and build)."
       exit 0 ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
 done
+if $WITH_CAST && { $REMOVE_DESKTOP || $CHECK_PORTS; }; then
+  echo "--with-cast applies only to an installation." >&2
+  exit 2
+fi
 if $REMOVE_DESKTOP && [[ ${#FIREWALL_ARGS[@]} -gt 0 ]]; then
   echo "--remove-desktop cannot be combined with firewall options." >&2
   exit 2
@@ -311,8 +318,27 @@ if [[ -f $ROOT/Cargo.toml ]]; then
     echo "WARNING: Hardware encoder helper could not be built. Auto mode can use software H.264."
     echo "On Omarchy, install ffmpeg (including its development files) and rerun this installer for GPU encoding."
   fi
+  if $WITH_CAST; then
+    for tool in python3 git pkg-config; do need "$tool"; done
+    CAST_CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/omabeam/cast"
+    echo "==> building the optional native Google Cast helper"
+    python3 "$ROOT/scripts/build-cast.py" --sync --cache "$CAST_CACHE"
+    install -m 755 "$CAST_CACHE/openscreen/out/omabeam/omabeam-cast" "$ROOT/omarchy-plugin/native/bin/omabeam-cast"
+    mkdir -p "$ROOT/licenses/cast"
+    cp -R "$CAST_CACHE/notices/." "$ROOT/licenses/cast/"
+  fi
 elif [[ ! -x $NATIVE ]]; then
   echo "install.sh: this bundle has neither source nor a native binary." >&2
+  exit 1
+fi
+CAST_NATIVE="$ROOT/omarchy-plugin/native/bin/omabeam-cast"
+if [[ -x $CAST_NATIVE ]]; then
+  case "$("$CAST_NATIVE" --version)" in
+    "omabeam-cast protocol=1 "*) ;;
+    *) echo "install.sh: incompatible native Cast helper; rebuild it with --with-cast." >&2; exit 1 ;;
+  esac
+elif $WITH_CAST; then
+  echo "install.sh: this bundle does not include the native Cast helper." >&2
   exit 1
 fi
 "$NATIVE" --help >/dev/null || {
