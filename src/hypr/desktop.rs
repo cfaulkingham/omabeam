@@ -1,4 +1,5 @@
 //! A session-owned Hyprland output; no persistent compositor configuration.
+//! Removal reloads Hyprland's configuration to drop the temporary monitor pins.
 use super::{Monitor, ipc::Ipc, parse_monitors};
 use crate::live::status;
 use anyhow::{Context, Result, ensure};
@@ -252,7 +253,6 @@ impl VirtualDisplay {
             .into_iter()
             .filter(|m| m.name != self.name())
             .collect();
-        pin_outputs(&self.ipc, &others)?;
         let (x, y) = config.placement(&others)?;
         self.ipc
             .command(&extra_command(self.name(), config, x, y)?)
@@ -298,7 +298,19 @@ impl VirtualDisplay {
                 "Hyprland still reports the extended display after removal"
             );
         }
+        // Use this display's own recorded compositor, not the current
+        // environment: recovery can target a session other than this one.
+        // A failed reload leaves the temporary pins in place until the next
+        // reload, but the output is still gone, so warn instead of failing
+        // the whole removal.
+        let reloaded = self.ipc.command("reload");
         status::clear_display_state();
+        if let Err(error) = reloaded {
+            eprintln!(
+                "Removed extended display {}, but Hyprland did not reload its configuration ({error:#}). Run hyprctl reload to restore your monitor settings.",
+                self.name()
+            );
+        }
         Ok(())
     }
 }
@@ -326,8 +338,11 @@ pub(crate) fn recover() -> Result<bool> {
         serde_json::from_slice(&raw).context("invalid extended display recovery file")?;
     owned.validate()?;
     let ipc = Ipc::for_instance(&owned.instance)?;
-    if !ipc.socket_exists()? {
-        // The compositor has exited; its virtual outputs no longer exist.
+    if !ipc.is_listening()? {
+        // Nothing accepted the connection: crashed or exited, its virtual
+        // outputs are gone either way. A socket that accepts connections but
+        // then fails or times out is a live, unresponsive compositor, so that
+        // error propagates instead and the record is kept for a later retry.
         status::clear_display_state();
         return Ok(true);
     }

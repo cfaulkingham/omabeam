@@ -173,7 +173,11 @@ the previous mode and reports the failure in the viewer.
 Stop sharing from the bar, or run `omabeam --stop`, to remove the extra display.
 Closing or disconnecting the viewer leaves it available for reconnection.
 Hyprland returns its workspaces to remaining displays when the output is removed.
-OmaBeam leaves physical monitor settings and Hyprland configuration files alone.
+While the extra display exists, OmaBeam holds your physical monitors at their
+current positions so Hyprland's automatic placement cannot move them. Removing
+the display reloads your Hyprland configuration, which restores your own
+monitor rules and also discards settings changed at runtime (for example with
+`hyprctl keyword`). OmaBeam never edits Hyprland configuration files.
 If the process is killed, `--stop` or the next share retries cleanup using the
 saved display record.
 

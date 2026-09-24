@@ -53,6 +53,11 @@ class Compositor:
                 with client:
                     request = client.recv(8192).decode()
                     self.commands.append(request)
+                    if not request:
+                        # is_listening() only probes that something accepts the
+                        # connection: it connects and disconnects without
+                        # writing a request, expecting no reply.
+                        continue
                     reply = 'ok'
                     if request in ('j/monitors', 'j/monitors all'):
                         reply = json.dumps(list(self.outputs.values()))
@@ -91,6 +96,8 @@ class Compositor:
                             reply = 'remove failed'
                         else:
                             self.outputs.pop(name, None)
+                    elif request == '/reload':
+                        pass  # reply stays 'ok'; recorded in commands like every request
                     else:
                         raise AssertionError(f'unexpected IPC request: {request}')
                     try:
@@ -134,11 +141,17 @@ class ExtendedDesktop(unittest.TestCase):
         commands = self.compositor.commands
         create = next(i for i, command in enumerate(commands) if command.startswith('/output create headless '))
         pins = [i for i, command in enumerate(commands) if 'output = "DP-1"' in command]
-        self.assertTrue(pins and pins[0] < create, commands)
+        # create() pins once, before creating the output; resize() no longer re-pins.
+        self.assertEqual(len(pins), 1, commands)
+        self.assertLess(pins[0], create, commands)
         self.assertIn('position = "0x0"', commands[pins[0]])
         self.assertTrue(any('position = "-1280x0"' in command for command in commands))
         self.assertEqual(list(self.compositor.outputs), ['DP-1'])
         self.assertFalse(self.journal.exists())
+        removes = [i for i, command in enumerate(commands) if command.startswith('/output remove ')]
+        self.assertTrue(removes, commands)
+        self.assertEqual(commands[-1], '/reload')
+        self.assertLess(removes[-1], commands.index('/reload'), commands)
 
     def test_create_or_configuration_rejection_rolls_back(self):
         for flag in ('fail_create', 'fail_config'):
@@ -154,11 +167,17 @@ class ExtendedDesktop(unittest.TestCase):
         result = self.start()
         self.assertIn('Run omabeam --stop', result.stderr)
         self.assertTrue(self.journal.exists())
+        self.assertNotIn('/reload', self.compositor.commands)
         self.compositor.fail_remove = False
         result = self.run_cli('--stop')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(self.compositor.outputs), ['DP-1'])
         self.assertFalse(self.journal.exists())
+        commands = self.compositor.commands
+        removes = [i for i, command in enumerate(commands) if command.startswith('/output remove ')]
+        self.assertTrue(removes, commands)
+        self.assertEqual(commands[-1], '/reload')
+        self.assertLess(removes[-1], commands.index('/reload'), commands)
 
     def test_killed_start_is_recovered_by_stop_even_from_a_different_session(self):
         self.compositor.hold_create = True
@@ -179,6 +198,34 @@ class ExtendedDesktop(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(self.compositor.outputs), ['DP-1'])
         self.assertFalse(self.journal.exists())
+        commands = self.compositor.commands
+        removes = [i for i, command in enumerate(commands) if command.startswith('/output remove ')]
+        self.assertTrue(removes, commands)
+        self.assertEqual(commands[-1], '/reload')
+        self.assertLess(removes[-1], commands.index('/reload'), commands)
+
+    def test_stale_compositor_socket_is_treated_as_exited(self):
+        # A crashed compositor leaves its socket file behind (Rust does not
+        # unlink on drop either); connecting to it must fail fast rather than
+        # hang, and must be treated the same as a missing socket.
+        name = 'OMABEAM-' + '0123456789abcdef' * 2
+        crashed = self.root / 'hypr/crashed-session'
+        crashed.mkdir(parents=True)
+        stale = socket.socket(socket.AF_UNIX)
+        stale.bind(str(crashed / '.socket.sock'))
+        stale.close()
+
+        self.journal.parent.mkdir(mode=0o700, exist_ok=True)
+        self.journal.write_text(json.dumps(dict(name=name, instance='crashed-session')))
+        self.journal.chmod(0o600)
+
+        result = self.run_cli('--stop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.journal.exists())
+        self.assertEqual(self.compositor.commands, [])
+
+        result = self.run_cli('--stop')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_start_and_stop_refuse_to_mutate_while_another_session_holds_lock(self):
         directory = self.root / 'omabeam'

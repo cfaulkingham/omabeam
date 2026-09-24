@@ -105,15 +105,18 @@ gives `--stop` 20 seconds so the 10-second graceful wait and display recovery
 can finish after a shell or plugin reload.
 
 Extended desktop sessions create a random `OMABEAM-` output through socket1,
-pin existing monitors to their current coordinates, configure the extra output
-with `eval hl.monitor(...)`, verify its layout, and capture that named output.
-Pinning keeps Omarchy's catch-all `position = "auto"` from shoving physical
-displays aside when the extra screen is attached. A session lock serializes
-startup and recovery. A private `display.json` records the exact output and
-compositor instance before creation.
-Failed starts and graceful termination remove the owned output after capture
-stops. Recovery after a forced kill uses that record, never a prefix scan of
-monitors. If removal fails, the record remains for `omabeam --stop` to retry.
+pin existing monitors to their current coordinates once at creation, configure
+the extra output with `eval hl.monitor(...)`, verify its layout, and capture
+that named output. Pinning keeps Omarchy's catch-all `position = "auto"` from
+shoving physical displays aside when the extra screen is attached. A session
+lock serializes startup and recovery. A private `display.json` records the
+exact output and compositor instance before creation.
+Failed starts, graceful termination, and recovery all remove the owned output
+after capture stops, then reload Hyprland's configuration so the user's own
+monitor rules replace the temporary pins. Recovery after a forced kill uses
+that record, never a prefix scan of monitors; a recorded compositor whose
+socket is missing or refuses connections is treated as already exited. If
+removal fails, the record remains for `omabeam --stop` to retry.
 The small `session.lock` file remains in the runtime directory; its inode must
 not be removed while a session might hold a lock.
 

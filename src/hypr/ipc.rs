@@ -42,8 +42,27 @@ impl Ipc {
         })
     }
 
-    pub(super) fn socket_exists(&self) -> Result<bool> {
-        Ok(self.path.try_exists()?)
+    /// A socket file can outlive the compositor that crashed: unlike a clean
+    /// exit, nothing unlinks it. Connecting distinguishes a live compositor
+    /// from that stale file without paying a full request round trip.
+    pub(super) fn is_listening(&self) -> Result<bool> {
+        match UnixStream::connect(&self.path) {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "could not check whether Hyprland is listening at {}",
+                    self.path.display()
+                )
+            }),
+        }
     }
 
     pub(super) fn query(&self, command: &str) -> Result<String> {
@@ -199,6 +218,30 @@ mod tests {
             assert!(socket_path(Some(OsStr::new(invalid)), None, 1000).is_err());
         }
         assert!(socket_path(signature, Some(OsStr::new("relative")), 1000).is_err());
+    }
+
+    #[test]
+    fn is_listening_distinguishes_live_stale_and_missing_sockets() {
+        // macOS's default TMPDIR is often too long for a Unix socket path
+        // (sun_path is capped around 104 bytes); /tmp keeps it short, as the
+        // `peer` helper below also relies on.
+        let dir = tempfile::Builder::new()
+            .prefix("ts-ipc-listen-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join(".socket.sock");
+
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(Ipc { path: path.clone() }.is_listening().unwrap());
+        drop(listener);
+
+        // Rust's UnixListener does not unlink its socket file on drop, so the
+        // path still exists but nothing is bound behind it: a crashed
+        // compositor leaves exactly this behind.
+        assert!(!Ipc { path: path.clone() }.is_listening().unwrap());
+
+        let missing = dir.path().join("missing.sock");
+        assert!(!Ipc { path: missing }.is_listening().unwrap());
     }
 
     // Real Unix listeners test framing and acknowledgements without changing
