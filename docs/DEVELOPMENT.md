@@ -655,7 +655,9 @@ helper-failure coverage.
 ### Nearby sending
 
 Send nearby (`--send-link`) opens its own window with app id `omabeam-send`;
-only class `omabeam` counts as the picker. OmaBeam runs no LocalSend server,
+only class `omabeam` counts as the picker. The window is split: the QR code and share link are on the left, and
+numbered LocalSend computers are on the right. With none in range, the right
+side shows the LocalSend icon and the text "Open LocalSend on the client device." OmaBeam runs no LocalSend server,
 so it discovers devices as one that cannot receive: targeted discovery,
 subnet scans, and answers to announcements confirm peers with `GET /info` and
 never register OmaBeam with them. A 401 to prepare-upload shows a masked PIN

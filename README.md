@@ -177,9 +177,10 @@ The browser offers pause/resume, snapshots, fullscreen, and fit controls.
 Regular shares support multiple viewers. Stop sharing from the bar when done;
 closing a viewer alone does not stop the host share.
 
-Nearby sending requires a LocalSend-compatible app on the receiving device.
-If it requires a PIN, the send window asks for it. OmaBeam only sends links;
-it does not appear as a receiving device.
+The send window puts the QR code and link on the left, and numbered LocalSend
+computers on the right. If none is open, the right side shows the LocalSend
+icon and how to open that app. If the receiver requires a PIN, the window asks
+for it. OmaBeam only sends links; it does not appear as a receiving device.
 
 ### Quality and video
 

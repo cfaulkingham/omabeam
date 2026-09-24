@@ -179,7 +179,8 @@ Keys:
 Live share closes this window so you can use the tile. OmaBeam then
 scans the LAN and can send the link with the LocalSend protocol — the
 LocalSend app is not required on this machine. The other computer needs
-OmaSend or LocalSend open to accept. The Omarchy bar screen icon stays
+OmaSend or LocalSend open to accept. The send window can also copy the
+link or show a QR code. The Omarchy bar screen icon stays
 active; open it to copy the URL, send it again, or stop sharing.
 "
     );

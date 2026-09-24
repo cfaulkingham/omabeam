@@ -430,7 +430,7 @@ path.chmod(0o755)
         send_rule = upgraded[upgraded.index('o.window("omabeam-send", {'):]
         self.assertIn("float = true", send_rule)
         self.assertIn("center = true", send_rule)
-        self.assertIn("size = { 440, 560 }", send_rule)
+        self.assertIn("size = { 760, 560 }", send_rule)
         # After the picker's rule, so the send window's size wins even where
         # the picker's class would also match it.
         self.assertLess(upgraded.index('o.window("omabeam", {'), upgraded.index('o.window("omabeam-send", {'))

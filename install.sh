@@ -138,7 +138,7 @@ o.window("omabeam-send", {
   center = true,
   focus_on_activate = false,
   animation = "popin",
-  size = { 440, 560 },
+  size = { 760, 560 },
 })
 """
 BIND = (
