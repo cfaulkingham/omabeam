@@ -4,7 +4,32 @@ on:
 permissions:
   contents: read
 jobs:
+  arch-encoder:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Arch build dependencies
+        run: pacman -Sy --noconfirm archlinux-keyring && pacman -Syu --noconfirm --needed base-devel clang ffmpeg git pkgconf rust
+      - uses: actions/checkout@v4
+      - run: cargo test --locked -p omabeam-encoder
+      - run: cargo build --release --locked -p omabeam-encoder
+      - name: Verify the helper resolves against Arch FFmpeg
+        run: |
+          ldd target/release/omabeam-encoder > target/release/omabeam-encoder.libraries.txt
+          pacman -Q ffmpeg >> target/release/omabeam-encoder.libraries.txt
+          if grep -q 'not found' target/release/omabeam-encoder.libraries.txt; then
+            echo "::error::omabeam-encoder failed to resolve a shared library against Arch FFmpeg"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-encoder-helper
+          path: |
+            target/release/omabeam-encoder
+            target/release/omabeam-encoder.libraries.txt
+          if-no-files-found: error
   linux-bundle:
+    needs: arch-encoder
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -34,10 +59,18 @@ jobs:
         run: |
           cargo install cargo-bundle-licenses --locked
           cargo bundle-licenses --format yaml --output target/THIRDPARTY.yml
+      - name: Download Arch-built encoder helper
+        uses: actions/download-artifact@v4
+        with:
+          name: arch-encoder-helper
+          path: target/arch-encoder
+      - run: chmod 755 target/arch-encoder/omabeam-encoder
       - name: Assemble plugin and native app
         run: |
-          python scripts/package-plugin.py --binary target/release/omabeam --encoder-helper target/release/omabeam-encoder --cast-helper target/release/omabeam-cast --cast-licenses target/native-cast/notices --target x86_64-unknown-linux-gnu --licenses target/THIRDPARTY.yml
-          ldd target/release/omabeam target/release/omabeam-encoder target/release/omabeam-cast > dist/linux-runtime-libraries.txt
+          python scripts/package-plugin.py --binary target/release/omabeam --encoder-helper target/arch-encoder/omabeam-encoder --cast-helper target/release/omabeam-cast --cast-licenses target/native-cast/notices --target x86_64-unknown-linux-gnu --licenses target/THIRDPARTY.yml
+          ldd target/release/omabeam target/release/omabeam-cast > dist/linux-runtime-libraries.txt
+          echo "## omabeam-encoder (built and resolved on Arch Linux)" >> dist/linux-runtime-libraries.txt
+          cat target/arch-encoder/omabeam-encoder.libraries.txt >> dist/linux-runtime-libraries.txt
       - uses: actions/upload-artifact@v4
         with:
           name: omabeam-omarchy-linux-x86_64

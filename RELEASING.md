@@ -87,11 +87,18 @@ not diagnose Cast. See the [Cast network checks](docs/NATIVE-CAST-STATUS.md#netw
 
 Keep the versions aligned in `manifest.json` and `Cargo.toml`. Run the
 **Package OmaBeam** workflow on the release commit. It builds and tests
-Linux x86_64, then uploads an archive, SHA-256 checksum, and runtime-library
-report. It does not publish automatically.
+Linux x86_64, building the hardware helper in an Arch Linux container so it
+links the FFmpeg Omarchy ships, then uploads an archive, SHA-256 checksum,
+and runtime-library report. It does not publish automatically.
 
-To build locally on Linux with Python 3.11+, Rust, and the dependencies in
-[Development](docs/DEVELOPMENT.md):
+A bundle's helper matches the FFmpeg major version current on Arch when it
+was built. Rebuild bundles after Arch moves FFmpeg to a new major version, or
+the installer will warn that the helper cannot load. Source installs are
+unaffected: they always build the helper against the machine's own FFmpeg.
+
+To build a bundle locally, use an Arch or Omarchy machine with Python 3.11+,
+Rust, and the dependencies in [Development](docs/DEVELOPMENT.md), so the
+packaged helper matches Omarchy's FFmpeg:
 
 ```bash
 cargo build --release --locked
