@@ -14,7 +14,7 @@ use crate::capture::{
 };
 use crate::hypr::{Client, Monitor, Snapshot, hide_picker, restore_picker};
 use crate::layout::{Tile, nearest_in_direction, tiles_for};
-use crate::live::{LiveConfig, LiveSource, spawn_daemon};
+use crate::live::{LiveConfig, LiveSource, prefs::StreamPrefs, spawn_daemon};
 use crate::portal::{PortalWindow, Selection, parse_window_list};
 
 mod brand;
@@ -77,6 +77,8 @@ pub struct Options {
     pub allow_token: bool,
     pub live_config: LiveConfig,
     pub fps_explicit: bool,
+    /// Remembered standalone-picker choices; empty for portal and demo pickers.
+    pub stream_prefs: StreamPrefs,
 }
 
 impl Options {
@@ -101,6 +103,7 @@ impl Options {
             allow_token,
             fps_explicit: live_config.fps != LiveConfig::default().fps,
             live_config,
+            stream_prefs: StreamPrefs::default(),
         })
     }
 }
@@ -191,6 +194,7 @@ pub struct OmaBeam {
     selected_window: Option<String>,
     selected_output: Option<String>,
     live_config: LiveConfig,
+    stream_prefs: StreamPrefs,
     cast_mode: bool,
     browser_config: Option<(LiveConfig, crate::hypr::desktop::DesktopConfig, bool)>,
     cast_receivers: Vec<omabeam_cast::Receiver>,
@@ -198,6 +202,10 @@ pub struct OmaBeam {
     cast_scanning: bool,
     cast_error: Option<String>,
     fps_selected: bool,
+    /// Remembered FPS for window, screen, and area sharing.
+    base_fps: u32,
+    /// Settings to restore when the picker leaves the Extend page.
+    extend_saved: Option<ExtendSaved>,
     desktop_config: crate::hypr::desktop::DesktopConfig,
     follow_workspace: bool,
     status: SharedString,
@@ -399,6 +407,7 @@ impl OmaBeam {
             Ok(worker) => (Some(worker), None),
             Err(error) => (None, Some(format!("Could not start preview: {error}"))),
         };
+        let (fps_selected, base_fps) = starting_fps(options.fps_explicit, &options.stream_prefs);
 
         Self {
             focus,
@@ -411,8 +420,11 @@ impl OmaBeam {
             workspace_id,
             selected_window,
             selected_output,
-            fps_selected: options.fps_explicit,
+            fps_selected,
+            base_fps,
+            extend_saved: None,
             live_config: options.live_config,
+            stream_prefs: options.stream_prefs,
             cast_mode: false,
             browser_config: None,
             cast_receivers: Vec::new(),
@@ -925,21 +937,15 @@ impl OmaBeam {
     }
 
     fn select_page(&mut self, page: Page) {
-        if !self.fps_selected {
-            self.live_config.set_fps(if self.cast_mode {
-                30
-            } else if page == Page::Extend {
-                60
-            } else {
-                15
-            });
-        }
-        if page == Page::Extend && self.page != Page::Extend {
-            // A second screen should show the host pointer and retain its
-            // configured pixel resolution, including a 2× desktop scale.
-            self.live_config.cursor = true;
-            self.live_config.pixel_mode = omabeam_capture::PixelMode::Native;
-        }
+        apply_page_defaults(
+            &mut self.live_config,
+            &mut self.extend_saved,
+            self.page,
+            page,
+            self.cast_mode,
+            self.fps_selected,
+            self.base_fps,
+        );
         self.page = page;
     }
 
@@ -959,6 +965,70 @@ impl OmaBeam {
                 (count > 0).then_some((workspace.id, workspace.name.clone(), count))
             })
             .collect()
+    }
+}
+
+/// The picker's starting `(fps_selected, base_fps)`. Only `--fps` chooses a
+/// rate; a remembered one is the base rate, so Extend still starts at 60 FPS.
+fn starting_fps(cli_fps: bool, prefs: &StreamPrefs) -> (bool, u32) {
+    (cli_fps, prefs.valid_fps().unwrap_or(15))
+}
+
+/// Stream settings that entering the Extend page replaced. Leaving the page
+/// restores them, so choices made there stay on that page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExtendSaved {
+    cursor: bool,
+    pixel_mode: omabeam_capture::PixelMode,
+    /// `None` when entered in Cast mode, which keeps its width.
+    max_width: Option<Option<u32>>,
+}
+
+/// Automatic stream settings for a page change; never remembered. `base_fps`
+/// is the rate for window, screen, and area sharing. `saved` holds what
+/// entering Extend replaced until the picker leaves that page.
+fn apply_page_defaults(
+    config: &mut LiveConfig,
+    saved: &mut Option<ExtendSaved>,
+    from: Page,
+    to: Page,
+    cast_mode: bool,
+    fps_selected: bool,
+    base_fps: u32,
+) {
+    if !fps_selected {
+        config.set_fps(if cast_mode {
+            30
+        } else if to == Page::Extend {
+            60
+        } else {
+            base_fps
+        });
+    }
+    if to == Page::Extend && from != Page::Extend {
+        *saved = Some(ExtendSaved {
+            cursor: config.cursor,
+            pixel_mode: config.pixel_mode,
+            max_width: (!cast_mode).then_some(config.max_width),
+        });
+        // A second screen should show the host pointer and retain its
+        // configured pixel resolution, including a 2× desktop scale.
+        config.cursor = true;
+        config.pixel_mode = omabeam_capture::PixelMode::Native;
+        // Cast keeps its width: it selects the 720p or 1080p canvas.
+        if !cast_mode {
+            config.max_width = None;
+        }
+    } else if from == Page::Extend
+        && to != Page::Extend
+        && let Some(before) = saved.take()
+    {
+        config.cursor = before.cursor;
+        config.pixel_mode = before.pixel_mode;
+        // The destination can change on the Extend page; Cast keeps its canvas.
+        if !cast_mode && let Some(max_width) = before.max_width {
+            config.max_width = max_width;
+        }
     }
 }
 
@@ -1073,6 +1143,7 @@ pub fn open(options: Options) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omabeam_capture::PixelMode::{self, Logical, Native};
 
     #[test]
     fn demo_picker_cannot_be_combined_with_portal_mode() {
@@ -1104,6 +1175,217 @@ mod tests {
         assert_eq!(Page::from_index(2), Page::Region);
         assert_eq!(Page::from_index(3), Page::Extend);
         assert_eq!(Page::Extend.index(), 3);
+    }
+
+    #[test]
+    fn extend_starts_at_60_fps_and_full_resolution_while_other_pages_keep_the_base_rate() {
+        // Remembered 30 FPS with a 1280-pixel cap, cursor off, logical pixels.
+        let mut config = LiveConfig {
+            max_width: Some(1280),
+            ..LiveConfig::default()
+        };
+        config.set_fps(30);
+        let mut saved = None;
+        apply_page_defaults(
+            &mut config,
+            &mut saved,
+            Page::Outputs,
+            Page::Tiles,
+            false,
+            false,
+            30,
+        );
+        assert_eq!(config.fps, 30);
+        assert_eq!(config.max_width, Some(1280));
+        apply_page_defaults(
+            &mut config,
+            &mut saved,
+            Page::Tiles,
+            Page::Extend,
+            false,
+            false,
+            30,
+        );
+        assert_eq!(config.fps, 60);
+        assert_eq!(config.h264_bitrate, LiveConfig::default_h264_bitrate(60));
+        assert!(config.cursor);
+        assert_eq!(config.pixel_mode, omabeam_capture::PixelMode::Native);
+        assert_eq!(config.max_width, None);
+        apply_page_defaults(
+            &mut config,
+            &mut saved,
+            Page::Extend,
+            Page::Windows,
+            false,
+            false,
+            30,
+        );
+        assert_eq!(config.fps, 30);
+        assert_eq!(config.h264_bitrate, LiveConfig::default_h264_bitrate(30));
+    }
+
+    #[test]
+    fn a_chosen_fps_is_kept_on_every_page() {
+        for cast_mode in [false, true] {
+            let mut config = LiveConfig::default();
+            config.set_fps(24);
+            let mut saved = None;
+            let mut from = Page::Tiles;
+            for to in [
+                Page::Windows,
+                Page::Outputs,
+                Page::Region,
+                Page::Extend,
+                Page::Tiles,
+            ] {
+                apply_page_defaults(&mut config, &mut saved, from, to, cast_mode, true, 30);
+                assert_eq!(config.fps, 24, "{from:?} to {to:?}, cast {cast_mode}");
+                from = to;
+            }
+        }
+    }
+
+    #[test]
+    fn cast_uses_30_fps_on_every_page_and_keeps_its_canvas_width() {
+        for page in [
+            Page::Tiles,
+            Page::Windows,
+            Page::Outputs,
+            Page::Region,
+            Page::Extend,
+        ] {
+            let mut config = LiveConfig {
+                max_width: Some(1920),
+                ..LiveConfig::default()
+            };
+            apply_page_defaults(&mut config, &mut None, Page::Tiles, page, true, false, 15);
+            assert_eq!(config.fps, 30, "{page:?}");
+            // The width selects the 1080p Cast canvas, not a cap on the desktop.
+            assert_eq!(config.max_width, Some(1920), "{page:?}");
+        }
+    }
+
+    /// Page changes as `OmaBeam::select_page` makes them, with no chosen FPS.
+    struct Picker {
+        config: LiveConfig,
+        saved: Option<ExtendSaved>,
+        page: Page,
+        cast_mode: bool,
+    }
+
+    impl Picker {
+        /// On Tiles with the cursor off, logical pixels, and `max_width`.
+        fn new(max_width: Option<u32>, cast_mode: bool) -> Self {
+            let config = LiveConfig {
+                max_width,
+                ..LiveConfig::default()
+            };
+            Self {
+                config,
+                saved: None,
+                page: Page::Tiles,
+                cast_mode,
+            }
+        }
+
+        /// Select `page`, then return the cursor, pixel mode, and width.
+        fn select(&mut self, page: Page) -> (bool, PixelMode, Option<u32>) {
+            apply_page_defaults(
+                &mut self.config,
+                &mut self.saved,
+                self.page,
+                page,
+                self.cast_mode,
+                false,
+                15,
+            );
+            self.page = page;
+            (
+                self.config.cursor,
+                self.config.pixel_mode,
+                self.config.max_width,
+            )
+        }
+    }
+
+    #[test]
+    fn leaving_extend_restores_the_cursor_pixels_and_width_it_replaced() {
+        let mut picker = Picker::new(Some(1280), false);
+        assert_eq!(picker.select(Page::Extend), (true, Native, None));
+        assert_eq!(picker.select(Page::Tiles), (false, Logical, Some(1280)));
+    }
+
+    #[test]
+    fn every_page_after_extend_restores_and_each_visit_saves_afresh() {
+        for page in [Page::Windows, Page::Outputs, Page::Region] {
+            let mut picker = Picker::new(Some(1280), false);
+            picker.select(Page::Extend);
+            assert_eq!(
+                picker.select(page),
+                (false, Logical, Some(1280)),
+                "{page:?}"
+            );
+            assert_eq!(picker.saved, None, "{page:?}");
+        }
+        // Choices made after one visit are what the next visit restores.
+        let mut picker = Picker::new(Some(1280), false);
+        picker.select(Page::Extend);
+        picker.select(Page::Windows);
+        picker.config.cursor = true;
+        picker.config.max_width = Some(1920);
+        picker.select(Page::Extend);
+        assert_eq!(picker.select(Page::Outputs), (true, Logical, Some(1920)));
+        assert_eq!(picker.saved, None);
+    }
+
+    #[test]
+    fn selecting_extend_again_keeps_the_choices_made_there() {
+        let mut picker = Picker::new(Some(1280), false);
+        picker.select(Page::Extend);
+        let saved = picker.saved;
+        assert_eq!(picker.select(Page::Extend), (true, Native, None));
+        // The viewer turns the cursor off on the Extend page.
+        picker.config.cursor = false;
+        assert_eq!(picker.select(Page::Extend), (false, Native, None));
+        assert_eq!(picker.saved, saved);
+        assert_eq!(picker.select(Page::Tiles), (false, Logical, Some(1280)));
+    }
+
+    #[test]
+    fn cast_keeps_its_canvas_width_through_an_extend_visit() {
+        let mut picker = Picker::new(Some(1920), true);
+        assert_eq!(picker.select(Page::Extend), (true, Native, Some(1920)));
+        assert_eq!(picker.select(Page::Tiles), (false, Logical, Some(1920)));
+    }
+
+    #[test]
+    fn a_destination_switch_on_extend_keeps_each_destinations_width() {
+        // Browser link to Google Cast on the Extend page, then 1080p: leaving
+        // keeps the Cast canvas and restores the cursor and pixels.
+        let mut picker = Picker::new(None, false);
+        picker.select(Page::Extend);
+        picker.cast_mode = true;
+        picker.config.max_width = Some(1920);
+        assert_eq!(picker.select(Page::Tiles), (false, Logical, Some(1920)));
+        // Google Cast back to Browser link restores the browser settings
+        // (src/app/cast.rs); the Cast canvas width must not return as a cap.
+        let mut picker = Picker::new(Some(1280), true);
+        picker.select(Page::Extend);
+        picker.cast_mode = false;
+        picker.config = LiveConfig::default();
+        assert_eq!(picker.select(Page::Tiles), (false, Logical, None));
+    }
+
+    #[test]
+    fn only_a_command_line_fps_counts_as_chosen_at_startup() {
+        let remembered = |fps| StreamPrefs {
+            fps: Some(fps),
+            ..StreamPrefs::default()
+        };
+        assert_eq!(starting_fps(false, &remembered(30)), (false, 30));
+        assert_eq!(starting_fps(false, &StreamPrefs::default()), (false, 15));
+        assert_eq!(starting_fps(true, &remembered(30)), (true, 30));
+        assert_eq!(starting_fps(false, &remembered(500)), (false, 15));
     }
 
     #[test]

@@ -250,7 +250,7 @@ impl OmaBeam {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.screenshot_mode = !this.screenshot_mode;
                                 if this.page == Page::Extend {
-                                    this.page = Page::Outputs;
+                                    this.select_page(Page::Outputs);
                                 }
                                 this.status = "".into();
                                 cx.notify();

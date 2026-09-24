@@ -6,12 +6,12 @@ fn main() {
 }
 
 fn run() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let fps_explicit = args
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let fps_explicit = raw
         .iter()
         .take_while(|arg| *arg != "--")
         .any(|arg| arg == "--fps");
-    let (mut config, args) = omabeam::live::LiveConfig::parse_args(&args)?;
+    let (mut config, args) = omabeam::live::LiveConfig::parse_args(&raw)?;
     if matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
         omabeam::app::print_help();
         return Ok(());
@@ -134,6 +134,13 @@ fn run() -> anyhow::Result<()> {
     let mut options = omabeam::app::Options::from_args(&args, config)?;
     options.fps_explicit = fps_explicit;
     if !options.picker && !options.demo {
+        // The standalone picker starts from remembered stream settings;
+        // command-line flags still override them for this run.
+        let prefs = omabeam::live::prefs::StreamPrefs::load();
+        let mut base = omabeam::live::LiveConfig::default();
+        prefs.apply(&mut base);
+        options.live_config = omabeam::live::LiveConfig::parse_args_from(base, &raw)?.0;
+        options.stream_prefs = prefs;
         if let Some(status) = omabeam::live::current_status() {
             if status.stats.state != "ended"
                 && let Some(cast) = &status.stats.cast

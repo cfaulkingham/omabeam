@@ -46,6 +46,17 @@ impl StreamPreset {
 }
 
 impl OmaBeam {
+    /// Record an explicit Stream settings choice for the next picker session.
+    fn remember(&mut self, record: impl FnOnce(&mut StreamPrefs)) {
+        if self.picker || self.demo || self.cast_mode {
+            return;
+        }
+        record(&mut self.stream_prefs);
+        if let Err(error) = self.stream_prefs.save() {
+            eprintln!("Could not save stream settings: {error:#}");
+        }
+    }
+
     pub(super) fn render_stream_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
         if self.cast_mode {
             return div()
@@ -59,6 +70,14 @@ impl OmaBeam {
         let preset_changed = cx.listener(|this, index: &usize, _, cx| {
             StreamPreset::ALL[*index].apply(&mut this.live_config);
             this.fps_selected = true;
+            let config = this.live_config.clone();
+            this.remember(|prefs| {
+                prefs.fps = Some(config.fps);
+                prefs.quality = Some(config.quality);
+                prefs.max_width = Some(config.max_width.unwrap_or(0));
+                prefs.native_pixels = Some(config.pixel_mode == PixelMode::Native);
+                prefs.record_bitrate(&config);
+            });
             cx.notify();
         });
         let preset_menu = menu(
@@ -82,12 +101,15 @@ impl OmaBeam {
         let cursor_changed = cx.listener(|this, value: &bool, _, cx| {
             if !this.busy {
                 this.live_config.cursor = *value;
+                this.remember(|prefs| prefs.cursor = Some(*value));
                 cx.notify();
             }
         });
         let webrtc = self.live_config.webrtc;
         let transport_changed = cx.listener(|this, index: &usize, _, cx| {
-            this.live_config.webrtc = *index == 0;
+            let webrtc = *index == 0;
+            this.live_config.webrtc = webrtc;
+            this.remember(|prefs| prefs.webrtc = Some(webrtc));
             cx.notify();
         });
         let transport_menu = menu(
@@ -176,6 +198,11 @@ impl OmaBeam {
         let changed = cx.listener(move |this, index: &usize, _, cx| {
             this.live_config.set_fps(fps_values[*index]);
             this.fps_selected = true;
+            let config = this.live_config.clone();
+            this.remember(|prefs| {
+                prefs.fps = Some(config.fps);
+                prefs.record_bitrate(&config);
+            });
             cx.notify();
         });
         let fps_menu = menu(
@@ -194,7 +221,9 @@ impl OmaBeam {
         let values = [55, 72, 90];
         let quality = self.live_config.quality;
         let changed = cx.listener(move |this, index: &usize, _, cx| {
-            this.live_config.quality = values[*index];
+            let value = values[*index];
+            this.live_config.quality = value;
+            this.remember(|prefs| prefs.quality = Some(value));
             cx.notify();
         });
         let jpeg_menu = menu(
@@ -213,7 +242,9 @@ impl OmaBeam {
         let widths = [None, Some(1280), Some(1920)];
         let width = self.live_config.max_width;
         let changed = cx.listener(move |this, index: &usize, _, cx| {
-            this.live_config.max_width = widths[*index];
+            let value = widths[*index];
+            this.live_config.max_width = value;
+            this.remember(|prefs| prefs.max_width = Some(value.unwrap_or(0)));
             cx.notify();
         });
         let width_menu = menu(
@@ -232,7 +263,9 @@ impl OmaBeam {
         let modes = [PixelMode::Logical, PixelMode::Native];
         let pixel_mode = self.live_config.pixel_mode;
         let changed = cx.listener(move |this, index: &usize, _, cx| {
-            this.live_config.pixel_mode = modes[*index];
+            let mode = modes[*index];
+            this.live_config.pixel_mode = mode;
+            this.remember(|prefs| prefs.native_pixels = Some(mode == PixelMode::Native));
             cx.notify();
         });
         let pixel_menu = menu(
@@ -252,6 +285,8 @@ impl OmaBeam {
         let bitrate = self.live_config.h264_bitrate;
         let changed = cx.listener(move |this, index: &usize, _, cx| {
             this.live_config.h264_bitrate = bitrates[*index];
+            let config = this.live_config.clone();
+            this.remember(|prefs| prefs.record_bitrate(&config));
             cx.notify();
         });
         let bitrate_menu = menu(
@@ -273,7 +308,9 @@ impl OmaBeam {
             move |index, window, cx| changed(&index, window, cx),
         );
         let changed = cx.listener(|this, index: &usize, _, cx| {
-            this.live_config.encoder = EncoderMode::ALL[*index];
+            let mode = EncoderMode::ALL[*index];
+            this.live_config.encoder = mode;
+            this.remember(|prefs| prefs.encoder = Some(mode.as_str().into()));
             cx.notify();
         });
         let encoder_menu = menu(

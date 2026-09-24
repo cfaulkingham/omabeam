@@ -6,6 +6,7 @@ mod desktop;
 mod diagnostics;
 mod h264;
 mod http;
+pub mod prefs;
 mod signals;
 mod state;
 pub(crate) mod status;

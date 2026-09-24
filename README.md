@@ -122,6 +122,8 @@ Left on disk after removal:
 
 - `$XDG_RUNTIME_DIR/omabeam/` — `live.json` and `live.log` for the current
   session. These go away at logout. There is no `/tmp` fallback.
+- `~/.config/omabeam/settings.json` (or under `$XDG_CONFIG_HOME`) — stream
+  settings remembered by the picker
 - Screenshots under `$OMARCHY_SCREENSHOT_DIR/omabeam`, `$XDG_PICTURES_DIR/omabeam`,
   or `~/Pictures/omabeam/`
 - Firewall rules (including ones added during install or with `--open-firewall`) and any
@@ -147,8 +149,10 @@ when idle so it does not cover the host cursor, and enters fullscreen when the
 browser allows or when you tap the picture. Move windows onto the extra display
 using your Omarchy computer's mouse or keyboard. The extra display starts empty;
 windows and notifications placed there become visible to viewers. Native pixels
-and the host cursor are selected when entering this mode. Extended desktop defaults
-to 60 FPS; an explicitly selected frame rate or quality preset takes precedence. H.264 / WebRTC is
+and the host cursor are selected when entering this mode, and any maximum-width
+cap is removed. Leaving this mode restores the earlier pixel, cursor, and width
+settings. Extended desktop defaults to 60 FPS; an explicitly selected frame rate
+or quality preset takes precedence. H.264 / WebRTC is
 the default video transport; choose **Video transport → JPEG** if you want
 MJPEG instead. JPEG and H.264 use
 the same firewall ports as other shares.
@@ -213,7 +217,13 @@ interruptions do not stop the picture. If the host cannot be reached for about
 Defaults: 15 FPS (60 FPS for extended desktop), H.264 / WebRTC with JPEG fallback, JPEG quality 55, native
 logical width, cursor off, 4 Mbit/s at 15 FPS (16 Mbit/s at 60 FPS), and local network (TCP **9847** and UDP **9848** on
 0.0.0.0). Presets offer Balanced, Crisp text, and Smooth motion. Advanced exposes
-individual settings.
+individual settings. The picker remembers the stream settings you choose in
+`~/.config/omabeam/settings.json` (or under `$XDG_CONFIG_HOME`) and applies them
+to window, screen, and area sharing. An extended desktop uses them too, but
+still starts at 60 FPS with native pixels, the cursor, and no width cap. Flags
+that set a value, such as `--fps`, `--quality`, `--width`, or `--jpeg`, override
+remembered settings for one run; no flag turns off a remembered cursor, native
+pixels, or width cap.
 
 Crisp text uses native captured pixels at JPEG quality 90, preserving fine
 detail on HiDPI displays. Balanced and Smooth motion use logical pixels.
