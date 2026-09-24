@@ -139,7 +139,11 @@ jobs:
           python3 scripts/release-assets.py
           # Generate canonical metadata using makepkg, without building or installing.
           docker run --rm -v "$GITHUB_WORKSPACE/dist/aur:/src:ro" -w /src \
-            archlinux:latest bash -c 'useradd -m builder; su builder -s /bin/bash -c "makepkg --printsrcinfo"' \
+            archlinux:latest bash -euc '
+              useradd -m builder
+              install -o builder -g builder -m 644 /src/PKGBUILD /home/builder/PKGBUILD
+              su builder -s /bin/bash -c "cd /home/builder && makepkg --printsrcinfo"
+            ' \
             > dist/aur/.SRCINFO
           bash -n dist/aur/PKGBUILD
           tar -czf "dist/omabeam-$RELEASE_VERSION-aur.tar.gz" -C dist/aur PKGBUILD .SRCINFO
