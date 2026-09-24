@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run inside Omarchy's native Arch / Arch Linux ARM builder as its builder user.
 set -euo pipefail
+umask 022
 cd "$(dirname "$0")/.."
 target=${1:?Usage: ci-package.sh TARGET}
 case "$target:$(uname -m)" in
