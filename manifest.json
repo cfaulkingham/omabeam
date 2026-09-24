@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.cfaulkingham.omabeam",
   "name": "OmaBeam",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Colin Faulkingham",
   "license": "MIT",
   "description": "Share a window, screen, or area from Omarchy and Hyprland. Watch in any browser and manage your share from the bar.",
