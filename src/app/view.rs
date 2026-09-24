@@ -763,11 +763,10 @@ impl OmaBeam {
                                             ButtonVariant::Secondary,
                                             cx,
                                         )
-                                        .disabled(self.busy || self.preview_pending)
+                                        .disabled(self.busy || self.preview_worker.pending())
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
-                                                this.preview_updated =
-                                                    Instant::now() - Duration::from_secs(10);
+                                                this.retry_preview();
                                                 cx.notify();
                                             }),
                                         ),

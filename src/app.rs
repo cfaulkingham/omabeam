@@ -25,7 +25,7 @@ mod preview;
 mod send;
 mod settings;
 mod view;
-use preview::{PreviewFrame, PreviewKey, PreviewWorker};
+use preview::{PreviewFrame, PreviewKey, PreviewWorker, ThumbnailWorker};
 use settings::dropdown;
 use std::{
     collections::HashMap,
@@ -214,8 +214,8 @@ pub struct OmaBeam {
     screenshot_mode: bool,
     show_advanced: bool,
     selected_region: Option<Selection>,
-    preview_worker: Option<PreviewWorker>,
-    preview_pending: bool,
+    preview_worker: PreviewWorker,
+    thumbnail_worker: ThumbnailWorker,
     preview_key: Option<PreviewKey>,
     preview_frame: Option<PreviewFrame>,
     preview_error: Option<String>,
@@ -403,10 +403,11 @@ impl OmaBeam {
             }
         })
         .detach();
-        let (preview_worker, preview_error) = match PreviewWorker::new(options.demo) {
-            Ok(worker) => (Some(worker), None),
-            Err(error) => (None, Some(format!("Could not start preview: {error}"))),
-        };
+        let mut preview_worker = preview::preview_worker(options.demo);
+        let preview_error = preview_worker
+            .start()
+            .err()
+            .map(|error| format!("Could not start preview: {error}"));
         let (fps_selected, base_fps) = starting_fps(options.fps_explicit, &options.stream_prefs);
 
         Self {
@@ -440,7 +441,7 @@ impl OmaBeam {
             show_advanced: false,
             selected_region: None,
             preview_worker,
-            preview_pending: false,
+            thumbnail_worker: preview::thumbnail_worker(options.demo),
             preview_key: None,
             preview_frame: None,
             preview_error,
@@ -705,7 +706,10 @@ impl OmaBeam {
         let operation = cx.background_executor().spawn(async { pick_region() });
         cx.spawn(async move |view, cx| {
             let result = operation.await;
-            restore_picker();
+            // Hyprland IPC stays off the UI thread; `busy` holds until it ends.
+            cx.background_executor()
+                .spawn(async { restore_picker() })
+                .await;
             let _ = view.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
@@ -777,6 +781,12 @@ impl OmaBeam {
             .spawn(async move { capture(&request, action) });
         cx.spawn(async move |view, cx| {
             let result = operation.await;
+            if result.is_err() {
+                // Hyprland IPC stays off the UI thread; `busy` holds until it ends.
+                cx.background_executor()
+                    .spawn(async { restore_picker() })
+                    .await;
+            }
             let _ = view.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
@@ -798,7 +808,6 @@ impl OmaBeam {
                         cx.quit();
                     }
                     Err(err) => {
-                        restore_picker();
                         this.status = friendly_error(&err.to_string()).into();
                         cx.notify();
                     }
@@ -881,10 +890,12 @@ impl OmaBeam {
         }
         .into();
         cx.notify();
-        hide_picker();
         let config = self.live_config.clone();
         let cast_id = self.cast_receiver_id.clone().filter(|_| self.cast_mode);
         let operation = cx.background_executor().spawn(async move {
+            // Hide the picker before capture starts; its Hyprland IPC stays off
+            // the UI thread.
+            hide_picker();
             if let Some(id) = cast_id {
                 crate::live::cast::spawn_daemon(&id, &source, &config).map(|_| None)
             } else {
@@ -893,6 +904,12 @@ impl OmaBeam {
         });
         cx.spawn(async move |view, cx| {
             let result = operation.await;
+            if result.is_err() {
+                // Hyprland IPC stays off the UI thread; `busy` holds until it ends.
+                cx.background_executor()
+                    .spawn(async { restore_picker() })
+                    .await;
+            }
             let _ = view.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
@@ -911,7 +928,6 @@ impl OmaBeam {
                         cx.quit();
                     }
                     Err(err) => {
-                        restore_picker();
                         this.status = friendly_error(&err.to_string()).into();
                         cx.notify();
                     }
@@ -1067,10 +1083,20 @@ fn friendly_error(raw: &str) -> String {
     }
 }
 
-fn desktop_notify(message: &str) {
-    let _ = std::process::Command::new("/usr/bin/notify-send")
+/// Show a desktop notification without waiting for `notify-send`, which can
+/// stall on a slow notification daemon; a throwaway thread reaps it.
+pub fn desktop_notify(message: &str) {
+    let Ok(mut child) = std::process::Command::new("/usr/bin/notify-send")
         .args(["OmaBeam", message])
-        .status();
+        .spawn()
+    else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("omabeam-notify".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 fn truncate(text: &str, max: usize) -> String {

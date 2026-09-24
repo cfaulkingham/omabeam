@@ -145,15 +145,10 @@ fn run() -> anyhow::Result<()> {
             if status.stats.state != "ended"
                 && let Some(cast) = &status.stats.cast
             {
-                let _ = std::process::Command::new("/usr/bin/notify-send")
-                    .args([
-                        "OmaBeam",
-                        &format!(
-                            "Casting to {}. Use the OmaBeam bar icon to stop.",
-                            cast.receiver_name
-                        ),
-                    ])
-                    .status();
+                omabeam::app::desktop_notify(&format!(
+                    "Casting to {}. Use the OmaBeam bar icon to stop.",
+                    cast.receiver_name
+                ));
                 return Ok(());
             }
             if status.stats.state == "ended" {
@@ -176,9 +171,7 @@ fn run() -> anyhow::Result<()> {
                 } else {
                     "A live share is already running. Use the OmaBeam bar icon to send its URL, manage it, or stop it."
                 };
-                let _ = std::process::Command::new("/usr/bin/notify-send")
-                    .args(["OmaBeam", message])
-                    .status();
+                omabeam::app::desktop_notify(message);
                 return Ok(());
             }
         }
