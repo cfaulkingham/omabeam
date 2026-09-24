@@ -264,8 +264,9 @@ async fn test_register_and_info() {
         .info(ProtocolType::Http, "127.0.0.1", server.port)
         .await
         .unwrap();
-    assert_eq!(info.alias, "Test Server");
-    assert_eq!(info.fingerprint, "server-fingerprint");
+    assert_eq!(info.body.alias, "Test Server");
+    assert_eq!(info.body.fingerprint, "server-fingerprint");
+    assert!(info.cert_fingerprint.is_none());
 }
 
 /// Old clients (v1.17 and earlier) probe unknown peers on the legacy v1 route.

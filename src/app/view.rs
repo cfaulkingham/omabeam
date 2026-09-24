@@ -250,7 +250,7 @@ impl OmaBeam {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.screenshot_mode = !this.screenshot_mode;
                                 if this.page == Page::Extend {
-                                    this.page = Page::Outputs;
+                                    this.select_page(Page::Outputs);
                                 }
                                 this.status = "".into();
                                 cx.notify();
@@ -763,11 +763,10 @@ impl OmaBeam {
                                             ButtonVariant::Secondary,
                                             cx,
                                         )
-                                        .disabled(self.busy || self.preview_pending)
+                                        .disabled(self.busy || self.preview_worker.pending())
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {
-                                                this.preview_updated =
-                                                    Instant::now() - Duration::from_secs(10);
+                                                this.retry_preview();
                                                 cx.notify();
                                             }),
                                         ),
@@ -803,13 +802,18 @@ impl OmaBeam {
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let ready = self.can_confirm() && !self.busy && !self.demo;
+        let ready = self.can_confirm()
+            && !self.busy
+            && !self.demo
+            && (!self.cast_mode || self.screenshot_mode || self.cast_receiver_id.is_some());
         let primary = if self.busy {
             "Working…"
         } else if self.picker {
             "Share with app"
         } else if self.screenshot_mode {
             "Copy screenshot"
+        } else if self.cast_mode {
+            "Start casting"
         } else if self.page == Page::Extend {
             "Extend desktop"
         } else {

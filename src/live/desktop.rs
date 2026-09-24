@@ -51,15 +51,54 @@ pub(super) type ApiResult<T> = Result<T, (&'static str, String)>;
 fn conflict() -> (&'static str, String) {
     ("409 Conflict", IN_USE.into())
 }
+fn expired() -> (&'static str, String) {
+    (
+        "412 Precondition Failed",
+        "Display connection expired; claim the display again".into(),
+    )
+}
 fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+/// Lease ids are bearer secrets: compare every byte so response timing does
+/// not reveal how much of a guessed id matched. `black_box` keeps the
+/// optimizer from reintroducing an early exit. Only the length can leak, and
+/// valid ids all have the same length.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes().zip(b.bytes()).fold(0, |difference, (x, y)| {
+            std::hint::black_box(difference | (x ^ y))
+        }) == 0
 }
 
 impl State {
     fn authorized(&self, connection: &str, now: Instant) -> bool {
         self.lease.as_ref().is_some_and(|lease| {
-            lease.connection == connection && !lease.departed && now < lease.until
+            constant_time_eq(&lease.connection, connection) && !lease.departed && now < lease.until
         })
+    }
+
+    /// This connection's lease ran out unreleased, for example during an outage
+    /// longer than the grace period. Any claim replaces the lease's connection,
+    /// so a match also means nobody has claimed the display since.
+    fn lapsed(&self, connection: &str, now: Instant) -> bool {
+        self.lease.as_ref().is_some_and(|lease| {
+            constant_time_eq(&lease.connection, connection) && !lease.departed && now >= lease.until
+        })
+    }
+
+    /// Only the lease holder may renew or resize. A page whose own lease lapsed
+    /// gets 412 and claims again through the normal claim rules; the answer
+    /// renews nothing, so it cannot take a display from anyone. Everyone else,
+    /// including a page that released its lease, gets 409.
+    fn require(&self, connection: &str, now: Instant) -> ApiResult<()> {
+        if self.authorized(connection, now) {
+            Ok(())
+        } else if self.lapsed(connection, now) {
+            Err(expired())
+        } else {
+            Err(conflict())
+        }
     }
 }
 
@@ -103,9 +142,9 @@ impl DesktopControl {
         let mut state = self.0.lock().unwrap();
         if let Some(lease) = &state.lease
             && now < lease.until
-            && (lease.client != client
-                || (!lease.departed && lease.connection != connection)
-                || (lease.departed && lease.connection == connection))
+            && (!constant_time_eq(&lease.client, client)
+                || (!lease.departed && !constant_time_eq(&lease.connection, connection))
+                || (lease.departed && constant_time_eq(&lease.connection, connection)))
         {
             return Err(conflict());
         }
@@ -126,11 +165,12 @@ impl DesktopControl {
     }
 
     pub fn heartbeat(&self, connection: &str) -> ApiResult<()> {
-        let now = Instant::now();
+        self.heartbeat_at(connection, Instant::now())
+    }
+
+    fn heartbeat_at(&self, connection: &str, now: Instant) -> ApiResult<()> {
         let mut state = self.0.lock().unwrap();
-        if !state.authorized(connection, now) {
-            return Err(conflict());
-        }
+        state.require(connection, now)?;
         state.lease.as_mut().unwrap().until = now + RECONNECT_GRACE;
         Ok(())
     }
@@ -146,10 +186,17 @@ impl DesktopControl {
     }
 
     pub fn request_size(&self, connection: &str, size: Option<(u32, u32, u32)>) -> ApiResult<()> {
+        self.request_size_at(connection, size, Instant::now())
+    }
+
+    fn request_size_at(
+        &self,
+        connection: &str,
+        size: Option<(u32, u32, u32)>,
+        now: Instant,
+    ) -> ApiResult<()> {
         let mut state = self.0.lock().unwrap();
-        if !state.authorized(connection, Instant::now()) {
-            return Err(conflict());
-        }
+        state.require(connection, now)?;
         let matched = size.is_some();
         let mut config = state.original.clone();
         if let Some((width, height, scale)) = size {
@@ -157,18 +204,10 @@ impl DesktopControl {
             config.height = height;
             config.scale = scale;
         }
+        // The CLI's rule, which also keeps every accepted size H.264-encodable.
         config
             .validate()
             .map_err(|e| ("400 Bad Request", e.to_string()))?;
-        // Both transports must support every accepted client size.
-        if matched
-            && (config.width.max(config.height) > 3840 || config.width.min(config.height) > 2160)
-        {
-            return Err((
-                "400 Bad Request",
-                "Display must fit within 3840×2160 or portrait".into(),
-            ));
-        }
         if state.applying || state.pending.is_some() {
             return Err((
                 "429 Too Many Requests",
@@ -180,14 +219,14 @@ impl DesktopControl {
         }
         if state
             .last_resize
-            .is_some_and(|at| at.elapsed() < Duration::from_millis(750))
+            .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_millis(750))
         {
             return Err((
                 "429 Too Many Requests",
                 "Please wait before resizing again".into(),
             ));
         }
-        state.last_resize = Some(Instant::now());
+        state.last_resize = Some(now);
         state.error = None;
         state.pending = Some(Resize {
             config,
@@ -288,6 +327,93 @@ mod tests {
         assert!(control.authorized(Some(OTHER)));
     }
 
+    fn status(result: ApiResult<()>) -> u16 {
+        result.map_or_else(|(status, _)| status[..3].parse().unwrap(), |()| 200)
+    }
+
+    #[test]
+    fn heartbeat_reports_a_lapsed_lease_apart_from_a_display_taken_by_another_device() {
+        let control = DesktopControl::new(DesktopConfig::default());
+        let start = Instant::now();
+        control.claim_at(CLIENT, PAGE, start).unwrap();
+        let renewed = start + RECONNECT_GRACE - Duration::from_millis(1);
+        assert_eq!(status(control.heartbeat_at(PAGE, renewed)), 200);
+        // The renewal outlives the claim's own expiry.
+        assert!(
+            control
+                .claim_at(OTHER, OTHER, start + RECONNECT_GRACE)
+                .is_err()
+        );
+        // An outage outlasted the grace period and nobody else took the display.
+        let lapsed = renewed + RECONNECT_GRACE;
+        assert_eq!(status(control.heartbeat_at(PAGE, lapsed)), 412);
+        // 412 renews nothing: another device may claim at once, and then the
+        // page faces a real conflict.
+        control.claim_at(OTHER, OTHER, lapsed).unwrap();
+        assert_eq!(status(control.heartbeat_at(PAGE, lapsed)), 409);
+        assert_eq!(status(control.claim_at(CLIENT, PAGE, lapsed)), 409);
+        assert_eq!(status(control.heartbeat_at(OTHER, lapsed)), 200);
+    }
+
+    #[test]
+    fn a_page_reclaims_its_lapsed_lease_but_a_released_one_stays_a_conflict() {
+        let control = DesktopControl::new(DesktopConfig::default());
+        let start = Instant::now();
+        control.claim_at(CLIENT, PAGE, start).unwrap();
+        let lapsed = start + RECONNECT_GRACE;
+        assert_eq!(status(control.heartbeat_at(PAGE, lapsed)), 412);
+        control.claim_at(CLIENT, PAGE, lapsed).unwrap();
+        assert_eq!(status(control.heartbeat_at(PAGE, lapsed)), 200);
+        // A released page switches identity; its old one never earns a 412.
+        control.release(PAGE);
+        assert_eq!(status(control.heartbeat(PAGE)), 409);
+        let later = Instant::now() + RECONNECT_GRACE;
+        assert_eq!(status(control.heartbeat_at(PAGE, later)), 409);
+    }
+
+    #[test]
+    fn a_size_request_reports_a_lapsed_lease_apart_from_a_display_taken_by_another_device() {
+        let size = Some((1280, 800, 1));
+        let control = DesktopControl::new(DesktopConfig::default());
+        let start = Instant::now();
+        control.claim_at(CLIENT, PAGE, start).unwrap();
+        let lapsed = start + RECONNECT_GRACE;
+        assert_eq!(status(control.request_size_at(PAGE, size, lapsed)), 412);
+        assert!(!control.stats().updating); // Nothing was queued.
+        // The page claims again, and its retried size goes through.
+        control.claim_at(CLIENT, PAGE, lapsed).unwrap();
+        assert_eq!(status(control.request_size_at(PAGE, size, lapsed)), 200);
+        assert!(control.take_resize().is_some());
+        // Once another device holds the display, the old page faces a conflict.
+        let taken = lapsed + RECONNECT_GRACE;
+        control.claim_at(OTHER, OTHER, taken).unwrap();
+        assert_eq!(status(control.request_size_at(PAGE, size, taken)), 409);
+    }
+
+    #[test]
+    fn constant_time_comparison_agrees_with_string_equality() {
+        let ids = [
+            "",
+            "a",
+            "b",
+            "ab",
+            "ba",
+            "é",
+            "e\u{301}",
+            CLIENT,
+            PAGE,
+            OTHER,
+            &PAGE[1..],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbc",
+            "cbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ];
+        for a in ids {
+            for b in ids {
+                assert_eq!(constant_time_eq(a, b), a == b, "{a:?} {b:?}");
+            }
+        }
+    }
+
     #[test]
     fn claims_are_atomic() {
         let control = std::sync::Arc::new(DesktopControl::new(DesktopConfig::default()));
@@ -324,6 +450,7 @@ mod tests {
             (1280, 800, 3),
             (3840, 3840, 1),
             (2880, 2880, 1),
+            (2400, 3456, 1),
             (1281, 800, 2),
         ] {
             assert!(control.request_size(PAGE, Some(size)).is_err());

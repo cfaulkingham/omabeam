@@ -307,7 +307,8 @@ impl LsHttpClientV2 {
     ///
     /// GET /api/localsend/v2/info
     ///
-    /// This is primarily for debugging purposes.
+    /// Unlike [`Self::register`], this tells the remote device nothing about
+    /// this one, so discovery uses it for devices that cannot receive.
     ///
     /// # Arguments
     /// * `protocol` - HTTP or HTTPS
@@ -315,13 +316,15 @@ impl LsHttpClientV2 {
     /// * `port` - Target device port
     ///
     /// # Returns
-    /// Device information including alias, version, device type, fingerprint, etc.
+    /// Device information including alias, version, device type, fingerprint,
+    /// etc., and in HTTPS mode the certificate it was received over, which is
+    /// the device's identity (like [`Self::register`]).
     pub async fn info(
         &self,
         protocol: ProtocolType,
         ip: &str,
         port: u16,
-    ) -> Result<InfoResponseDtoV2, ClientError> {
+    ) -> Result<ResultWithPublicKey<InfoResponseDtoV2>, ClientError> {
         let url = TargetUrl {
             version: ApiVersion::V2,
             protocol: protocol.as_str(),
@@ -338,9 +341,21 @@ impl LsHttpClientV2 {
             return res.into_error().await;
         }
 
+        let (public_key, cert_fingerprint) = match protocol {
+            ProtocolType::Https => (
+                Some(super::verify_cert_from_res(&res, None)?),
+                Some(super::cert_fingerprint_from_res(&res)?),
+            ),
+            _ => (None, None),
+        };
+
         let body = res.json::<InfoResponseDtoV2>().await?;
 
-        Ok(body)
+        Ok(ResultWithPublicKey {
+            public_key,
+            cert_fingerprint,
+            body,
+        })
     }
 
     /// Prepares to download files from a sender (Download API).

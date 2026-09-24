@@ -9,7 +9,7 @@ repository = "https://github.com/cfaulkingham/omabeam"
 readme = "README.md"
 
 [workspace]
-members = ["crates/omabeam-capture", "crates/omabeam-encoder"]
+members = ["crates/omabeam-capture", "crates/omabeam-encoder", "crates/omabeam-cast"]
 default-members = [".", "crates/omabeam-encoder"]
 exclude = ["vendor/localsend"]
 resolver = "3"
@@ -22,13 +22,15 @@ gpui-kit = { version = "=0.6.0", default-features = false }
 gpui-omarchy = "0.1.0"
 if-addrs = "0.15"
 localsend = { path = "vendor/localsend", features = ["discovery"] }
-rustix = { version = "1", features = ["event", "fs", "process"] }
+rustix = { version = "1", features = ["event", "fs", "pipe", "process", "stdio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 signal-hook = "0.3"
 omabeam-capture = { path = "crates/omabeam-capture" }
+omabeam-cast = { path = "crates/omabeam-cast" }
 omabeam-encoder = { path = "crates/omabeam-encoder", default-features = false }
 openh264 = "0.9.8"
+openh264-sys2 = "0.9.8"
 str0m = "0.23.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-util = { version = "0.7", features = ["rt"] }

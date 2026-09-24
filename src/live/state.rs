@@ -1,5 +1,6 @@
 use super::diagnostics::{
-    DiagnosticsState, FrameMeasurement, SendMeasurement, StreamDiagnostics, ViewerDiagnostics,
+    DiagnosticsState, FrameMeasurement, LogThrottle, SendMeasurement, StreamDiagnostics,
+    ViewerDiagnostics,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -28,15 +29,19 @@ pub struct StreamStats {
     pub webrtc: Option<super::WebRtcStats>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<super::desktop::DesktopStats>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast: Option<super::cast::CastStats>,
 }
 
 pub(super) struct FrameData {
     pub jpeg: Arc<[u8]>,
-    pub raw: Option<Arc<super::webrtc::RawFrame>>,
+    pub raw: Option<Arc<super::h264::RawFrame>>,
     pub generation: u64,
     pub width: u32,
     pub height: u32,
     pub encode_started_at: Instant,
+    /// The generation whose lazy JPEG encode failed.
+    jpeg_failed: Option<u64>,
     diagnostics: DiagnosticsState,
     times: VecDeque<Instant>,
     started: Instant,
@@ -48,10 +53,19 @@ pub(super) struct FrameState {
     pub inner: Mutex<FrameData>,
     pub tick: Condvar,
     pub viewers: AtomicUsize,
+    pub cast_viewers: AtomicUsize,
     pub rtc: Mutex<Option<Arc<super::webrtc::Service>>>,
     pub desktop: Option<Arc<super::desktop::DesktopControl>>,
-    jpeg_encode: Mutex<()>,
+    /// Serializes lazy JPEG encodes and rate-limits their failure log.
+    jpeg_encode: Mutex<LogThrottle>,
     source: String,
+}
+
+/// The latest frame could not be JPEG-encoded. Streams skip to the next
+/// generation; snapshots answer 500.
+#[derive(Debug)]
+pub(super) struct EncodeFailed {
+    pub generation: u64,
 }
 
 impl FrameState {
@@ -71,6 +85,7 @@ impl FrameState {
                 width: 0,
                 height: 0,
                 encode_started_at: Instant::now(),
+                jpeg_failed: None,
                 diagnostics: DiagnosticsState::new(Instant::now()),
                 times: VecDeque::new(),
                 started: Instant::now(),
@@ -79,9 +94,10 @@ impl FrameState {
             }),
             tick: Condvar::new(),
             viewers: AtomicUsize::new(0),
+            cast_viewers: AtomicUsize::new(0),
             rtc: Mutex::new(None),
             desktop: None,
-            jpeg_encode: Mutex::new(()),
+            jpeg_encode: Mutex::new(LogThrottle::default()),
             source,
         }
     }
@@ -95,7 +111,7 @@ impl FrameState {
         width: u32,
         height: u32,
         measurement: FrameMeasurement,
-        raw: Option<Arc<super::webrtc::RawFrame>>,
+        raw: Option<Arc<super::h264::RawFrame>>,
     ) {
         let mut data = self.inner.lock().unwrap();
         if data.ended.is_some() {
@@ -125,8 +141,14 @@ impl FrameState {
         drop(data);
         self.tick.notify_all();
     }
+    /// Capture skipped a frame whose eager JPEG failed. It counts like a failed
+    /// lazy encode; the frame was never published, so it counts only once.
+    pub fn jpeg_skipped(&self) {
+        self.inner.lock().unwrap().diagnostics.jpeg_failed();
+    }
     pub fn viewer_count(&self) -> usize {
         self.viewers.load(Ordering::SeqCst)
+            + self.cast_viewers.load(Ordering::SeqCst)
             + self
                 .rtc
                 .lock()
@@ -178,17 +200,24 @@ impl FrameState {
             diagnostics: data.diagnostics.stats(now),
             webrtc: self.rtc.lock().unwrap().as_ref().map(|rtc| rtc.stats()),
             desktop: self.desktop.as_ref().map(|d| d.stats()),
+            cast: None,
         }
     }
 
     /// Cache at most the latest JPEG. RTC-only viewers do not run the JPEG
     /// encoder; snapshots and fallback connections request it on demand.
-    pub fn jpeg_frame(&self) -> anyhow::Result<(Arc<[u8]>, u64, Instant)> {
-        let _encoder = self.jpeg_encode.lock().unwrap();
+    pub fn jpeg_frame(&self) -> Result<(Arc<[u8]>, u64, Instant), EncodeFailed> {
+        let mut failure_log = self.jpeg_encode.lock().unwrap();
         let (raw, generation, at) = {
             let data = self.inner.lock().unwrap();
             if !data.jpeg.is_empty() || data.ended.is_some() {
                 return Ok((data.jpeg.clone(), data.generation, data.encode_started_at));
+            }
+            // Each viewer would otherwise repeat the failing encode.
+            if data.jpeg_failed == Some(data.generation) {
+                return Err(EncodeFailed {
+                    generation: data.generation,
+                });
             }
             (data.raw.clone(), data.generation, data.encode_started_at)
         };
@@ -196,16 +225,32 @@ impl FrameState {
             return Ok((Arc::from([]), generation, at));
         };
         let started = Instant::now();
-        let (jpeg, _, _) = raw.frame.jpeg_with_mode(
-            raw.config.quality,
-            raw.config.max_width,
-            raw.config.pixel_mode,
-        )?;
-        let jpeg: Arc<[u8]> = jpeg.into();
+        let encoded = raw
+            .frame
+            .jpeg_with_mode(
+                raw.config.quality,
+                raw.config.max_width,
+                raw.config.pixel_mode,
+            )
+            .map(|(jpeg, _, _)| Arc::<[u8]>::from(jpeg));
         let mut data = self.inner.lock().unwrap();
         if data.ended.is_some() {
             return Ok((Arc::from([]), generation, at));
         }
+        let jpeg = match encoded {
+            Ok(jpeg) => jpeg,
+            Err(error) => {
+                data.diagnostics.jpeg_failed();
+                if data.generation == generation {
+                    data.jpeg_failed = Some(generation);
+                }
+                drop(data);
+                if failure_log.allow(Instant::now()) {
+                    eprintln!("live share: could not encode a JPEG frame: {error:#}");
+                }
+                return Err(EncodeFailed { generation });
+            }
+        };
         if data.generation == generation {
             data.jpeg = jpeg.clone();
             data.encode_started_at = started;

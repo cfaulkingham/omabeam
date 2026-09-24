@@ -11,12 +11,14 @@ use rustix::fs::{
 };
 use rustix::io::{Errno, write};
 use rustix::process::geteuid;
+use std::io::Write as _;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
-use std::{fs, io};
 #[cfg(target_os = "linux")]
-use std::{thread, time::Duration};
+use std::thread;
+use std::time::{Duration, Instant};
+use std::{fs, io};
 
 pub const MAX_STATUS_BYTES: usize = 8192;
 pub const MAX_TITLE_BYTES: usize = 200;
@@ -26,6 +28,10 @@ pub const MAX_SOURCE_BYTES: usize = 200;
 const LEAF: &str = "omabeam";
 const STATUS_NAME: &str = "live.json";
 const LOG_NAME: &str = "live.log";
+const LOCK_NAME: &str = "session.lock";
+/// Unchanged fields are rewritten at most this often; the bar polls every 1-2 s.
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
+const FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 pub fn status_dir() -> Result<PathBuf> {
     Ok(runtime_dir()?.join(LEAF))
@@ -256,7 +262,7 @@ pub(crate) fn session_lock() -> Result<fs::File> {
     let dirfd = open_omabeam_dir()?;
     let fd = openat(
         &dirfd,
-        "session.lock",
+        LOCK_NAME,
         OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
         Mode::from_raw_mode(0o600),
     )?;
@@ -272,11 +278,74 @@ pub(crate) fn session_lock() -> Result<fs::File> {
     Ok(into_std_file(fd))
 }
 
+/// Share processes also record "pid starttime" in the lock they hold, so
+/// `--stop` can reach one that is still starting and has no live.json yet.
+pub(crate) fn session_lock_owned() -> Result<fs::File> {
+    let lock = session_lock()?;
+    let record = format!("{} {}\n", std::process::id(), self_starttime());
+    ftruncate(&lock, 0).context("cannot record the session owner")?;
+    write_all_fd(&lock, record.as_bytes()).context("cannot record the session owner")?;
+    Ok(lock)
+}
+
+/// The share recorded in the session lock, only while that lock is held.
+fn lock_owner() -> Option<(u32, u64)> {
+    let dirfd = open_omabeam_dir().ok()?;
+    let fd = openat(
+        &dirfd,
+        LOCK_NAME,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let st = fstat(&fd).ok()?;
+    if !FileType::from_raw_mode(st.st_mode).is_file()
+        || st.st_uid != geteuid().as_raw()
+        || st.st_nlink != 1
+    {
+        return None;
+    }
+    // A shared lock is refused only while someone holds the exclusive one.
+    // When granted, it lasts only until `fd` closes at the end of this probe.
+    match rustix::fs::flock(&fd, rustix::fs::FlockOperation::NonBlockingLockShared) {
+        Err(Errno::WOULDBLOCK) => {}
+        _ => return None,
+    }
+    let mut record = [0u8; 64];
+    let len = rustix::io::pread(&fd, &mut record, 0).ok()?;
+    if len == record.len() {
+        return None;
+    }
+    parse_owner(&record[..len])
+}
+
+/// Exactly what `session_lock_owned` writes: "pid starttime", both non-zero,
+/// and at most one final newline. No signs, padding, or other whitespace.
+fn parse_owner(record: &[u8]) -> Option<(u32, u64)> {
+    let record = std::str::from_utf8(record).ok()?;
+    let (pid, starttime) = record
+        .strip_suffix('\n')
+        .unwrap_or(record)
+        .split_once(' ')?;
+    // `str::parse` alone would also take a leading '+' or zeros.
+    let decimal = |field: &str| {
+        !field.is_empty()
+            && field.bytes().all(|b| b.is_ascii_digit())
+            && !(field.len() > 1 && field.starts_with('0'))
+    };
+    if !(decimal(pid) && decimal(starttime)) {
+        return None;
+    }
+    // A pid_t: `terminate` converts it back to i32.
+    let pid: u32 = pid.parse().ok().filter(|&pid| i32::try_from(pid).is_ok())?;
+    let starttime: u64 = starttime.parse().ok()?;
+    (pid != 0 && starttime != 0).then_some((pid, starttime))
+}
+
 fn write_record(name: &str, payload: &[u8]) -> Result<()> {
-    ensure!(
-        payload.len() <= MAX_STATUS_BYTES,
-        "session payload exceeds the byte limit"
-    );
+    if payload.len() > MAX_STATUS_BYTES {
+        return Err(StatusTooLarge.into());
+    }
     let dirfd = open_omabeam_dir()?;
     let tmp_name = format!(".live.{}.json.tmp", random_suffix()?);
     let fd = openat(
@@ -382,10 +451,7 @@ pub fn read_status() -> Result<Option<LiveStatus>> {
 }
 
 pub fn current_status() -> Option<LiveStatus> {
-    read_status()
-        .ok()
-        .flatten()
-        .filter(|status| pid_alive(status.pid))
+    read_status().ok().flatten().filter(status_alive)
 }
 
 pub fn latest_status() -> Option<LiveStatus> {
@@ -393,11 +459,132 @@ pub fn latest_status() -> Option<LiveStatus> {
 }
 
 pub fn latest_status_report() -> Result<Option<LiveStatus>> {
-    Ok(read_status()?.filter(|status| status.stats.state == "ended" || pid_alive(status.pid)))
+    Ok(read_status()?.filter(|status| status.stats.state == "ended" || status_alive(status)))
 }
 
+/// True while `pid` is a process of this user. A share record also needs its
+/// start time to match; see `status_alive`.
 pub fn pid_alive(pid: u32) -> bool {
     process_identity(pid).is_some_and(|id| id.uid == geteuid().as_raw())
+}
+
+/// A record describes a running share only while its pid still has the
+/// recorded start time: after a crash the pid can belong to any process.
+pub fn status_alive(status: &LiveStatus) -> bool {
+    same_process(status.starttime, process_identity(status.pid))
+}
+
+fn same_process(starttime: u64, id: Option<ProcessIdentity>) -> bool {
+    starttime != 0 && id.is_some_and(|id| id.starttime == starttime && id.uid == geteuid().as_raw())
+}
+
+/// A status that can never fit the session file: a programming error, unlike
+/// the transient failures `StatusWriter` retries.
+#[derive(Debug)]
+pub(crate) struct StatusTooLarge;
+
+impl std::fmt::Display for StatusTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("session payload exceeds the byte limit")
+    }
+}
+
+impl std::error::Error for StatusTooLarge {}
+
+/// True at most once per 10 s, so a lasting fault cannot flood live.log.
+pub(super) fn log_due(last: &mut Option<Instant>, now: Instant) -> bool {
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= FAILURE_LOG_INTERVAL);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+/// Paces live.json rewrites. Each write repairs the directory, fsyncs twice,
+/// and renames, so changing counters are written at most once a second, while
+/// what the bar and launchers act on is written at once. A failed write (out
+/// of descriptors or space, an I/O error) is logged and retried on the next
+/// call rather than ending the share.
+pub(crate) struct StatusWriter<W = fn(&LiveStatus) -> Result<()>> {
+    write: W,
+    last: Option<(LiveStatus, Instant)>,
+    retry: bool,
+    logged: Option<Instant>,
+}
+
+impl StatusWriter {
+    pub fn new() -> Self {
+        Self::with(write_live_status)
+    }
+}
+
+impl<W: FnMut(&LiveStatus) -> Result<()>> StatusWriter<W> {
+    pub fn with(write: W) -> Self {
+        Self {
+            write,
+            last: None,
+            retry: false,
+            logged: None,
+        }
+    }
+
+    pub fn write(&mut self, status: &LiveStatus) -> Result<()> {
+        self.write_at(status, Instant::now())
+    }
+
+    /// First and final records and Cast negotiation steps never wait.
+    pub fn force(&mut self, status: &LiveStatus) -> Result<()> {
+        self.store(status, Instant::now())
+    }
+
+    pub fn write_at(&mut self, status: &LiveStatus, now: Instant) -> Result<()> {
+        let due = self.retry
+            || self.last.as_ref().is_none_or(|(last, at)| {
+                now.saturating_duration_since(*at) >= STATUS_INTERVAL
+                    || salient_change(last, status)
+            });
+        if due { self.store(status, now) } else { Ok(()) }
+    }
+
+    fn store(&mut self, status: &LiveStatus, now: Instant) -> Result<()> {
+        match (self.write)(status) {
+            Ok(()) => {
+                self.last = Some((status.clone(), now));
+                self.retry = false;
+                Ok(())
+            }
+            Err(error) if error.is::<StatusTooLarge>() => Err(error),
+            Err(error) => {
+                self.retry = true;
+                if log_due(&mut self.logged, now) {
+                    // stderr is live.log, which can fail the same way: never panic.
+                    let _ = writeln!(
+                        io::stderr(),
+                        "live share: could not update {STATUS_NAME}, retrying: {error:#}"
+                    );
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// What the bar shows, and what `spawn_daemon` for Cast waits on.
+fn salient_change(old: &LiveStatus, new: &LiveStatus) -> bool {
+    fn cast(status: &LiveStatus) -> Option<(&str, bool)> {
+        status.stats.cast.as_ref().map(|cast| {
+            let ready = cast.accepted_frames > 0 && cast.released_frames > 0;
+            (cast.connection.as_str(), ready)
+        })
+    }
+    old.url != new.url
+        || old.title != new.title
+        || old.stats.state != new.stats.state
+        || old.stats.error != new.stats.error
+        || old.stats.source != new.stats.source
+        || old.stats.viewers != new.stats.viewers
+        || old.stats.desktop != new.stats.desktop
+        || cast(old) != cast(new)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -447,11 +634,18 @@ fn cmdline_is_session(pid: u32) -> bool {
     let Ok(data) = fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    if data.len() > 8192 {
-        return false;
-    }
-    data.split(|b| *b == 0)
-        .any(|arg| arg == b"--live" || arg == b"--demo")
+    data.len() <= 8192 && runs_a_session(&data)
+}
+
+/// Commands that record themselves in the session lock: shares, demos, Cast.
+#[cfg(any(target_os = "linux", test))]
+fn runs_a_session(cmdline: &[u8]) -> bool {
+    cmdline.split(|b| *b == 0).any(|arg| {
+        matches!(
+            arg,
+            b"--live" | b"--demo" | b"--cast" | b"--cast-test" | b"--cast-demo"
+        )
+    })
 }
 
 fn without_deleted_suffix(path: &std::path::Path) -> &std::path::Path {
@@ -480,60 +674,75 @@ fn exe_is_omabeam(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn matches_session(status: &LiveStatus, id: ProcessIdentity) -> bool {
-    status.pid == id.pid
-        && status.starttime != 0
-        && status.starttime == id.starttime
-        && id.uid == geteuid().as_raw()
-        && exe_is_omabeam(id.pid)
-        && cmdline_is_session(id.pid)
+fn matches_session(pid: u32, starttime: u64, id: ProcessIdentity) -> bool {
+    id.pid == pid
+        && same_process(starttime, Some(id))
+        && exe_is_omabeam(pid)
+        && cmdline_is_session(pid)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Stops the share named by live.json or, while one is still starting and
+/// has published nothing, the owner recorded in the session lock. Returns
+/// whether a share was signaled. The caller clears stale records once it
+/// holds the session lock.
 pub fn stop_live_process() -> bool {
+    if let Ok(Some(status)) = read_status()
+        && terminate(status.pid, status.starttime)
+    {
+        return true;
+    }
+    lock_owner().is_some_and(|(pid, starttime)| terminate(pid, starttime))
+}
+
+/// How long `--stop` waits for a signaled share to exit before SIGKILL.
+const STOP_GRACE: Duration = Duration::from_secs(10);
+/// What a stopping share needs besides Hyprland IPC: noticing the signal
+/// (run_session checks every 250 ms) and joining its capture thread.
+const STOP_JOIN_ALLOWANCE: Duration = Duration::from_secs(2);
+// SIGKILL must not interrupt a share removing its extended display.
+const _: () = assert!(
+    crate::hypr::TEARDOWN_BUDGET.as_millis() + STOP_JOIN_ALLOWANCE.as_millis()
+        < STOP_GRACE.as_millis()
+);
+
+/// Without /proc a recorded process cannot be verified, so it is never signaled.
+#[cfg(not(target_os = "linux"))]
+fn terminate(_pid: u32, _starttime: u64) -> bool {
     false
 }
 
+/// Signals `pid` only while it is still this user's omabeam share with the
+/// recorded start time; an unreadable or mismatched record is never signaled.
 #[cfg(target_os = "linux")]
-pub fn stop_live_process() -> bool {
-    let Ok(Some(status)) = read_status() else {
+fn terminate(pid: u32, starttime: u64) -> bool {
+    let Some(expected) = process_identity(pid) else {
         return false;
     };
-    if !pid_alive(status.pid) {
-        clear_live_status();
+    if !matches_session(pid, starttime, expected) {
         return false;
     }
-    let Some(expected) = process_identity(status.pid) else {
+    let Some(raw) = rustix::process::Pid::from_raw(pid as i32) else {
         return false;
     };
-    if !matches_session(&status, expected) {
-        return false;
-    }
-    let Some(pid) = rustix::process::Pid::from_raw(status.pid as i32) else {
+    let Ok(pidfd) = rustix::process::pidfd_open(raw, rustix::process::PidfdFlags::empty()) else {
         return false;
     };
-    let Ok(pidfd) = rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()) else {
+    let Some(again) = process_identity(pid) else {
         return false;
     };
-    let Some(again) = process_identity(status.pid) else {
-        return false;
-    };
-    if again != expected || !matches_session(&status, again) {
+    if again != expected || !matches_session(pid, starttime, again) {
         return false;
     }
     let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::TERM);
     // Capture and HTTP workers must stop before a virtual output is removed.
     // Allow the bounded compositor IPC cleanup to finish before forcing exit.
-    for _ in 0..200 {
-        if process_identity(status.pid).is_none_or(|id| id != expected) {
-            break;
-        }
+    let deadline = Instant::now() + STOP_GRACE;
+    while Instant::now() < deadline && process_identity(pid).is_some_and(|id| id == expected) {
         thread::sleep(Duration::from_millis(50));
     }
-    if process_identity(status.pid).is_some_and(|id| id == expected) {
+    if process_identity(pid).is_some_and(|id| id == expected) {
         let _ = rustix::process::pidfd_send_signal(&pidfd, rustix::process::Signal::KILL);
     }
-    clear_live_status();
     true
 }
 
@@ -576,14 +785,23 @@ pub fn log_path() -> Result<PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    use crate::live::StreamStats;
-    use std::os::unix::fs::PermissionsExt;
+    use crate::live::{DesktopStats, StreamStats, cast::CastStats};
+    use std::cell::Cell;
+    use std::os::unix::fs::{FileExt, PermissionsExt};
     use std::path::Path;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    // A failed test must not fail every later one through a poisoned lock.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn sample() -> LiveStatus {
         LiveStatus {
@@ -598,8 +816,9 @@ mod tests {
         }
     }
 
-    fn with_runtime<T>(run: impl FnOnce(&Path) -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap();
+    /// Serializes tests that point XDG_RUNTIME_DIR at a temporary directory.
+    pub(crate) fn with_runtime<T>(run: impl FnOnce(&Path) -> T) -> T {
+        let _guard = env_lock();
         let dir = tempfile::TempDir::new().unwrap();
         let previous = std::env::var_os("XDG_RUNTIME_DIR");
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir.path()) };
@@ -614,9 +833,25 @@ mod tests {
         }
     }
 
+    /// The session lock once nothing holds it. A child that another test is
+    /// spawning shares our descriptors until it execs (on macOS that can take
+    /// tens of milliseconds), so a lock just released may still be held.
+    pub(crate) fn session_lock_when_free() -> fs::File {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match session_lock() {
+                Ok(lock) => return lock,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("the session lock stayed held: {error:#}"),
+            }
+        }
+    }
+
     #[test]
     fn refuses_missing_runtime_dir() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let previous = std::env::var_os("XDG_RUNTIME_DIR");
         unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
         let error = runtime_dir().unwrap_err().to_string();
@@ -668,6 +903,22 @@ mod tests {
         )));
     }
 
+    /// Runs a binary the test just copied. A child that another test thread
+    /// forked during the copy holds its write descriptor until that child
+    /// execs, and exec fails with ETXTBSY meanwhile.
+    #[cfg(target_os = "linux")]
+    fn spawn_copied(command: &mut std::process::Command) -> std::process::Child {
+        for _ in 0..20 {
+            match command.spawn() {
+                Err(error) if error.raw_os_error() == Some(Errno::TXTBSY.raw_os_error()) => {
+                    thread::sleep(Duration::from_millis(25));
+                }
+                spawned => return spawned.unwrap(),
+            }
+        }
+        command.spawn().unwrap()
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn exe_is_omabeam_after_the_file_is_unlinked() {
@@ -679,7 +930,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let bin = dir.path().join("omabeam");
         fs::copy(sleep, &bin).unwrap();
-        let mut child = std::process::Command::new(&bin).arg("8").spawn().unwrap();
+        let mut child = spawn_copied(std::process::Command::new(&bin).arg("8"));
         let pid = child.id();
         fs::remove_file(&bin).unwrap();
         assert!(
@@ -707,6 +958,388 @@ mod tests {
             assert!(!stop_live_process());
             let _ = child.kill();
             let _ = child.wait();
+        });
+    }
+
+    #[test]
+    fn stop_recognizes_the_commands_that_record_themselves_in_the_lock() {
+        let cmdline = |args: Vec<String>| -> Vec<u8> {
+            let args = ["/opt/omabeam/omabeam".to_owned()].into_iter().chain(args);
+            args.flat_map(|arg| arg.into_bytes().into_iter().chain([0]))
+                .collect()
+        };
+        let config = crate::live::LiveConfig::default().to_cli_args();
+        let source = crate::live::LiveSource::Output {
+            name: "DP-1".into(),
+        }
+        .to_cli_args();
+        let words = |args: &[&str]| args.iter().map(|&arg| arg.to_owned()).collect::<Vec<_>>();
+        // As cast::spawn_daemon starts it, and the development Cast commands.
+        let daemon = [config, words(&["--cast", "receiver-id", "--"]), source].concat();
+        for args in [
+            daemon,
+            words(&["--cast-demo", "receiver-id"]),
+            words(&["--cast-test", "192.0.2.1:8009", "cert.pem"]),
+            words(&["--live", "--", "output", "DP-1"]),
+            words(&["--demo"]),
+        ] {
+            assert!(runs_a_session(&cmdline(args.clone())), "{args:?}");
+        }
+        for args in [&["--cast-devices"][..], &["--stop"], &["--status"], &[]] {
+            assert!(!runs_a_session(&cmdline(words(args))), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn a_record_is_live_only_while_its_pid_has_the_recorded_start_time() {
+        let uid = geteuid().as_raw();
+        let running = ProcessIdentity {
+            pid: 42,
+            starttime: 7_000,
+            uid,
+        };
+        assert!(same_process(7_000, Some(running)));
+        // After a crash the pid can belong to another process of this user.
+        assert!(!same_process(6_999, Some(running)));
+        // Records written before the start time was recorded are stale.
+        let unrecorded = ProcessIdentity {
+            starttime: 0,
+            ..running
+        };
+        assert!(!same_process(0, Some(unrecorded)));
+        let foreign = ProcessIdentity {
+            uid: uid.wrapping_add(1),
+            ..running
+        };
+        assert!(!same_process(7_000, Some(foreign)));
+        assert!(!same_process(7_000, None));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn our_pid_is_live_only_with_our_start_time() {
+        with_runtime(|_| {
+            let mut status = sample();
+            assert_ne!(status.starttime, 0);
+            assert!(status_alive(&status));
+            write_live_status(&status).unwrap();
+            assert!(current_status().is_some());
+            status.starttime += 1;
+            assert!(!status_alive(&status));
+            write_live_status(&status).unwrap();
+            assert!(current_status().is_none());
+            assert!(latest_status_report().unwrap().is_none());
+            status.starttime = 0;
+            assert!(!status_alive(&status));
+        });
+    }
+
+    fn counted(writes: &Cell<usize>) -> StatusWriter<impl FnMut(&LiveStatus) -> Result<()> + '_> {
+        StatusWriter::with(move |_: &LiveStatus| {
+            writes.set(writes.get() + 1);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn changing_counters_are_rewritten_at_most_once_a_second() {
+        with_runtime(|root| {
+            let path = root.join(LEAF).join(STATUS_NAME);
+            let start = Instant::now();
+            let mut writer = StatusWriter::new();
+            let mut status = sample();
+            let (mut renames, mut inode) = (0, None);
+            // Five seconds of 250 ms ticks in which only counters change.
+            for tick in 0..20u64 {
+                status.stats.frames = tick;
+                status.stats.uptime = tick / 4;
+                let now = start + Duration::from_millis(250 * tick);
+                writer.write_at(&status, now).unwrap();
+                let current = fs::metadata(&path).unwrap().ino();
+                if inode != Some(current) {
+                    renames += 1;
+                    inode = Some(current);
+                }
+            }
+            assert_eq!(renames, 5);
+            assert_eq!(read_status().unwrap().unwrap().stats.frames, 16);
+            // A new viewer is written without waiting for the interval.
+            status.stats.viewers = 1;
+            writer
+                .write_at(&status, start + Duration::from_millis(4_800))
+                .unwrap();
+            assert_ne!(Some(fs::metadata(&path).unwrap().ino()), inode);
+            assert_eq!(read_status().unwrap().unwrap().stats.viewers, 1);
+        });
+    }
+
+    type Change = (&'static str, fn(&mut LiveStatus));
+
+    #[test]
+    fn what_the_bar_and_launchers_act_on_is_written_at_once() {
+        let mut base = sample();
+        base.stats.cast = Some(CastStats {
+            connection: "starting".into(),
+            ..CastStats::default()
+        });
+        let changes: [Change; 9] = [
+            ("state", |s| s.stats.state = "ended".into()),
+            ("error", |s| {
+                s.stats.error = Some("Selected window closed".into())
+            }),
+            ("url", |s| s.url.push('x')),
+            ("title", |s| s.title.push('x')),
+            ("source", |s| s.stats.source.push('x')),
+            ("viewers", |s| s.stats.viewers += 1),
+            ("desktop", |s| {
+                s.stats.desktop = Some(DesktopStats {
+                    config: Default::default(),
+                    matched: true,
+                    occupied: true,
+                    updating: false,
+                    error: None,
+                    reconnect_seconds: 15,
+                })
+            }),
+            ("cast connection", |s| {
+                s.stats.cast.as_mut().unwrap().connection = "streaming".into()
+            }),
+            ("cast readiness", |s| {
+                let cast = s.stats.cast.as_mut().unwrap();
+                cast.accepted_frames = 1;
+                cast.released_frames = 1;
+            }),
+        ];
+        let start = Instant::now();
+        for (field, change) in changes {
+            let writes = Cell::new(0);
+            let mut writer = counted(&writes);
+            writer.write_at(&base, start).unwrap();
+            let mut changed = base.clone();
+            change(&mut changed);
+            writer
+                .write_at(&changed, start + Duration::from_millis(250))
+                .unwrap();
+            assert_eq!(writes.get(), 2, "{field} must be written at once");
+        }
+        // Counters and timings wait for the interval.
+        let writes = Cell::new(0);
+        let mut writer = counted(&writes);
+        writer.write_at(&base, start).unwrap();
+        let mut busy = base.clone();
+        busy.stats.frames += 30;
+        busy.stats.fps = 29.5;
+        busy.stats.uptime += 1;
+        busy.stats.diagnostics.bytes_sent += 4096;
+        let cast = busy.stats.cast.as_mut().unwrap();
+        cast.accepted_frames = 30; // not ready until frames are also released
+        cast.rtt_us = 900;
+        writer
+            .write_at(&busy, start + Duration::from_millis(999))
+            .unwrap();
+        assert_eq!(writes.get(), 1);
+        writer
+            .write_at(&busy, start + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(writes.get(), 2);
+        // First, final, and Cast negotiation records do not wait.
+        writer.force(&busy).unwrap();
+        assert_eq!(writes.get(), 3);
+    }
+
+    #[test]
+    fn transient_write_failures_are_retried_and_only_an_oversized_record_is_fatal() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let (attempts, failures) = (Cell::new(0), Cell::new(3));
+        let mut writer = StatusWriter::with(|_: &LiveStatus| {
+            attempts.set(attempts.get() + 1);
+            if failures.get() == 0 {
+                return Ok(());
+            }
+            failures.set(failures.get() - 1);
+            Err(io::Error::from(Errno::MFILE).into())
+        });
+        let status = sample();
+        writer.write_at(&status, at(0)).unwrap();
+        assert_eq!((attempts.get(), writer.logged), (1, Some(at(0))));
+        // Nothing changed, but a failed write is retried on the next tick.
+        writer.write_at(&status, at(250)).unwrap();
+        writer.write_at(&status, at(500)).unwrap();
+        assert_eq!((attempts.get(), writer.logged), (3, Some(at(0))));
+        writer.write_at(&status, at(750)).unwrap();
+        assert_eq!(attempts.get(), 4);
+        writer.write_at(&status, at(1_000)).unwrap();
+        assert_eq!(attempts.get(), 4, "written 250 ms ago");
+        // A lasting failure keeps the share running and logs once per 10 s.
+        failures.set(usize::MAX);
+        for ms in (1_750..=11_750).step_by(250) {
+            writer.write_at(&status, at(ms)).unwrap();
+        }
+        assert_eq!(attempts.get(), 4 + 41);
+        assert_eq!(writer.logged, Some(at(10_000)));
+        // Only a record that can never fit ends the share.
+        let mut writer = StatusWriter::with(|_: &LiveStatus| Err(StatusTooLarge.into()));
+        let error = writer.write_at(&status, start).unwrap_err();
+        assert!(error.is::<StatusTooLarge>(), "{error:#}");
+        let mut huge = sample();
+        huge.stats.diagnostics.bytes_sent = u64::MAX;
+        huge.stats.webrtc = Some(crate::live::WebRtcStats {
+            encoder: "x".repeat(MAX_STATUS_BYTES),
+            ..Default::default()
+        });
+        with_runtime(|_| {
+            let error = StatusWriter::new().force(&huge).unwrap_err();
+            assert!(error.is::<StatusTooLarge>(), "{error:#}");
+        });
+    }
+
+    fn rewrite(lock: &fs::File, record: &str) {
+        lock.set_len(0).unwrap();
+        lock.write_all_at(record.as_bytes(), 0).unwrap();
+    }
+
+    #[test]
+    fn the_lock_record_names_its_owner_only_while_the_lock_is_held() {
+        with_runtime(|root| {
+            let lock = session_lock().unwrap();
+            rewrite(&lock, "4242 777\n");
+            assert_eq!(lock_owner(), Some((4242, 777)));
+            for bad in [
+                "",
+                "4242",
+                "4242 0",
+                "0 777",
+                "-1 777",
+                "x 777",
+                "4242 777 1",
+                "4242 99999999999999999999",
+            ] {
+                rewrite(&lock, bad);
+                assert_eq!(lock_owner(), None, "{bad:?}");
+            }
+            rewrite(&lock, "4242 777\n");
+            drop(lock);
+            // A released lock's record is stale.
+            let path = root.join(LEAF).join("session.lock");
+            assert_eq!(fs::read_to_string(&path).unwrap(), "4242 777\n");
+            assert_eq!(lock_owner(), None);
+        });
+    }
+
+    #[test]
+    fn the_lock_record_is_exactly_what_a_share_writes() {
+        for (record, owner) in [
+            (&b"1 2"[..], (1, 2)),
+            (b"1 2\n", (1, 2)),
+            (b"4242 777\n", (4242, 777)),
+            // The largest pid_t, and the largest start time.
+            (
+                b"2147483647 18446744073709551615\n",
+                (i32::MAX as u32, u64::MAX),
+            ),
+        ] {
+            let text = String::from_utf8_lossy(record);
+            assert_eq!(parse_owner(record), Some(owner), "{text:?}");
+        }
+        let rejected: [&[u8]; 21] = [
+            b" 1 2",
+            b"1  2",
+            b"+1 2",
+            b"1 +2",
+            b"1 2 3",
+            b"0 2",
+            b"1 0",
+            b"01 2",
+            b"1 02",
+            b"007 2",
+            b"1 2\n\n",
+            b"",
+            b"1 2\xff",
+            b"\xff",
+            b"1 2 ",
+            b"1\t2",
+            b"1 2\r\n",
+            b"\n1 2",
+            b"2147483648 2",
+            b"4294967296 2",
+            b"1 18446744073709551616",
+        ];
+        let accepted: Vec<_> = rejected
+            .into_iter()
+            .filter(|record| parse_owner(record).is_some())
+            .map(String::from_utf8_lossy)
+            .collect();
+        assert!(accepted.is_empty(), "accepted {accepted:?}");
+    }
+
+    #[test]
+    fn a_share_records_itself_in_the_lock_it_holds() {
+        with_runtime(|root| {
+            let path = root.join(LEAF).join("session.lock");
+            let lock = session_lock_owned().unwrap();
+            let record = format!("{} {}\n", std::process::id(), self_starttime());
+            assert_eq!(fs::read_to_string(&path).unwrap(), record);
+            // A refused second owner leaves the record alone.
+            assert!(session_lock_owned().is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), record);
+            #[cfg(target_os = "linux")]
+            assert_eq!(lock_owner(), Some((std::process::id(), self_starttime())));
+            drop(lock);
+            assert_eq!(lock_owner(), None);
+        });
+    }
+
+    #[test]
+    fn stop_clears_a_stale_record_only_under_the_session_lock() {
+        with_runtime(|_| {
+            let mut status = sample();
+            // A reused pid: this process did not start at that time.
+            status.starttime = self_starttime() + 1;
+            write_live_status(&status).unwrap();
+            let lock = session_lock().unwrap();
+            assert!(crate::live::stop_and_cleanup().is_err());
+            assert!(read_status().unwrap().is_some());
+            drop(lock);
+            assert!(!crate::live::stop_and_cleanup().unwrap());
+            assert!(read_status().unwrap().is_none());
+        });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stop_reaches_a_starting_share_through_the_lock_it_holds() {
+        use std::os::unix::process::ExitStatusExt;
+        with_runtime(|_| {
+            let cat = ["/usr/bin/cat", "/bin/cat"]
+                .into_iter()
+                .map(Path::new)
+                .find(|path| path.is_file())
+                .expect("cat");
+            let dir = tempfile::TempDir::new().unwrap();
+            let bin = dir.path().join("omabeam");
+            fs::copy(cat, &bin).unwrap();
+            // Blocks on stdin; its exe and command line look like a share.
+            let mut child = spawn_copied(
+                std::process::Command::new(&bin)
+                    .args(["--", "-", "--live"])
+                    .stdin(std::process::Stdio::piped()),
+            );
+            let pid = child.id();
+            let starttime = process_identity(pid).unwrap().starttime;
+            let lock = session_lock().unwrap();
+            rewrite(&lock, &format!("{pid} {starttime}\n"));
+            drop(lock);
+            assert!(!stop_live_process(), "the lock is not held");
+            let lock = session_lock().unwrap();
+            rewrite(&lock, &format!("{pid} {}\n", starttime + 1));
+            assert!(!stop_live_process(), "the record names another process");
+            assert!(child.try_wait().unwrap().is_none());
+            rewrite(&lock, &format!("{pid} {starttime}\n"));
+            assert!(stop_live_process());
+            let terminated = child.wait().unwrap().signal();
+            assert_eq!(terminated, Some(signal_hook::consts::SIGTERM));
+            drop(lock);
         });
     }
 }

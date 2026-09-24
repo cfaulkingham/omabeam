@@ -8,14 +8,37 @@ use std::{
     io::{self, Read, Write},
     os::unix::{ffi::OsStrExt, net::UnixStream},
     path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// All compositor IPC allowed once shutdown starts, and again for recovery.
+/// `--stop` sends SIGKILL 10 s after SIGTERM; joining capture and removing
+/// the extended display must finish first. If time runs out before the
+/// display is gone, display.json stays for a later `--stop`.
+pub(crate) const TEARDOWN_BUDGET: Duration = Duration::from_secs(6);
 const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Set by the first stop signal; later ones never extend it.
+static TEARDOWN: OnceLock<Instant> = OnceLock::new();
+
+/// Every later request, from any thread, ends within `budget` from now: each
+/// gets the smaller of its usual timeout and what is left.
+pub(crate) fn arm_teardown(budget: Duration) {
+    if let Some(deadline) = Instant::now().checked_add(budget) {
+        let _ = TEARDOWN.set(deadline);
+    }
+}
+
+fn teardown_deadline() -> Option<Instant> {
+    TEARDOWN.get().copied()
+}
 
 pub(super) struct Ipc {
     path: PathBuf,
+    /// Shared by every request: recovery's total budget.
+    deadline: Option<Instant>,
 }
 
 impl Ipc {
@@ -28,9 +51,12 @@ impl Ipc {
                 runtime.as_deref(),
                 rustix::process::getuid().as_raw(),
             )?,
+            deadline: None,
         })
     }
 
+    /// Recovery (from `--stop` or a new share) shares one budget across all
+    /// of its requests, so a slow compositor cannot hold it 5 s per request.
     pub(super) fn for_instance(signature: &str) -> Result<Self> {
         let runtime = std::env::var_os("XDG_RUNTIME_DIR");
         Ok(Self {
@@ -39,11 +65,31 @@ impl Ipc {
                 runtime.as_deref(),
                 rustix::process::getuid().as_raw(),
             )?,
+            deadline: Instant::now().checked_add(TEARDOWN_BUDGET),
         })
     }
 
-    pub(super) fn socket_exists(&self) -> Result<bool> {
-        Ok(self.path.try_exists()?)
+    /// A socket file can outlive the compositor that crashed: unlike a clean
+    /// exit, nothing unlinks it. Connecting distinguishes a live compositor
+    /// from that stale file without paying a full request round trip.
+    pub(super) fn is_listening(&self) -> Result<bool> {
+        match UnixStream::connect(&self.path) {
+            Ok(_) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "could not check whether Hyprland is listening at {}",
+                    self.path.display()
+                )
+            }),
+        }
     }
 
     pub(super) fn query(&self, command: &str) -> Result<String> {
@@ -61,10 +107,31 @@ impl Ipc {
     }
 
     fn request(&self, request: &str) -> Result<String> {
+        self.request_before(teardown_deadline(), request)
+    }
+
+    /// `teardown` is the process's stop deadline; tests pass their own.
+    fn request_before(&self, teardown: Option<Instant>, request: &str) -> Result<String> {
+        let failed = || format!("Hyprland IPC request {request:?} failed");
+        let timeout = self
+            .timeout(teardown, Instant::now())
+            .with_context(failed)?;
         let mut socket = UnixStream::connect(&self.path)
             .with_context(|| format!("could not connect to Hyprland at {}", self.path.display()))?;
-        exchange(&mut socket, request, IO_TIMEOUT)
-            .with_context(|| format!("Hyprland IPC request {request:?} failed"))
+        exchange(&mut socket, request, timeout).with_context(failed)
+    }
+
+    /// The usual timeout, cut to what is left of any budget. With nothing
+    /// left, fail before connecting.
+    fn timeout(&self, teardown: Option<Instant>, now: Instant) -> Result<Duration> {
+        [self.deadline, teardown]
+            .into_iter()
+            .flatten()
+            .try_fold(IO_TIMEOUT, |timeout, deadline| {
+                let left = deadline.saturating_duration_since(now);
+                ensure!(!left.is_zero(), "cleanup time limit reached");
+                Ok(timeout.min(left))
+            })
     }
 }
 
@@ -174,6 +241,16 @@ mod tests {
     use super::*;
     use std::{net::Shutdown, os::unix::net::UnixListener, thread};
 
+    impl Ipc {
+        /// No budget of its own, like `from_env`.
+        fn at(path: PathBuf) -> Self {
+            Self {
+                path,
+                deadline: None,
+            }
+        }
+    }
+
     #[test]
     fn resolves_the_session_socket_and_default_runtime() {
         let signature = Some(OsStr::new("commit_123_456"));
@@ -199,6 +276,30 @@ mod tests {
             assert!(socket_path(Some(OsStr::new(invalid)), None, 1000).is_err());
         }
         assert!(socket_path(signature, Some(OsStr::new("relative")), 1000).is_err());
+    }
+
+    #[test]
+    fn is_listening_distinguishes_live_stale_and_missing_sockets() {
+        // macOS's default TMPDIR is often too long for a Unix socket path
+        // (sun_path is capped around 104 bytes); /tmp keeps it short, as the
+        // `peer` helper below also relies on.
+        let dir = tempfile::Builder::new()
+            .prefix("ts-ipc-listen-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join(".socket.sock");
+
+        let listener = UnixListener::bind(&path).unwrap();
+        assert!(Ipc::at(path.clone()).is_listening().unwrap());
+        drop(listener);
+
+        // Rust's UnixListener does not unlink its socket file on drop, so the
+        // path still exists but nothing is bound behind it: a crashed
+        // compositor leaves exactly this behind.
+        assert!(!Ipc::at(path.clone()).is_listening().unwrap());
+
+        let missing = dir.path().join("missing.sock");
+        assert!(!Ipc::at(missing).is_listening().unwrap());
     }
 
     // Real Unix listeners test framing and acknowledgements without changing
@@ -229,7 +330,7 @@ mod tests {
                 "unexpected request terminator: {trailing:?}"
             );
         });
-        (dir, Ipc { path }, server)
+        (dir, Ipc::at(path), server)
     }
 
     #[test]
@@ -312,5 +413,93 @@ mod tests {
         let error = exchange(&mut client, "j/clients", Duration::from_millis(40)).unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Accepts and reads a request, then never answers: a hung compositor.
+    fn stalled_peer() -> (tempfile::TempDir, Ipc, thread::JoinHandle<()>) {
+        let dir = tempfile::Builder::new()
+            .prefix("ts-ipc-stall-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = dir.path().join("socket");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(8)))
+                .unwrap();
+            // Ends when the client gives up and closes its end.
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).unwrap();
+            assert_eq!(request, b"j/monitors");
+        });
+        (dir, Ipc::at(path), server)
+    }
+
+    #[test]
+    fn an_armed_budget_ends_a_stalled_request_within_it() {
+        // The stop signal's teardown budget, then recovery's own budget.
+        for recovery in [false, true] {
+            let (_dir, mut ipc, server) = stalled_peer();
+            let start = Instant::now();
+            let deadline = start + Duration::from_millis(300);
+            let result = if recovery {
+                ipc.deadline = Some(deadline);
+                ipc.query("monitors")
+            } else {
+                ipc.request_before(Some(deadline), "j/monitors")
+            };
+            let elapsed = start.elapsed();
+            server.join().unwrap();
+            let error = format!("{:#}", result.unwrap_err());
+            assert!(error.contains("timed out"), "{error}");
+            assert!(
+                (Duration::from_millis(250)..Duration::from_secs(2)).contains(&elapsed),
+                "recovery {recovery}: took {elapsed:?}, not the 300 ms budget"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spent_budget_fails_before_connecting() {
+        let dir = tempfile::Builder::new()
+            .prefix("ts-ipc-spent-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        // Nothing listens here, so connecting would fail with another error.
+        let mut ipc = Ipc::at(dir.path().join("socket"));
+        let spent = Instant::now();
+        for (own, teardown) in [(Some(spent), None), (None, Some(spent))] {
+            ipc.deadline = own;
+            let error = ipc.request_before(teardown, "j/monitors").unwrap_err();
+            assert!(format!("{error:#}").contains("time limit"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn unarmed_requests_keep_the_normal_timeout() {
+        let now = Instant::now();
+        let mut ipc = Ipc::at(PathBuf::from("/unused"));
+        assert_eq!(IO_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(ipc.timeout(None, now).unwrap(), IO_TIMEOUT);
+        // Armed: the smaller of the usual timeout and what is left.
+        let far = now + Duration::from_secs(60);
+        let near = now + Duration::from_millis(300);
+        assert_eq!(ipc.timeout(Some(far), now).unwrap(), IO_TIMEOUT);
+        let short = Duration::from_millis(300);
+        assert_eq!(ipc.timeout(Some(near), now).unwrap(), short);
+        ipc.deadline = Some(far);
+        assert_eq!(ipc.timeout(Some(near), now).unwrap(), short);
+        ipc.deadline = Some(near);
+        assert_eq!(ipc.timeout(Some(far), now).unwrap(), short);
+    }
+
+    #[test]
+    fn recovery_has_its_own_total_budget() {
+        let before = Instant::now();
+        let ipc = Ipc::for_instance("commit_123_456").unwrap();
+        let deadline = ipc.deadline.expect("recovery bounds all of its requests");
+        assert!(deadline >= before + TEARDOWN_BUDGET);
+        assert!(deadline <= Instant::now() + TEARDOWN_BUDGET);
     }
 }

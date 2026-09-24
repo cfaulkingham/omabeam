@@ -2,23 +2,41 @@
 """Encoder selection and hardware acceptance using generated frames only.
 
 Default checks need no GPU. --require-hardware also requires the real helper
-to encode on this machine's GPU; failures never count as hardware success.
+to encode on this machine's GPU at every checked size; failures never count
+as hardware success.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
 import tempfile
 
 
-def probe(binary, mode, success=True):
-    result = subprocess.run([str(binary), '--check-encoders', '--encoder', mode],
-                            capture_output=True, text=True, timeout=12)
+DEFAULT_SIZES = [(640, 360), (1920, 1080), (3840, 2160)]
+
+
+def probe(binary, mode, success=True, sizes=()):
+    # In auto mode each size may wait out the helper's 5 s start timeout and a
+    # 0.75 s frame timeout before falling back to software: allow 10 s a size.
+    timeout = 5 + 10 * len(sizes or DEFAULT_SIZES)
+    result = subprocess.run([str(binary), '--check-encoders', *sizes, '--encoder', mode],
+                            capture_output=True, text=True, timeout=timeout)
     assert (result.returncode == 0) == success, result.stdout + result.stderr
-    return json.loads(result.stdout) if success else result.stderr
+    if not success:
+        return result.stderr
+    report = json.loads(result.stdout)
+    # One result per distinct size, rounded up to even as a stream would be.
+    requested = dict.fromkeys(tuple(map(int, re.split('[xX×]', size))) for size in sizes)
+    expected = [(width + width % 2, height + height % 2) for width, height in requested] or DEFAULT_SIZES
+    assert [(size['width'], size['height']) for size in report['sizes']] == expected, report
+    # The top-level fields are the first size without hardware, else the first size.
+    summary = next((size for size in report['sizes'] if not size['hardware']), report['sizes'][0])
+    assert {key: report[key] for key in summary} == summary, report
+    return report
 
 
 def main():
@@ -36,14 +54,21 @@ def main():
         shutil.copy2(binary, isolated)
         auto = probe(isolated, 'auto')
         assert auto['encoder'] == 'OpenH264 software' and not auto['hardware'] and auto['note'], auto
+        assert all(size['encoder'] == 'OpenH264 software' and not size['hardware'] and size['note']
+                   for size in auto['sizes']), auto
         software = probe(isolated, 'software')
         assert not software['hardware'] and software['note'] is None, software
+        assert all(not size['hardware'] and size['note'] is None for size in software['sizes']), software
+        probe(isolated, 'software', sizes=['1280x720', '1279X719', '720×1280', '1280x720'])
         assert 'helper' in probe(isolated, 'hardware', success=False)
+        assert 'WxH' in probe(isolated, 'software', success=False, sizes=['1920'])
+        assert '3840' in probe(isolated, 'software', success=False, sizes=['4096x2160'])
     actual = probe(binary, 'auto')
     if args.require_hardware:
-        assert actual['hardware'], actual
-        assert probe(binary, 'hardware')['hardware']
-    print('PASS encoder selection: missing helper fallback, explicit software, required hardware, and real local probe')
+        assert all(size['hardware'] for size in actual['sizes']), actual
+        assert all(size['hardware'] for size in probe(binary, 'hardware')['sizes'])
+    print('PASS encoder selection at 640x360, 1080p, 4K, and requested sizes: missing helper fallback, '
+          'explicit software, required hardware, and real local probe')
     print(json.dumps(actual, indent=2))
     if args.browser:
         from playwright.sync_api import sync_playwright

@@ -40,6 +40,118 @@ def source_copy(destination):
     shutil.copy2(ROOT / "vendor/localsend/UPSTREAM.md", destination / "vendor/localsend/UPSTREAM.md")
 
 
+def native_app_script():
+    """Mock native app written by the fake `cargo install` below. Without
+    OMABEAM_TEST_HYPR_STATE naming a state directory, it keeps the behavior
+    test_installer_build_bundle_upgrade_and_git_checkout relies on: --hypr
+    version fails, so install.sh skips the reload entirely. With it, it
+    simulates the real CLI's --hypr version/reload/configerrors contract so
+    the config-error-baseline path in edit_hypr can be exercised: reload
+    copies errors-after.json over errors-current.json (if staged), and
+    configerrors always reports whatever errors-current.json holds (or []).
+    """
+    return f'''#!{sys.executable}
+import os
+import shutil
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+state = os.environ.get("OMABEAM_TEST_HYPR_STATE")
+log = os.environ.get("OMABEAM_TEST_LOG")
+
+
+def log_call(entry):
+    if log:
+        with open(log, "a") as stream:
+            stream.write(entry + "\\n")
+
+
+if not state:
+    if args == ["--hypr", "version"]:
+        sys.exit(1)
+    print("native app")
+    sys.exit(0)
+
+directory = Path(state)
+if args == ["--hypr", "version"]:
+    sys.exit(0)
+if args == ["--hypr", "reload"]:
+    after = directory / "errors-after.json"
+    if after.exists():
+        shutil.copyfile(after, directory / "errors-current.json")
+    log_call("reload")
+    print("ok")
+    sys.exit(0)
+if args == ["--hypr", "configerrors"]:
+    current = directory / "errors-current.json"
+    print(current.read_text() if current.exists() else "[]")
+    sys.exit(0)
+print("native app")
+'''
+
+
+def install_env(base, *, hypr_state=None, log=None):
+    """Shared harness for exercising install.sh end to end: a disposable
+    HOME/config plus mocked uname/wl-copy/omarchy/omarchy-shell/cargo/ufw
+    (see test_installer_build_bundle_upgrade_and_git_checkout for the
+    pattern this extends). Optionally wires the Hyprland-reload state
+    directory and shared call log that the native/omarchy/omarchy-shell
+    mocks use to simulate a reachable compositor and record call order."""
+    home, tools = base / "home", base / "tools"
+    tools.mkdir()
+    mock_firewall(tools)
+    config = home / "config with spaces"
+    hypr = config / "hypr"
+    hypr.mkdir(parents=True)
+    (hypr / "hyprland.lua").write_text("-- user config\n")
+    (hypr / "bindings.lua").write_text("-- user binding\n")
+    executable(tools / "uname", "#!/bin/sh\necho Linux\n")
+    executable(tools / "wl-copy", "#!/bin/sh\nexit 0\n")
+    executable(tools / "omarchy-shell", f'''#!{sys.executable}
+import os
+import sys
+log = os.environ.get("OMABEAM_TEST_LOG")
+if log:
+    with open(log, "a") as stream:
+        stream.write(" ".join(sys.argv[1:]) + "\\n")
+''')
+    executable(tools / "omarchy", f'''#!{sys.executable}
+import json
+import os
+import sys
+from pathlib import Path
+log = os.environ.get("OMABEAM_TEST_LOG")
+if log:
+    with open(log, "a") as stream:
+        stream.write(" ".join(sys.argv[1:]) + "\\n")
+if sys.argv[1:3] == ["plugin", "validate"]:
+    root = Path(sys.argv[3])
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert (root / manifest["entryPoints"]["barWidget"]).is_file()
+''')
+    native = native_app_script()
+    executable(tools / "cargo", f'''#!{sys.executable}
+import sys
+from pathlib import Path
+assert "--locked" in sys.argv
+root = Path(sys.argv[sys.argv.index("--root") + 1])
+name = "omabeam-encoder" if Path(sys.argv[sys.argv.index("--path") + 1]).name == "omabeam-encoder" else "omabeam"
+path = root / "bin" / name
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text({native!r})
+path.chmod(0o755)
+''')
+    env = {**os.environ, "HOME": str(home), "XDG_CONFIG_HOME": str(config),
+           "XDG_CACHE_HOME": str(home / "cache"), "PATH": f"{tools}:{os.environ['PATH']}"}
+    if hypr_state is not None:
+        hypr_state.mkdir(parents=True, exist_ok=True)
+        env["OMABEAM_TEST_HYPR_STATE"] = str(hypr_state)
+    if log is not None:
+        env["OMABEAM_TEST_LOG"] = str(log)
+    return env, hypr
+
+
 class Packaging(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="omabeam-package-")
@@ -106,6 +218,38 @@ class Packaging(unittest.TestCase):
         helper.write_bytes(self.binary.read_bytes())
         helper.chmod(0o644)
         with self.assertRaisesRegex(ValueError, "executable"):
+            package()
+
+    def test_cast_helper_requires_matching_binary_and_notice_inventory(self):
+        notices = self.base / "cast-notices"
+        notices.mkdir()
+        license_file = notices / "LICENSE"
+        license_file.write_text("test-only native license\n")
+        manifest = {"upstream":{"fixture":"test"}, "binary":{"protocol":1,
+            "sha256":hashlib.sha256(self.binary.read_bytes()).hexdigest()}, "files":[{
+            "path":"LICENSE", "sha256":hashlib.sha256(license_file.read_bytes()).hexdigest()}]}
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        def package(license_dir=notices):
+            return PACKAGER.package(self.binary, "x86_64-unknown-linux-gnu", self.licenses,
+                self.base / "dist", root=self.source, encoder_helper=self.binary,
+                cast_helper=self.binary, cast_licenses=license_dir)
+        with tarfile.open(package()) as tar:
+            self.assertEqual(tar.getmember(f"{PLUGIN_ID}/omarchy-plugin/native/bin/omabeam-cast").mode, 0o755)
+            self.assertIn(f"{PLUGIN_ID}/licenses/cast/LICENSE", tar.getnames())
+        with self.assertRaisesRegex(ValueError, "together"):
+            package(None)
+        manifest["binary"]["sha256"] = "wrong"
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            package()
+        manifest["binary"]["sha256"] = hashlib.sha256(self.binary.read_bytes()).hexdigest()
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        license_file.write_text("modified notice")
+        with self.assertRaisesRegex(ValueError, "checksum"):
+            package()
+        manifest["files"][0]["path"] = "../THIRDPARTY.yml"
+        (notices / "manifest.json").write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "Unsafe"):
             package()
 
     def test_launcher_requires_plugin_binary_and_preserves_literal_arguments(self):
@@ -198,6 +342,191 @@ path.chmod(0o755)
         bindings = (hypr / "bindings.lua").read_text()
         self.assertNotIn("OmaBeam", bindings)
         self.assertNotIn("omabeam (install.sh)", (hypr / "hyprland.lua").read_text())
+
+    def run_install(self, source, *args, env, success=True):
+        result = subprocess.run(["bash", str(source / "install.sh"), *args], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+        return result
+
+    def test_hypr_reload_baseline_ignores_preexisting_errors_and_reloads_before_restart(self):
+        state = self.base / "hypr-state"
+        log = self.base / "install-log.txt"
+        env, hypr = install_env(self.base, hypr_state=state, log=log)
+        (state / "errors-current.json").write_text(json.dumps(["config error at line 3: bad value"]))
+        result = self.run_install(self.source, env=env)
+        self.assertIn("Hyprland already reported these configuration errors before OmaBeam changed anything:", result.stdout)
+        self.assertIn("config error at line 3: bad value", result.stdout)
+        self.assertIn('o.window("omabeam"', (hypr / "hyprland.lua").read_text())
+        calls = log.read_text().splitlines()
+        self.assertLess(calls.index("reload"), calls.index("restart shell"))
+
+    def test_hypr_reload_rejects_new_config_errors_and_rolls_back(self):
+        state = self.base / "hypr-state"
+        log = self.base / "install-log.txt"
+        env, hypr = install_env(self.base, hypr_state=state, log=log)
+        (state / "errors-after.json").write_text(json.dumps(["config error at line 90: omabeam broke it"]))
+        before = {name: (hypr / name).read_text() for name in ("hyprland.lua", "bindings.lua")}
+        result = self.run_install(self.source, env=env, success=False)
+        self.assertIn("config error at line 90: omabeam broke it", result.stderr)
+        self.assertEqual(before, {name: (hypr / name).read_text() for name in ("hyprland.lua", "bindings.lua")})
+        installed = Path(env["XDG_CONFIG_HOME"]) / "omarchy/plugins" / PLUGIN_ID
+        self.assertFalse(installed.exists())
+        calls = log.read_text().splitlines() if log.exists() else []
+        self.assertFalse(any("plugin enable" in call for call in calls))
+        self.assertNotIn("restart shell", calls)
+
+    def test_remove_desktop_config_error_baseline_allows_preexisting_errors(self):
+        state = self.base / "hypr-state"
+        env, hypr = install_env(self.base, hypr_state=state)
+        # --remove-desktop never builds; it needs an already-built native
+        # binary on $ROOT to reach Hyprland at all (the same one a real
+        # install would have left behind), otherwise reload is skipped.
+        self.run_install(self.source, "--backend-only", env=env)
+        (hypr / "hyprland.lua").write_text(
+            '-- user config\n'
+            '-- omabeam (install.sh)\n'
+            'o.window("omabeam", {\n'
+            '  float = true,\n'
+            '  center = true,\n'
+            '  focus_on_activate = false,\n'
+            '  animation = "popin",\n'
+            '  size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },\n'
+            '  max_size = { 980, 560 },\n'
+            '})\n'
+        )
+        (hypr / "bindings.lua").write_text(
+            '-- user binding\n-- omabeam (install.sh)\n'
+            'o.bind("SUPER + SHIFT + T", "OmaBeam", { launch = "/old/bin/omabeam" })\n'
+        )
+        (state / "errors-current.json").write_text(json.dumps(["config error at line 12: user typo"]))
+        (state / "errors-after.json").write_text(json.dumps(["config error at line 8: user typo"]))
+        result = self.run_install(self.source, "--remove-desktop", env=env)
+        self.assertIn("Hyprland already reported these configuration errors before OmaBeam changed anything:", result.stdout)
+        self.assertNotIn("OmaBeam", (hypr / "bindings.lua").read_text())
+        self.assertNotIn("omabeam (install.sh)", (hypr / "hyprland.lua").read_text())
+
+    def test_window_rules_float_the_picker_and_the_send_window(self):
+        env, hypr = install_env(self.base)
+        # An installation from before the send window had its own app id.
+        picker_only = (
+            '-- user config\n'
+            '-- omabeam (install.sh)\n'
+            'o.window("omabeam", {\n'
+            '  float = true,\n'
+            '  center = true,\n'
+            '  focus_on_activate = false,\n'
+            '  animation = "popin",\n'
+            '  size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },\n'
+            '  max_size = { 980, 560 },\n'
+            '})\n'
+        )
+        (hypr / "hyprland.lua").write_text(picker_only)
+        self.run_install(self.source, env=env)
+        upgraded = (hypr / "hyprland.lua").read_text()
+        self.assertEqual(upgraded.count("-- omabeam (install.sh)"), 1, upgraded)
+        self.assertEqual(upgraded.count('o.window("omabeam", {'), 1, upgraded)
+        self.assertEqual(upgraded.count('o.window("omabeam-send", {'), 1, upgraded)
+        send_rule = upgraded[upgraded.index('o.window("omabeam-send", {'):]
+        self.assertIn("float = true", send_rule)
+        self.assertIn("center = true", send_rule)
+        self.assertIn("size = { 440, 560 }", send_rule)
+        # After the picker's rule, so the send window's size wins even where
+        # the picker's class would also match it.
+        self.assertLess(upgraded.index('o.window("omabeam", {'), upgraded.index('o.window("omabeam-send", {'))
+        # Reinstalling keeps a single up-to-date block.
+        self.run_install(self.source, env=env)
+        self.assertEqual((hypr / "hyprland.lua").read_text(), upgraded)
+        self.run_install(self.source, "--remove-desktop", env=env)
+        removed = (hypr / "hyprland.lua").read_text()
+        self.assertNotIn("omabeam", removed)
+        self.assertIn("-- user config", removed)
+
+    def test_symlinked_hyprland_lua_is_not_edited_and_prints_both_blocks(self):
+        env, hypr = install_env(self.base)
+        external = self.base / "external-hyprland.lua"
+        external.write_text("-- externally managed by chezmoi\n")
+        (hypr / "hyprland.lua").unlink()
+        (hypr / "hyprland.lua").symlink_to(external)
+        bindings_before = (hypr / "bindings.lua").read_text()
+        result = self.run_install(self.source, env=env)
+        # Only hyprland.lua is linked, but bindings.lua is left unedited too
+        # (edit_hypr never edits one file without the other), so the printed
+        # guidance must cover both files, not just the one that tripped it.
+        self.assertIn('o.window("omabeam"', result.stdout)
+        self.assertIn('o.window("omabeam-send"', result.stdout)
+        self.assertIn("o.bind(", result.stdout)
+        self.assertIn("bindings.lua", result.stdout)
+        self.assertTrue((hypr / "hyprland.lua").is_symlink())
+        self.assertEqual(os.readlink(hypr / "hyprland.lua"), str(external))
+        self.assertEqual(external.read_text(), "-- externally managed by chezmoi\n")
+        self.assertEqual((hypr / "bindings.lua").read_text(), bindings_before)
+        # The banner must not claim a key bind that was never added.
+        self.assertNotIn("SUPER + SHIFT + T  or", result.stdout)
+        self.assertNotIn("Traceback", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_symlinked_bindings_lua_is_not_edited_and_prints_both_blocks(self):
+        env, hypr = install_env(self.base)
+        external = self.base / "external-bindings.lua"
+        external.write_text("-- externally managed by chezmoi\n")
+        (hypr / "bindings.lua").unlink()
+        (hypr / "bindings.lua").symlink_to(external)
+        hyprland_before = (hypr / "hyprland.lua").read_text()
+        result = self.run_install(self.source, env=env)
+        # The mirror image of the case above: only bindings.lua is linked,
+        # but hyprland.lua's window-rule guidance must still be printed.
+        self.assertIn('o.window("omabeam"', result.stdout)
+        self.assertIn("o.bind(", result.stdout)
+        self.assertIn("hyprland.lua", result.stdout)
+        self.assertTrue((hypr / "bindings.lua").is_symlink())
+        self.assertEqual(os.readlink(hypr / "bindings.lua"), str(external))
+        self.assertEqual(external.read_text(), "-- externally managed by chezmoi\n")
+        self.assertEqual((hypr / "hyprland.lua").read_text(), hyprland_before)
+        self.assertNotIn("SUPER + SHIFT + T  or", result.stdout)
+        self.assertNotIn("Traceback", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_remove_desktop_with_symlinked_bindings_lua_fails_without_editing(self):
+        env, hypr = install_env(self.base)
+        external = self.base / "external-bindings.lua"
+        external.write_text(
+            '-- user binding\n-- omabeam (install.sh)\n'
+            'o.bind("SUPER + SHIFT + T", "OmaBeam", { launch = "/old/bin/omabeam" })\n'
+        )
+        hypr_before = (hypr / "hyprland.lua").read_text()
+        external_before = external.read_text()
+        (hypr / "bindings.lua").unlink()
+        (hypr / "bindings.lua").symlink_to(external)
+        result = self.run_install(self.source, "--remove-desktop", env=env, success=False)
+        self.assertIn("-- omabeam (install.sh)", result.stderr)
+        self.assertIn("by hand", result.stderr)
+        # Only bindings.lua is linked, but the message must still name both
+        # files: neither one is touched, so the user must clean up both.
+        self.assertIn("hyprland.lua", result.stderr)
+        self.assertIn("bindings.lua", result.stderr)
+        self.assertNotIn("Traceback", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual((hypr / "hyprland.lua").read_text(), hypr_before)
+        self.assertTrue((hypr / "bindings.lua").is_symlink())
+        self.assertEqual(external.read_text(), external_before)
+
+    def test_hardware_encoder_helper_warns_only_when_ldd_reports_missing_libraries(self):
+        env, hypr = install_env(self.base)
+        tools = self.base / "tools"
+        executable(tools / "ldd", "#!/bin/sh\nprintf '\\tlibavcodec.so.60 => not found\\n\\tlibavutil.so.58 => not found\\n'\n")
+        result = self.run_install(self.source, "--backend-only", env=env)
+        self.assertIn("hardware encoder helper cannot load", result.stdout)
+        self.assertIn("libavcodec.so.60", result.stdout)
+        self.assertIn("libavutil.so.58", result.stdout)
+        executable(tools / "ldd", "#!/bin/sh\nprintf '\\tlibc.so.6 => /lib/libc.so.6 (0x1)\\n'\n")
+        result = self.run_install(self.source, "--backend-only", env=env)
+        self.assertNotIn("hardware encoder helper cannot load", result.stdout)
+        # A non-dynamic executable makes real `ldd` exit non-zero; the check
+        # must stay quiet and must not abort the script under `set -euo pipefail`.
+        executable(tools / "ldd", "#!/bin/sh\necho 'not a dynamic executable' >&2\nexit 1\n")
+        result = self.run_install(self.source, "--backend-only", env=env)
+        self.assertNotIn("hardware encoder helper cannot load", result.stdout)
+        self.assertNotIn("not a dynamic executable", result.stdout + result.stderr)
 
     def test_installer_check_only_scoped_open_and_invalid_arguments(self):
         home, tools = self.base / "home", self.base / "tools"

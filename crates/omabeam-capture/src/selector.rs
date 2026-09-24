@@ -1,6 +1,7 @@
 use crate::{Rect, Region, connection::*, pixels::BufferSpec};
 use anyhow::{Context, Result, bail, ensure};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
 pub(crate) struct Overlay {
@@ -9,7 +10,16 @@ pub(crate) struct Overlay {
     layer: layer_surface::ZwlrLayerSurfaceV1,
     size: Option<(u32, u32)>,
     scale: i32,
+    origin: (i32, i32),
     pub buffers: Vec<Buffer>,
+    /// Parallel to `buffers` (the release handler only knows `Buffer`): the
+    /// frame each one holds, or `None` until it has been drawn in full.
+    drawn: Vec<Option<Frame>>,
+    /// What the compositor shows, for damage; `None` forces full damage.
+    shown: Option<Shown>,
+    /// The last commit's `wl_surface.frame` has not fired; redraws wait for it.
+    frame_pending: bool,
+    scratch: Vec<u8>,
     dirty: bool,
 }
 impl Drop for Overlay {
@@ -132,9 +142,33 @@ pub(crate) struct Selector {
     result: Option<Result<Region>>,
 }
 impl Selector {
-    fn dirty(&mut self) {
+    /// Applies an input change to the drag and marks only the overlays whose
+    /// image it can change: those the old or the new rect overlaps.
+    fn update(&mut self, outputs: &HashMap<u32, Output>, change: impl FnOnce(&mut Drag)) {
+        let before = self.drag.rect();
+        change(&mut self.drag);
+        let after = self.drag.rect();
+        if before == after {
+            return;
+        }
         for overlay in &mut self.overlays {
-            overlay.dirty = true;
+            let bounds =
+                overlay
+                    .size
+                    .zip(outputs.get(&overlay.output))
+                    .map(|((width, height), output)| Rect {
+                        x: output.position.0,
+                        y: output.position.1,
+                        width,
+                        height,
+                    });
+            // An overlay without a size yet is drawn in full once configured.
+            overlay.dirty |= bounds.is_none_or(|bounds| {
+                [before, after]
+                    .into_iter()
+                    .flatten()
+                    .any(|rect| rect.intersect(bounds).is_some())
+            });
         }
     }
     fn cancel(&mut self) {
@@ -254,7 +288,12 @@ fn run_selector(runtime: &mut Runtime) -> Result<Region> {
             layer,
             size: None,
             scale: output.scale,
+            origin: output.position,
             buffers: Vec::new(),
+            drawn: Vec::new(),
+            shown: None,
+            frame_pending: false,
+            scratch: Vec::new(),
             dirty: true,
         });
     }
@@ -293,11 +332,13 @@ fn render_overlays(state: &mut State, qh: &QueueHandle<State>) -> Result<()> {
             .outputs
             .get(&overlay.output)
             .context("selected output disconnected")?;
-        if overlay.scale != output.scale {
+        if overlay.scale != output.scale || overlay.origin != output.position {
             overlay.scale = output.scale;
+            overlay.origin = output.position;
             overlay.dirty = true;
         }
-        if !overlay.dirty {
+        // The compositor paces redraws: one commit per frame callback.
+        if !overlay.dirty || overlay.frame_pending {
             continue;
         }
         let scale = overlay.scale.max(1) as u32;
@@ -308,7 +349,27 @@ fn render_overlays(state: &mut State, qh: &QueueHandle<State>) -> Result<()> {
                 .context("overlay height overflow")?,
             wl_shm::Format::Argb8888,
         )?;
-        overlay.buffers.retain(|b| b.busy || b.spec == spec);
+        let bounds = Rect {
+            x: output.position.0,
+            y: output.position.1,
+            width,
+            height,
+        };
+        let frame = overlay_frame(spec, bounds, selection);
+        let damage = match overlay.shown {
+            Some(shown) if shown.spec == spec && shown.scale == scale => {
+                changed(shown.frame, frame)
+            }
+            _ => Some([0, 0, spec.width, spec.height]),
+        };
+        let Some([x0, y0, x1, y1]) = damage else {
+            // The rect changed elsewhere; this overlay's image did not.
+            overlay.dirty = false;
+            continue;
+        };
+        retain_parallel(&mut overlay.buffers, &mut overlay.drawn, |b| {
+            b.busy || b.spec == spec
+        });
         let free = overlay
             .buffers
             .iter()
@@ -323,28 +384,180 @@ fn render_overlays(state: &mut State, qh: &QueueHandle<State>) -> Result<()> {
             overlay
                 .buffers
                 .push(Buffer::new(state.shm.as_ref().unwrap(), spec, qh)?);
+            overlay.drawn.push(None);
             overlay.buffers.len() - 1
         };
+        // Rewrite what this buffer holds, which may be older than what is shown.
+        let rows = stale_rows(overlay.drawn[index], frame, spec.height);
+        if !rows.is_empty() {
+            draw_rows(spec, frame, rows.clone(), &mut overlay.scratch);
+            overlay.buffers[index].write_rows(rows.start, &overlay.scratch)?;
+        }
+        overlay.drawn[index] = Some(frame);
         let buffer = &mut overlay.buffers[index];
-        let bounds = Rect {
-            x: output.position.0,
-            y: output.position.1,
-            width,
-            height,
-        };
-        let bytes = draw_overlay(spec, bounds, selection)?;
-        buffer.write(&bytes)?;
         buffer.busy = true;
         overlay.surface.set_buffer_scale(scale as i32);
         overlay.surface.attach(Some(&buffer.proxy), 0, 0);
-        overlay.surface.damage(0, 0, width as i32, height as i32);
+        if overlay.surface.version() >= 4 {
+            overlay
+                .surface
+                .damage_buffer(x0 as i32, y0 as i32, (x1 - x0) as i32, (y1 - y0) as i32);
+        } else {
+            overlay.surface.damage(0, 0, width as i32, height as i32);
+        }
+        overlay.surface.frame(qh, OverlayFrame(overlay.output));
         overlay.surface.commit();
+        overlay.frame_pending = true;
+        overlay.shown = Some(Shown { spec, scale, frame });
         overlay.dirty = false;
     }
     Ok(())
 }
 
-fn draw_overlay(spec: BufferSpec, logical: Rect, selection: Option<Rect>) -> Result<Vec<u8>> {
+/// Removes the items `keep` rejects, and the entries at the same positions of
+/// `parallel`.
+fn retain_parallel<T, U>(items: &mut Vec<T>, parallel: &mut Vec<U>, keep: impl Fn(&T) -> bool) {
+    let mut i = 0;
+    while i < items.len() {
+        if keep(&items[i]) {
+            i += 1;
+        } else {
+            items.remove(i);
+            parallel.remove(i);
+        }
+    }
+}
+
+/// Buffer-pixel edges of the selection on one overlay, as half-open ranges per
+/// axis: the selection, and the part inside its 2 px border.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Spans {
+    x: (u32, u32),
+    y: (u32, u32),
+    inner_x: (u32, u32),
+    inner_y: (u32, u32),
+}
+/// An overlay image; `None` is dim throughout.
+type Frame = Option<Spans>;
+/// A committed frame and the buffer geometry it was committed with.
+#[derive(Clone, Copy)]
+struct Shown {
+    spec: BufferSpec,
+    scale: u32,
+    frame: Frame,
+}
+
+const DIM: [u8; 4] = 0x66000000u32.to_ne_bytes();
+const CLEAR: [u8; 4] = 0u32.to_ne_bytes();
+const BORDER: [u8; 4] = 0xff82aaffu32.to_ne_bytes();
+
+/// The selection on an overlay whose buffer `spec` covers `logical`.
+fn overlay_frame(spec: BufferSpec, logical: Rect, selection: Option<Rect>) -> Frame {
+    let r = selection?;
+    let scale = spec.width as f64 / logical.width as f64;
+    let columns = |from, to| {
+        let (x, width) = (logical.x, spec.width);
+        (edge(x, scale, width, from), edge(x, scale, width, to))
+    };
+    let rows = |from, to| {
+        let (y, height) = (logical.y, spec.height);
+        (edge(y, scale, height, from), edge(y, scale, height, to))
+    };
+    let (left, top) = (r.x as f64, r.y as f64);
+    let (right, bottom) = (r.right() as f64, r.bottom() as f64);
+    let (x, y) = (columns(left, right), rows(top, bottom));
+    (x.0 < x.1 && y.0 < y.1).then(|| Spans {
+        x,
+        y,
+        inner_x: columns(left + 2.0, right - 2.0),
+        inner_y: rows(top + 2.0, bottom - 2.0),
+    })
+}
+
+/// The first buffer pixel in `0..=len` whose logical coordinate reaches `at`.
+/// This reproduces the old per-pixel f64 edge tests (see the reference test).
+fn edge(origin: i32, scale: f64, len: u32, at: f64) -> u32 {
+    ((at - f64::from(origin)) * scale)
+        .ceil()
+        .clamp(0.0, f64::from(len)) as u32
+}
+
+/// Draws whole `rows` of `frame` into `out`. There are three kinds of row
+/// (dim, border, inside); each is drawn once, then copied.
+fn draw_rows(spec: BufferSpec, frame: Frame, rows: Range<u32>, out: &mut Vec<u8>) {
+    let stride = spec.stride as usize;
+    out.clear();
+    out.reserve(rows.len() * stride);
+    let mut first = [None; 3];
+    for y in rows {
+        let kind = match frame {
+            Some(s) if (s.y.0..s.y.1).contains(&y) => {
+                1 + usize::from((s.inner_y.0..s.inner_y.1).contains(&y))
+            }
+            _ => 0,
+        };
+        let start = out.len();
+        if let Some(row) = first[kind] {
+            out.extend_from_within(row..row + stride);
+            continue;
+        }
+        first[kind] = Some(start);
+        out.extend(std::iter::repeat_n(DIM, spec.width as usize).flatten());
+        out.resize(start + stride, 0);
+        if let Some(s) = frame
+            && kind > 0
+        {
+            let row = &mut out[start..];
+            let mut paint = |columns: (u32, u32), pixel: [u8; 4]| {
+                let bytes = &mut row[columns.0 as usize * 4..columns.1 as usize * 4];
+                for p in bytes.chunks_exact_mut(4) {
+                    p.copy_from_slice(&pixel);
+                }
+            };
+            paint(s.x, BORDER);
+            if kind == 2 && s.inner_x.0 < s.inner_x.1 {
+                paint(s.inner_x, CLEAR);
+            }
+        }
+    }
+}
+
+/// The buffer-pixel box `[x0, y0, x1, y1]` outside which two frames are the
+/// same, or `None` when they are identical.
+fn changed(a: Frame, b: Frame) -> Option<[u32; 4]> {
+    if a == b {
+        return None;
+    }
+    [a, b]
+        .into_iter()
+        .flatten()
+        .map(|s| [s.x.0, s.y.0, s.x.1, s.y.1])
+        .reduce(|p, q| {
+            [
+                p[0].min(q[0]),
+                p[1].min(q[1]),
+                p[2].max(q[2]),
+                p[3].max(q[3]),
+            ]
+        })
+}
+
+/// The rows of a buffer holding `held` that differ from `frame`; all of them
+/// when the buffer's content is unknown.
+fn stale_rows(held: Option<Frame>, frame: Frame, height: u32) -> Range<u32> {
+    match held {
+        None => 0..height,
+        Some(held) => changed(held, frame).map_or(0..0, |[_, top, _, bottom]| top..bottom),
+    }
+}
+
+/// The old per-pixel renderer: the reference `draw_rows` must match.
+#[cfg(test)]
+pub(crate) fn draw_overlay(
+    spec: BufferSpec,
+    logical: Rect,
+    selection: Option<Rect>,
+) -> Result<Vec<u8>> {
     let mut bytes = vec![0; spec.byte_len()?];
     let scale = spec.width as f64 / logical.width as f64;
     for y in 0..spec.height {
@@ -385,15 +598,12 @@ fn move_pointer(state: &mut State, seat_id: u32, x: f64, y: f64) {
     let Some(output) = seat.output.and_then(|id| state.outputs.get(&id)) else {
         return;
     };
+    let position = (
+        output.position.0.saturating_add(x.floor() as i32),
+        output.position.1.saturating_add(y.floor() as i32),
+    );
     if let Some(selector) = &mut state.selector {
-        selector.drag.motion(
-            seat_id,
-            (
-                output.position.0.saturating_add(x.floor() as i32),
-                output.position.1.saturating_add(y.floor() as i32),
-            ),
-        );
-        selector.dirty();
+        selector.update(&state.outputs, |drag| drag.motion(seat_id, position));
     }
 }
 fn surface_output(state: &State, surface: &wl_surface::WlSurface) -> Option<u32> {
@@ -451,6 +661,28 @@ fn set_cursor(
         pointer.set_cursor(serial, Some(&seat.cursor.as_ref().unwrap().0), 11, 11);
     }
     Ok(())
+}
+
+/// An overlay's `wl_surface.frame` callback, by output.
+pub(crate) struct OverlayFrame(u32);
+impl Dispatch<wl_callback::WlCallback, OverlayFrame> for State {
+    fn event(
+        state: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        frame: &OverlayFrame,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `done` is the only event.
+        if let Some(overlay) = state
+            .selector
+            .as_mut()
+            .and_then(|s| s.overlays.iter_mut().find(|o| o.output == frame.0))
+        {
+            overlay.frame_pending = false;
+        }
+    }
 }
 
 impl Dispatch<layer_surface::ZwlrLayerSurfaceV1, u32> for State {
@@ -587,8 +819,7 @@ impl Dispatch<wl_pointer::WlPointer, u32> for State {
                             selector.cancel();
                         }
                     } else if button_state == wl_pointer::ButtonState::Pressed {
-                        selector.drag.start(*id);
-                        selector.dirty();
+                        selector.update(&state.outputs, |drag| drag.start(*id));
                     } else {
                         selector.finish(*id, &state.outputs);
                     }
@@ -627,8 +858,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, u32> for State {
                     selector.drag.moving = down;
                 }
                 if key == 42 || key == 54 {
-                    selector.drag.square = down;
-                    selector.dirty();
+                    selector.update(&state.outputs, |drag| drag.square = down);
                 }
             }
         }
@@ -657,8 +887,7 @@ impl Dispatch<wl_touch::WlTouch, u32> for State {
                 }
                 move_pointer(state, *seat_id, x, y);
                 if let Some(selector) = &mut state.selector {
-                    selector.drag.start(*seat_id);
-                    selector.dirty();
+                    selector.update(&state.outputs, |drag| drag.start(*seat_id));
                 }
             }
             wl_touch::Event::Motion { id, x, y, .. }
@@ -806,5 +1035,188 @@ mod tests {
         assert_eq!(pixel(0, 0), 0x66000000);
         assert_eq!(pixel(5, 5), 0xff82aaff);
         assert_eq!(pixel(10, 10), 0);
+    }
+
+    /// Deterministic pseudo-random values for broad boundary coverage.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self, range: std::ops::Range<i32>) -> i32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            range.start + ((self.0 >> 33) % (range.end - range.start) as u64) as i32
+        }
+    }
+    /// The first pixel `(x, y)` where two images differ.
+    fn mismatch(a: &[u8], b: &[u8], width: u32) -> Option<(usize, usize)> {
+        assert_eq!(a.len(), b.len());
+        let i = a.chunks(4).zip(b.chunks(4)).position(|(p, q)| p != q)?;
+        Some((i % width as usize, i / width as usize))
+    }
+
+    #[test]
+    fn span_renderer_matches_the_per_pixel_reference() {
+        let mut rng = Lcg(7);
+        let mut out = Vec::new();
+        // A 40x24 logical overlay at scales 1, 1.25, 1.5, and 2.
+        for (width, height) in [(40, 24), (50, 30), (60, 36), (80, 48)] {
+            let spec = BufferSpec::packed(width, height, wl_shm::Format::Argb8888).unwrap();
+            let stride = spec.stride as usize;
+            for (x, y) in [(0, 0), (-40, -24), (-1000, 7), (13, -5)] {
+                let logical = Rect {
+                    x,
+                    y,
+                    width: 40,
+                    height: 24,
+                };
+                let rect = |dx: i32, dy: i32, width: u32, height: u32| {
+                    Some(Rect {
+                        x: x + dx,
+                        y: y + dy,
+                        width,
+                        height,
+                    })
+                };
+                let mut selections = vec![
+                    None,
+                    Some(logical),
+                    rect(-10, -10, 25, 20),
+                    rect(30, 15, 25, 20),
+                    rect(-5, -5, 50, 34),
+                    rect(40, 0, 5, 5),
+                    rect(-5, 0, 5, 5),
+                    Some(Rect {
+                        x: i32::MIN,
+                        y: i32::MIN,
+                        width: u32::MAX,
+                        height: u32::MAX,
+                    }),
+                    Some(Rect {
+                        x: i32::MAX,
+                        y: i32::MAX,
+                        width: u32::MAX,
+                        height: 1,
+                    }),
+                ];
+                // Rects no wider than the border on each side.
+                selections.extend((1..6).map(|size| rect(3, 4, size, size)));
+                for _ in 0..300 {
+                    let (dx, dy) = (rng.next(-12..48), rng.next(-12..32));
+                    let (w, h) = (rng.next(1..30) as u32, rng.next(1..30) as u32);
+                    selections.push(rect(dx, dy, w, h));
+                }
+                for selection in selections {
+                    let reference = draw_overlay(spec, logical, selection).unwrap();
+                    let frame = overlay_frame(spec, logical, selection);
+                    draw_rows(spec, frame, 0..height, &mut out);
+                    assert_eq!(
+                        mismatch(&out, &reference, width),
+                        None,
+                        "{width}x{height} buffer at ({x}, {y}), {selection:?}"
+                    );
+                    let top = rng.next(0..height as i32) as u32;
+                    let bottom = rng.next(top as i32..height as i32 + 1) as u32;
+                    draw_rows(spec, frame, top..bottom, &mut out);
+                    assert!(
+                        out == reference[top as usize * stride..bottom as usize * stride],
+                        "rows {top}..{bottom} of {width}x{height} at ({x}, {y}), {selection:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_buffers_take_their_drawn_record_with_them() {
+        let mut buffers = vec![1, 2, 3, 4, 5, 6];
+        let mut drawn = vec!['a', 'b', 'c', 'd', 'e', 'f'];
+        retain_parallel(&mut buffers, &mut drawn, |b| b % 3 != 0 && *b != 1);
+        assert_eq!((buffers, drawn), (vec![2, 4, 5], vec!['b', 'd', 'e']));
+    }
+
+    #[test]
+    fn partial_redraws_keep_every_buffer_and_the_shown_image_exact() {
+        // Buffers come back in any order, and the compositor copies only the
+        // damaged box into what it shows, as wlroots does for shm buffers.
+        let spec = BufferSpec::packed(60, 36, wl_shm::Format::Argb8888).unwrap();
+        let logical = Rect {
+            x: -40,
+            y: 10,
+            width: 40,
+            height: 24,
+        };
+        let stride = spec.stride as usize;
+        let fresh = || (vec![0; spec.byte_len().unwrap()], None);
+        let mut rng = Lcg(11);
+        let mut buffers: Vec<(Vec<u8>, Option<Frame>)> = Vec::new();
+        let mut shown: Option<(Vec<u8>, Frame)> = None;
+        let mut selection = None;
+        let mut out = Vec::new();
+        let mut partial = 0;
+        for step in 0..3000 {
+            let random = |rng: &mut Lcg| Rect {
+                x: rng.next(-50..10),
+                y: rng.next(0..40),
+                width: rng.next(1..60) as u32,
+                height: rng.next(1..40) as u32,
+            };
+            selection = match (rng.next(0..8), selection) {
+                (0, _) => None,
+                (1, same) => same,
+                (2, _) | (_, None) => Some(random(&mut rng)),
+                // A drag step: move or resize by a few pixels.
+                (_, Some(r)) => Some(Rect {
+                    x: r.x + rng.next(-1..2),
+                    y: r.y + rng.next(-1..2),
+                    width: (r.width as i32 + rng.next(-3..4)).max(1) as u32,
+                    height: (r.height as i32 + rng.next(-3..4)).max(1) as u32,
+                }),
+            };
+            let frame = overlay_frame(spec, logical, selection);
+            let damage = match &shown {
+                Some((_, on_screen)) => changed(*on_screen, frame),
+                None => Some([0, 0, spec.width, spec.height]),
+            };
+            let Some([x0, y0, x1, y1]) = damage else {
+                continue;
+            };
+            // Any buffer may be the free one; some are newly allocated.
+            let index = match rng.next(0..4) as usize {
+                i if i < buffers.len() => i,
+                _ if buffers.len() < 3 => {
+                    buffers.push(fresh());
+                    buffers.len() - 1
+                }
+                i => i % buffers.len(),
+            };
+            if rng.next(0..40) == 0 {
+                buffers[index] = fresh();
+            }
+            let (pixels, held) = &mut buffers[index];
+            let rows = stale_rows(*held, frame, spec.height);
+            draw_rows(spec, frame, rows.clone(), &mut out);
+            pixels[rows.start as usize * stride..rows.end as usize * stride].copy_from_slice(&out);
+            *held = Some(frame);
+            partial += usize::from(rows.len() < spec.height as usize);
+            let expected = draw_overlay(spec, logical, selection).unwrap();
+            assert_eq!(
+                mismatch(pixels, &expected, spec.width),
+                None,
+                "buffer {index} at step {step}"
+            );
+            let (image, on_screen) = shown.get_or_insert_with(|| (vec![0; expected.len()], None));
+            for y in y0 as usize..y1 as usize {
+                let span = y * stride + x0 as usize * 4..y * stride + x1 as usize * 4;
+                image[span.clone()].copy_from_slice(&pixels[span]);
+            }
+            assert_eq!(
+                mismatch(image, &expected, spec.width),
+                None,
+                "shown image at step {step}"
+            );
+            *on_screen = frame;
+        }
+        assert!(partial > 500, "only {partial} partial redraws");
     }
 }

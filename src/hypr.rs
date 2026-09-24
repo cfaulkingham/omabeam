@@ -4,6 +4,8 @@ use serde::Deserialize;
 pub mod desktop;
 mod ipc;
 
+pub(crate) use ipc::{TEARDOWN_BUDGET, arm_teardown};
+
 use crate::portal::PortalWindow;
 
 const APP_CLASS: &str = "omabeam";
@@ -605,6 +607,17 @@ mod tests {
 
     fn test_client() -> Client {
         parse_clients(r#"[{"address":"0x1","mapped":true,"hidden":false,"at":[0,0],"size":[100,100],"workspace":{"id":1,"name":"1"},"monitor":0,"class":"foot","title":"term","stableId":"window-1","floating":false,"focusHistoryID":0}]"#).unwrap().remove(0)
+    }
+
+    #[test]
+    fn the_send_window_is_not_the_picker() {
+        // A bar click focuses an existing picker, so the send window must
+        // never count as one (e.g. after --stop while it is open).
+        let mut client = test_client();
+        client.class = "omabeam".into();
+        assert!(client.is_picker());
+        client.class = "omabeam-send".into();
+        assert!(!client.is_picker());
     }
 
     #[test]

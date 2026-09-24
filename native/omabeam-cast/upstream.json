@@ -1,0 +1,10 @@
+{
+  "openscreen": {
+    "url": "https://chromium.googlesource.com/openscreen",
+    "revision": "8b108491d2696309ca37ac0d3260bf423e773e8b"
+  },
+  "depot_tools": {
+    "url": "https://chromium.googlesource.com/chromium/tools/depot_tools.git",
+    "revision": "099d54a878f6554bb096e5e77d49b93973b92b24"
+  }
+}

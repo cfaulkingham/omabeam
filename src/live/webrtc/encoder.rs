@@ -1,16 +1,5 @@
 use super::*;
-mod hardware;
-use crate::live::config::EncoderMode;
-use openh264::formats::YUVSource;
-use openh264::{
-    OpenH264API, Timestamp,
-    encoder::{
-        BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
-        Profile, RateControlMode, UsageType,
-    },
-    formats::{RgbSliceU8, RgbaSliceU8, YUVBuffer},
-};
-
+use crate::live::h264::{AdaptiveEncoder, YuvConverter};
 pub(super) struct Encoded {
     pub bytes: Arc<[u8]>,
     pub keyframe: bool,
@@ -19,196 +8,60 @@ pub(super) struct Encoded {
     pub ready_at: Instant,
 }
 
-fn create(config: &LiveConfig) -> Result<Encoder> {
-    Ok(Encoder::with_api_config(
-        OpenH264API::from_source(),
-        EncoderConfig::new()
-            .bitrate(BitRate::from_bps(config.h264_bitrate))
-            .max_frame_rate(FrameRate::from_hz(config.fps as f32))
-            .rate_control_mode(RateControlMode::Bitrate)
-            .skip_frames(false)
-            .usage_type(UsageType::ScreenContentRealTime)
-            .profile(Profile::Baseline)
-            .complexity(Complexity::Low)
-            .num_threads(2)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(config.fps * 2)),
-    )?)
-}
+/// Minimum gap between viewer-requested (PLI/FIR) IDRs. One lossy peer must
+/// not cost every other viewer a full frame back-to-back; a request inside
+/// the window is kept pending rather than dropped, and fires as soon as the
+/// window ends. A first frame, a new peer, a dropped reference frame, and a
+/// hardware/software switch all bypass this and force immediately (handled
+/// where each of those is already detected, below and in h264.rs).
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(500);
 
-struct AdaptiveEncoder {
-    config: LiveConfig,
-    software: Encoder,
-    hardware: Option<hardware::Hardware>,
-    attempted: bool,
-    name: String,
-    note: Option<String>,
-}
-impl AdaptiveEncoder {
-    fn new(config: &LiveConfig) -> Result<Self> {
-        Ok(Self {
-            config: config.clone(),
-            software: create(config)?,
-            hardware: None,
-            attempted: config.encoder == EncoderMode::Software,
-            name: "OpenH264 software".into(),
-            note: None,
-        })
-    }
-    fn encode(&mut self, yuv: &YUVBuffer, pts: i64, mut force: bool) -> Result<(Vec<u8>, bool)> {
-        if self
-            .hardware
-            .as_ref()
-            .is_some_and(|h| h.dimensions != yuv.dimensions())
-        {
-            self.hardware = None;
-            self.attempted = false;
-        }
-        let hardware_result = (|| {
-            if !self.attempted {
-                self.attempted = true;
-                let (w, h) = yuv.dimensions();
-                self.hardware = Some(hardware::Hardware::new(&omabeam_encoder::Config {
-                    version: omabeam_encoder::VERSION,
-                    width: w as u32,
-                    height: h as u32,
-                    fps: self.config.fps.min(60),
-                    bitrate: self.config.h264_bitrate,
-                })?);
-            }
-            match &mut self.hardware {
-                Some(hardware) => {
-                    let frame = hardware.encode(yuv, pts, force)?;
-                    self.name = hardware.name.clone();
-                    self.note = None;
-                    Ok(Some(frame))
-                }
-                None => Ok(None),
-            }
-        })();
-        match hardware_result {
-            Ok(Some(frame)) => return Ok(frame),
-            Ok(None) => {}
-            Err(error) => {
-                self.hardware = None;
-                if self.config.encoder == EncoderMode::Hardware {
-                    return Err(error);
-                }
-                self.note = Some(
-                    format!("Hardware unavailable; using software. {error:#}")
-                        .chars()
-                        .take(600)
-                        .collect(),
-                );
-                self.name = "OpenH264 software".into();
-                // A backend switch must restart the prediction sequence with
-                // fresh SPS/PPS and IDR, even when the desktop is static.
-                force = true;
-            }
-        }
-        if force {
-            self.software.force_intra_frame();
-        }
-        let bitstream = self
-            .software
-            .encode_at(yuv, Timestamp::from_millis((pts.max(0) / 1000) as u64))?;
-        Ok((bitstream.to_vec(), bitstream.frame_type() == FrameType::IDR))
-    }
-}
-
-pub fn probe(config: &LiveConfig) -> Result<serde_json::Value> {
-    let mut config = config.clone();
-    config.fps = config.fps.min(60);
-    let raw = RawFrame {
-        frame: omabeam_capture::demo_frame(0),
-        config: config.clone(),
-        captured_at: Instant::now(),
-    };
-    let mut converter = YuvConverter::default();
-    let yuv = converter.convert(&raw)?;
-    let mut encoder = AdaptiveEncoder::new(&config)?;
-    // Verify first frame, a delta, and a forced IDR at the negotiated profile.
-    for (pts, force) in [(0, true), (100_000, false), (200_000, true)] {
-        let (bytes, _) = encoder.encode(yuv, pts, force)?;
-        let idr = omabeam_encoder::inspect_h264(&bytes)?;
-        ensure!(
-            !force || idr,
-            "encoder probe did not return a requested IDR"
-        );
-    }
-    Ok(
-        serde_json::json!({ "encoder": encoder.name, "hardware": encoder.hardware.is_some(),
-        "note": encoder.note, "width": yuv.dimensions().0, "height": yuv.dimensions().1 }),
-    )
-}
-
-/// Retain conversion buffers across frames. Opaque native captures go directly
-/// from RGBA to I420, without allocating/compositing an intermediate RGB image.
 #[derive(Default)]
-struct YuvConverter {
-    buffer: Option<YUVBuffer>,
-    padded: Vec<u8>,
+struct KeyframePolicy {
+    last_idr: Option<Instant>,
+    pending_request: bool,
+    /// The `Service::joins` count already answered.
+    joins: u64,
 }
 
-impl YuvConverter {
-    fn convert(&mut self, raw: &RawFrame) -> Result<&YUVBuffer> {
-        let (width, height) = raw
-            .frame
-            .stream_dimensions(raw.config.max_width, raw.config.pixel_mode)?;
-        let (w, h) = (
-            width.next_multiple_of(2) as usize,
-            height.next_multiple_of(2) as usize,
-        );
-        ensure!(
-            w >= 16 && h >= 16,
-            "H.264 needs at least 16 pixels on each edge; use JPEG for this size"
-        );
-        ensure!(
-            w.max(h) <= 3840 && w.min(h) <= 2160,
-            "H.264 supports up to 3840×2160 (or portrait); choose a maximum width or use JPEG"
-        );
-        if self
-            .buffer
-            .as_ref()
-            .is_none_or(|buffer| buffer.dimensions() != (w, h))
-        {
-            self.buffer = Some(YUVBuffer::new(w, h));
-        }
-        let buffer = self.buffer.as_mut().unwrap();
-        let image = &raw.frame.image;
-        if image.dimensions() == (w as u32, h as u32)
-            && (width as usize, height as usize) == (w, h)
-            && image.as_raw().chunks_exact(4).all(|p| p[3] == 255)
-        {
-            buffer.read_rgba8(RgbaSliceU8::new(image.as_raw(), (w, h)));
-            return Ok(buffer);
-        }
-        let rgb = raw
-            .frame
-            .stream_rgb(raw.config.max_width, raw.config.pixel_mode)?;
-        if (w, h) == (width as usize, height as usize) {
-            buffer.read_rgb8(RgbSliceU8::new(rgb.as_raw(), (w, h)));
-            return Ok(buffer);
-        }
-        // Replicate odd edges; never shrink native text to an even resolution.
-        self.padded.resize(w * h * 3, 0);
-        for y in 0..h {
-            for x in 0..w {
-                self.padded[(y * w + x) * 3..(y * w + x + 1) * 3].copy_from_slice(
-                    &rgb.get_pixel((x as u32).min(width - 1), (y as u32).min(height - 1))
-                        .0,
-                );
-            }
-        }
-        buffer.read_rgb8(RgbSliceU8::new(&self.padded, (w, h)));
-        Ok(buffer)
+impl KeyframePolicy {
+    /// Remember a PLI/FIR-style request; `due`/`wait` decide when it fires.
+    fn request(&mut self) {
+        self.pending_request = true;
     }
-}
-
-#[cfg(test)]
-fn yuv(raw: &RawFrame) -> Result<YUVBuffer> {
-    let mut converter = YuvConverter::default();
-    converter.convert(raw)?;
-    Ok(converter.buffer.unwrap())
+    /// Whether viewers joined since the last check. A join forces the next
+    /// frame regardless of the request throttle below, so a new viewer
+    /// decodes at once. The connected count cannot show this: it stays the
+    /// same when another viewer leaves in the same network pass.
+    fn joined(&mut self, joins: u64) -> bool {
+        let new = joins > self.joins;
+        self.joins = joins;
+        new
+    }
+    /// Whether a pending request has waited out the throttle window (or
+    /// there has never been an IDR, so there is nothing to throttle against).
+    fn due(&self, now: Instant) -> bool {
+        self.pending_request
+            && self
+                .last_idr
+                .is_none_or(|at| now.saturating_duration_since(at) >= KEYFRAME_REQUEST_INTERVAL)
+    }
+    /// Time left until a pending request becomes due, to cap the encoder's
+    /// condvar wait so it is honored as soon as the window ends, not on the
+    /// next unrelated poll.
+    fn wait(&self, now: Instant) -> Option<Duration> {
+        if !self.pending_request || self.due(now) {
+            return None;
+        }
+        let at = self.last_idr?;
+        Some(KEYFRAME_REQUEST_INTERVAL.saturating_sub(now.saturating_duration_since(at)))
+    }
+    /// Record that an IDR actually went out at `now`, satisfying any pending
+    /// request no matter what forced it.
+    fn produced(&mut self, now: Instant) {
+        self.last_idr = Some(now);
+        self.pending_request = false;
+    }
 }
 
 pub(super) fn run(
@@ -220,11 +73,18 @@ pub(super) fn run(
 ) -> Result<()> {
     config.fps = config.fps.min(60);
     let mut encoder = AdaptiveEncoder::new(&config)?;
+    // Only the cases below (plus the long hardware safety GOP this still
+    // configures) should force an IDR; the periodic/scene-change one this
+    // used to rely on cost bitrate and softened every frame after it.
+    encoder.idr_only_when_requested()?;
+    // No bandwidth estimation: it would move str0m to its rate-limited pacer
+    // (added latency), and NVENC needs an IDR to change bitrate anyway.
     let mut converter = YuvConverter::default();
     let origin = Instant::now();
     let mut last_generation = 0;
     let mut last_frame = origin;
     let mut force = true;
+    let mut keyframes = KeyframePolicy::default();
     while !stop.load(Ordering::SeqCst) && !service.failed.load(Ordering::SeqCst) {
         let (generation, raw) = {
             let mut data = frames.inner.lock().unwrap();
@@ -235,10 +95,17 @@ pub(super) fn run(
                 {
                     return Ok(());
                 }
-                if service.connected() == 0 {
+                let now = Instant::now();
+                let connected = service.connected();
+                if keyframes.joined(service.joins.load(Ordering::SeqCst)) {
+                    // A brand-new viewer must decode right away; never make
+                    // it wait out the PLI/FIR throttle below.
                     force = true;
                 }
-                force |= service.keyframe.swap(false, Ordering::SeqCst);
+                if service.keyframe.swap(false, Ordering::SeqCst) {
+                    keyframes.request();
+                }
+                force |= keyframes.due(now);
                 let changed = data.generation != last_generation;
                 // Capture supplies the only cadence for new frames. Only
                 // repeated frames (PLI/join/keepalive) need an encoder deadline.
@@ -248,14 +115,14 @@ pub(super) fn run(
                     Duration::from_secs(1)
                 };
                 let ready = changed || last_frame.elapsed() >= repeat_after;
-                if service.connected() > 0
+                if connected > 0
                     && !service.queued.load(Ordering::SeqCst)
                     && ready
                     && let Some(raw) = data.raw.clone()
                 {
                     break (data.generation, raw);
                 }
-                let wait = if service.connected() == 0
+                let wait = if connected == 0
                     || service.queued.load(Ordering::SeqCst)
                     || data.raw.is_none()
                 {
@@ -265,6 +132,9 @@ pub(super) fn run(
                         .saturating_sub(last_frame.elapsed())
                         .min(Duration::from_millis(100))
                 };
+                let wait = keyframes
+                    .wait(now)
+                    .map_or(wait, |remaining| wait.min(remaining));
                 data = frames.tick.wait_timeout(data, wait).unwrap().0;
             }
         };
@@ -273,6 +143,10 @@ pub(super) fn run(
         let yuv = converter.convert(&raw)?;
         let converted_at = Instant::now();
         let (bytes, keyframe) = encoder.encode(yuv, origin.elapsed().as_micros() as i64, force)?;
+        if keyframe {
+            // Any IDR satisfies a pending request, not only one it caused.
+            keyframes.produced(at);
+        }
         last_frame = at;
         last_generation = generation;
         if bytes.is_empty() {
@@ -328,151 +202,9 @@ pub(super) fn run(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use openh264::{decoder::Decoder, formats::YUVSource};
-
-    #[test]
-    fn reusable_conversion_preserves_alpha_scaling_and_odd_edges() {
-        let mut converter = YuvConverter::default();
-        let mut previous_storage = None;
-        for (w, h, alpha, scaled) in [
-            (32, 18, 255, false),
-            (32, 18, 255, false),
-            (32, 18, 127, false),
-            (31, 17, 255, false),
-            (32, 18, 255, true),
-        ] {
-            let frame = CapturedFrame {
-                image: image::RgbaImage::from_fn(w, h, |x, y| {
-                    image::Rgba([(x * 7) as u8, (y * 11) as u8, 90, alpha])
-                }),
-                logical_width: if scaled { 16 } else { w },
-                logical_height: if scaled { 16 } else { h },
-            };
-            let raw = RawFrame {
-                frame,
-                config: LiveConfig::default(),
-                captured_at: Instant::now(),
-            };
-            let rgb = raw.frame.stream_rgb(None, raw.config.pixel_mode).unwrap();
-            let (ew, eh) = (
-                rgb.width().next_multiple_of(2),
-                rgb.height().next_multiple_of(2),
-            );
-            let padded = image::RgbImage::from_fn(ew, eh, |x, y| {
-                *rgb.get_pixel(x.min(rgb.width() - 1), y.min(rgb.height() - 1))
-            });
-            let expected = YUVBuffer::from_rgb8_source(RgbSliceU8::new(
-                padded.as_raw(),
-                (ew as usize, eh as usize),
-            ));
-            let actual = converter.convert(&raw).unwrap();
-            assert_eq!(actual.dimensions(), expected.dimensions());
-            for (a, b) in [
-                (actual.y(), expected.y()),
-                (actual.u(), expected.u()),
-                (actual.v(), expected.v()),
-            ] {
-                assert!(
-                    a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1),
-                    "color conversion changed"
-                );
-            }
-            if let Some((dimensions, address)) = previous_storage {
-                if dimensions == actual.dimensions() {
-                    assert_eq!(
-                        address,
-                        actual.y().as_ptr(),
-                        "same-size conversion reallocated"
-                    );
-                }
-            }
-            previous_storage = Some((actual.dimensions(), actual.y().as_ptr()));
-        }
-    }
-
-    #[test]
-    fn software_encoder_emits_a_bitstream_for_every_changed_frame() {
-        let config = LiveConfig {
-            fps: 60,
-            h264_bitrate: 100_000,
-            webrtc: true,
-            encoder: EncoderMode::Software,
-            ..Default::default()
-        };
-        let mut encoder = create(&config).unwrap();
-        for index in 0..24 {
-            let raw = RawFrame {
-                frame: omabeam_capture::demo_frame(index * 11),
-                config: config.clone(),
-                captured_at: Instant::now(),
-            };
-            let yuv = yuv(&raw).unwrap();
-            let bitstream = encoder
-                .encode_at(&yuv, Timestamp::from_millis(index as u64 * 16))
-                .unwrap();
-            assert!(!bitstream.to_vec().is_empty(), "frame {index} was skipped");
-        }
-    }
-
-    #[test]
-    fn h264_decodes_odd_edges_keyframe_recovery_and_resolution_changes() {
-        let config = LiveConfig {
-            webrtc: true,
-            ..Default::default()
-        };
-        let mut encoder = create(&config).unwrap();
-        let mut decoder = Decoder::new().unwrap();
-        for (index, (w, h)) in [(641, 361), (641, 361), (480, 270), (17, 17)]
-            .into_iter()
-            .enumerate()
-        {
-            let mut frame = omabeam_capture::demo_frame(index as u32);
-            frame.logical_width = w;
-            frame.logical_height = h;
-            let raw = RawFrame {
-                frame,
-                config: config.clone(),
-                captured_at: Instant::now(),
-            };
-            let yuv = yuv(&raw).unwrap();
-            encoder.force_intra_frame();
-            let bitstream = encoder
-                .encode_at(&yuv, Timestamp::from_millis(index as u64 * 1000))
-                .unwrap();
-            assert_eq!(bitstream.frame_type(), FrameType::IDR);
-            let bytes = bitstream.to_vec();
-            let decoded = decoder
-                .decode(&bytes)
-                .unwrap()
-                .expect("an actual decoded frame");
-            assert_eq!(
-                decoded.dimensions(),
-                (
-                    w.next_multiple_of(2) as usize,
-                    h.next_multiple_of(2) as usize
-                )
-            );
-        }
-    }
-
-    #[test]
-    fn oversized_native_images_report_a_fallback_instead_of_silently_downscaling() {
-        let mut frame = omabeam_capture::demo_frame(0);
-        frame.logical_width = 8000;
-        let raw = RawFrame {
-            frame,
-            config: LiveConfig::default(),
-            captured_at: Instant::now(),
-        };
-        assert!(yuv(&raw).err().unwrap().to_string().contains("3840"));
-    }
-}
-
-#[cfg(test)]
 mod static_tests {
     use super::*;
+    use crate::live::EncoderMode;
 
     fn service(frames: &Arc<FrameState>, config: &LiveConfig) -> Arc<Service> {
         let (commands, _commands_rx) = mpsc::sync_channel(1);
@@ -481,6 +213,7 @@ mod static_tests {
         Arc::new(Service {
             commands,
             connected: AtomicUsize::new(1),
+            joins: AtomicU64::new(0),
             keyframe: AtomicBool::new(true),
             failed: AtomicBool::new(false),
             metrics: Mutex::new(Metrics {
@@ -584,7 +317,7 @@ mod static_tests {
             thread::spawn(move || run(config, worker_frames, worker_stop, worker_service, tx));
         assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().keyframe);
         service.queued.store(false, Ordering::SeqCst);
-        service.request_keyframe();
+        service.peer_joined();
         assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().keyframe);
         assert_eq!(frames.stats().frames, 1);
         assert!(frames.inner.lock().unwrap().jpeg.is_empty());
@@ -592,99 +325,283 @@ mod static_tests {
         worker.join().unwrap().unwrap();
         assert!(frames.inner.lock().unwrap().raw.is_none());
     }
-}
 
-#[cfg(test)]
-mod hardware_tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    // -- KeyframePolicy: pure logic, no threads/video needed. --
 
-    fn fixture(mode: &str) -> (tempfile::TempDir, YUVBuffer, AdaptiveEncoder) {
-        let directory = tempfile::tempdir().unwrap();
-        let config = LiveConfig::default();
-        let mut frame = omabeam_capture::demo_frame(0);
-        frame.logical_width = 64;
-        frame.logical_height = 64;
-        let pixels = yuv(&RawFrame {
-            frame,
-            config: config.clone(),
-            captured_at: Instant::now(),
-        })
-        .unwrap();
-        let mut software = create(&config).unwrap();
-        software.force_intra_frame();
-        let packet = software.encode(&pixels).unwrap().to_vec();
-        std::fs::write(directory.path().join("frame.h264"), packet).unwrap();
-        std::fs::write(directory.path().join("mode"), mode).unwrap();
-        let helper = directory.path().join("helper");
-        std::fs::write(
-            &helper,
-            r#"#!/usr/bin/env python3
-import json, pathlib, struct, sys, time
-root = pathlib.Path(__file__).parent
-mode = (root / 'mode').read_text()
-source, target = sys.stdin.buffer, sys.stdout.buffer
-size = struct.unpack('<I', source.read(4))[0]
-config = json.loads(source.read(size))
-length = config['width'] * config['height'] * 3 // 2
-packet = (root / 'frame.h264').read_bytes()
-for index in range(2):
-    if len(source.read(9 + length)) != 9 + length: sys.exit(0)
-    if index == 1:
-        if mode == 'stall': time.sleep(30)
-        elif mode == 'oversized':
-            target.write(struct.pack('<I', 0xffffffff)); target.flush(); time.sleep(30)
-        else: sys.exit(1)
-    header = json.dumps({'encoder': 'Fixture hardware', 'bytes': len(packet)}).encode()
-    target.write(struct.pack('<I', len(header)) + header + packet); target.flush()
-"#,
+    #[test]
+    fn a_request_shortly_after_an_idr_waits_for_the_throttle_mark_not_dropped() {
+        let mut policy = KeyframePolicy::default();
+        let start = Instant::now();
+        policy.produced(start);
+        policy.request();
+        assert!(
+            !policy.due(start + Duration::from_millis(100)),
+            "must not fire inside the 500 ms window"
+        );
+        assert!(
+            !policy.due(start + Duration::from_millis(499)),
+            "must still be pending just before the mark"
+        );
+        assert!(
+            policy.due(start + KEYFRAME_REQUEST_INTERVAL),
+            "must fire once the window elapses, not be dropped"
+        );
+    }
+
+    #[test]
+    fn wait_reports_the_remaining_throttle_window_and_none_once_due() {
+        let mut policy = KeyframePolicy::default();
+        let start = Instant::now();
+        assert_eq!(policy.wait(start), None, "nothing pending yet");
+        policy.produced(start);
+        policy.request();
+        assert_eq!(
+            policy.wait(start + Duration::from_millis(100)),
+            Some(Duration::from_millis(400))
+        );
+        assert_eq!(
+            policy.wait(start + KEYFRAME_REQUEST_INTERVAL),
+            None,
+            "already due; nothing left to wait for"
+        );
+    }
+
+    #[test]
+    fn frequent_requests_are_capped_to_the_throttle_rate() {
+        let mut policy = KeyframePolicy::default();
+        let start = Instant::now();
+        let mut idrs = 0;
+        for i in 0..40u64 {
+            let now = start + Duration::from_millis(i * 50);
+            policy.request();
+            if policy.due(now) {
+                policy.produced(now);
+                idrs += 1;
+            }
+        }
+        assert!(
+            idrs <= 5,
+            "expected at most 5 IDRs for 40 requests over 2 s, got {idrs}"
+        );
+    }
+
+    #[test]
+    fn a_join_forces_even_while_a_request_is_throttled() {
+        let mut policy = KeyframePolicy::default();
+        let start = Instant::now();
+        assert!(!policy.joined(0), "no viewer has joined yet");
+        policy.produced(start);
+        policy.request();
+        assert!(
+            !policy.due(start + Duration::from_millis(100)),
+            "a plain request is still inside the window"
+        );
+        assert!(
+            policy.joined(1),
+            "a new viewer must force regardless of the request throttle"
+        );
+        assert!(!policy.joined(1), "an answered join must not force again");
+        assert!(
+            policy.joined(3),
+            "joins made while the encoder was busy still force"
+        );
+    }
+
+    #[test]
+    fn a_join_wakes_a_waiting_encoder() {
+        let frames = Arc::new(FrameState::new("wake fixture".into()));
+        let service = service(&frames, &LiveConfig::default());
+        let (ready, waiting) = mpsc::channel();
+        let waiter = thread::spawn({
+            let frames = frames.clone();
+            move || {
+                // Signal while holding the lock, so the wake lands in the wait.
+                let data = frames.inner.lock().unwrap();
+                ready.send(()).unwrap();
+                let started = Instant::now();
+                drop(frames.tick.wait_timeout(data, Duration::from_secs(5)));
+                started.elapsed()
+            }
+        });
+        waiting.recv().unwrap();
+        service.peer_joined();
+        let waited = waiter.join().unwrap();
+        assert!(
+            waited < Duration::from_secs(1),
+            "a join left the encoder waiting {waited:?}"
+        );
+    }
+
+    // -- run(): real threads, verifying the policy is wired in correctly. --
+
+    #[test]
+    fn a_viewer_replacing_another_gets_an_idr_at_once_but_a_pli_waits_for_the_mark() {
+        let config = LiveConfig {
+            webrtc: true,
+            encoder: EncoderMode::Software,
+            ..Default::default()
+        };
+        let frames = Arc::new(FrameState::new("replacing viewer fixture".into()));
+        crate::live::publish_frame(
+            &frames,
+            omabeam_capture::demo_frame(0),
+            &config,
+            Duration::ZERO,
         )
         .unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut encoder = AdaptiveEncoder::new(&config).unwrap();
-        encoder.hardware = Some(
-            hardware::Hardware::spawn(
-                &helper,
-                &omabeam_encoder::Config {
-                    version: omabeam_encoder::VERSION,
-                    width: 64,
-                    height: 64,
-                    fps: 15,
-                    bitrate: config.h264_bitrate,
-                },
-            )
-            .unwrap(),
+        let service = service(&frames, &config);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (worker_frames, worker_service, worker_stop, worker_config) = (
+            frames.clone(),
+            service.clone(),
+            stop.clone(),
+            config.clone(),
         );
-        encoder.attempted = true;
-        (directory, pixels, encoder)
+        let worker = thread::spawn(move || {
+            run(
+                worker_config,
+                worker_frames,
+                worker_stop,
+                worker_service,
+                tx,
+            )
+        });
+        let first = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(first.keyframe);
+        service.queued.store(false, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        // One viewer connects and another leaves in the same network pass, well
+        // inside the 500 ms PLI/FIR throttle: the connected count stays 1.
+        service.peer_joined();
+        let joined = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(joined.keyframe);
+        // `at` is when the encoder picked the frame, and what the throttle
+        // measures from.
+        assert!(
+            joined.at.duration_since(first.at) < KEYFRAME_REQUEST_INTERVAL,
+            "a newly connected viewer waited for the request throttle"
+        );
+        service.queued.store(false, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        service.request_keyframe();
+        let requested = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(requested.keyframe);
+        assert!(
+            requested.at.duration_since(joined.at) >= KEYFRAME_REQUEST_INTERVAL,
+            "a PLI 100 ms after an IDR was not deferred to the 500 ms mark"
+        );
+        frames.fail("test complete".into());
+        worker.join().unwrap().unwrap();
     }
 
     #[test]
-    fn helper_failure_recovers_with_a_decodable_software_idr_and_does_not_retry() {
-        for mode in ["crash", "stall", "oversized"] {
-            let (_directory, pixels, mut encoder) = fixture(mode);
-            assert!(encoder.encode(&pixels, 0, true).unwrap().1);
-            assert_eq!(encoder.name, "Fixture hardware");
-            let started = Instant::now();
-            let (packet, idr) = encoder.encode(&pixels, 100_000, false).unwrap();
-            assert!(started.elapsed() < Duration::from_secs(3), "{mode}");
-            assert!(idr && omabeam_encoder::inspect_h264(&packet).unwrap());
-            let mut decoder = openh264::decoder::Decoder::new().unwrap();
-            assert_eq!(
-                decoder.decode(&packet).unwrap().unwrap().dimensions(),
-                (64, 64)
-            );
-            assert_eq!(encoder.name, "OpenH264 software");
-            assert!(encoder.note.is_some() && encoder.hardware.is_none() && encoder.attempted);
-            encoder.encode(&pixels, 200_000, false).unwrap();
+    fn the_frame_after_a_dropped_encoded_frame_is_an_idr() {
+        let config = LiveConfig {
+            webrtc: true,
+            encoder: EncoderMode::Software,
+            ..Default::default()
+        };
+        let frames = Arc::new(FrameState::new("dropped frame fixture".into()));
+        crate::live::publish_frame(
+            &frames,
+            omabeam_capture::demo_frame(0),
+            &config,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let service = service(&frames, &config);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let tx_test = tx.clone();
+        let (worker_frames, worker_service, worker_stop, worker_config) = (
+            frames.clone(),
+            service.clone(),
+            stop.clone(),
+            config.clone(),
+        );
+        let worker = thread::spawn(move || {
+            run(
+                worker_config,
+                worker_frames,
+                worker_stop,
+                worker_service,
+                tx,
+            )
+        });
+        assert!(rx.recv_timeout(Duration::from_secs(3)).unwrap().keyframe);
+        service.queued.store(false, Ordering::SeqCst);
+        // Occupy the one-slot channel so the encoder's next send finds it full.
+        tx_test
+            .try_send(Encoded {
+                bytes: vec![0u8; 4].into(),
+                keyframe: false,
+                at: Instant::now(),
+                timestamp: 0,
+                ready_at: Instant::now(),
+            })
+            .unwrap();
+        crate::live::publish_frame(
+            &frames,
+            omabeam_capture::demo_frame(1),
+            &config,
+            Duration::ZERO,
+        )
+        .unwrap();
+        // Give the encoder a chance to attempt (and drop) its real encode
+        // against the still-full channel before we drain the placeholder.
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(service.stats().dropped_frames, 1);
+        rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        service.queued.store(false, Ordering::SeqCst);
+        frames.wake();
+        let recovered = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(recovered.keyframe, "the frame after a drop must be an IDR");
+        frames.fail("test complete".into());
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn two_hundred_changing_frames_with_no_requests_produce_exactly_one_idr() {
+        let config = LiveConfig {
+            webrtc: true,
+            encoder: EncoderMode::Software,
+            ..Default::default()
+        };
+        let frames = Arc::new(FrameState::new("changing source fixture".into()));
+        let service = service(&frames, &config);
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (worker_frames, worker_service, worker_stop, worker_config) = (
+            frames.clone(),
+            service.clone(),
+            stop.clone(),
+            config.clone(),
+        );
+        let worker = thread::spawn(move || {
+            run(
+                worker_config,
+                worker_frames,
+                worker_stop,
+                worker_service,
+                tx,
+            )
+        });
+        let mut keyframes = 0u32;
+        for index in 0..200u32 {
+            crate::live::publish_frame(
+                &frames,
+                omabeam_capture::demo_frame(index),
+                &config,
+                Duration::ZERO,
+            )
+            .unwrap();
+            let frame = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            keyframes += u32::from(frame.keyframe);
+            service.queued.store(false, Ordering::SeqCst);
         }
-    }
-
-    #[test]
-    fn explicit_hardware_mode_reports_failure_instead_of_silently_using_software() {
-        let (_directory, pixels, mut encoder) = fixture("crash");
-        encoder.config.encoder = EncoderMode::Hardware;
-        encoder.encode(&pixels, 0, true).unwrap();
-        assert!(encoder.encode(&pixels, 100_000, false).is_err());
+        assert_eq!(keyframes, 1, "only the very first frame should be an IDR");
+        frames.fail("test complete".into());
+        worker.join().unwrap().unwrap();
     }
 }

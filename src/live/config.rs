@@ -28,7 +28,7 @@ impl EncoderMode {
             Self::Software => "Software",
         }
     }
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         Self::ALL
             .into_iter()
             .find(|mode| mode.as_str() == value)
@@ -122,9 +122,15 @@ impl LiveConfig {
 
     /// Strip streaming options from the command. `--` preserves literal targets.
     pub fn parse_args(args: &[String]) -> Result<(Self, Vec<String>)> {
-        let mut config = Self::default();
-        let mut fps_explicit = false;
-        let mut bitrate_explicit = false;
+        Self::parse_args_from(Self::default(), args)
+    }
+
+    /// Like `parse_args`, but options missing from the command keep their
+    /// values from `base`, such as the picker's remembered settings.
+    pub fn parse_args_from(base: Self, args: &[String]) -> Result<(Self, Vec<String>)> {
+        let mut config = base;
+        let mut fps = None;
+        let mut bitrate = None;
         let mut rest = Vec::new();
         let mut args = args.iter();
         while let Some(arg) = args.next() {
@@ -148,13 +154,9 @@ impl LiveConfig {
                             config.webrtc_port = value.parse().context("invalid WebRTC UDP port")?
                         }
                         "--h264-bitrate" => {
-                            config.h264_bitrate = value.parse().context("invalid H.264 bitrate")?;
-                            bitrate_explicit = true;
+                            bitrate = Some(value.parse().context("invalid H.264 bitrate")?)
                         }
-                        "--fps" => {
-                            config.fps = value.parse().context("invalid FPS")?;
-                            fps_explicit = true;
-                        }
+                        "--fps" => fps = Some(value.parse().context("invalid FPS")?),
                         "--quality" => {
                             config.quality = value.parse().context("invalid JPEG quality")?
                         }
@@ -178,6 +180,10 @@ impl LiveConfig {
                         && !matches!(
                             other,
                             "--live"
+                                | "--cast"
+                                | "--cast-devices"
+                                | "--cast-demo"
+                                | "--cast-test"
                                 | "--demo"
                                 | "--demo-picker"
                                 | "--picker"
@@ -203,14 +209,14 @@ impl LiveConfig {
                 _ => rest.push(arg.clone()),
             }
         }
-        if !fps_explicit
-            && rest.first().is_some_and(|s| s == "--live")
-            && rest.get(1).is_some_and(|s| s == "extend")
-        {
-            config.fps = 60;
+        let extend = rest.first().is_some_and(|s| s == "--live")
+            && rest.get(1).is_some_and(|s| s == "extend");
+        // An automatic bitrate follows the new rate; an explicit one wins last.
+        if let Some(fps) = fps.or(extend.then_some(60)) {
+            config.set_fps(fps);
         }
-        if !bitrate_explicit {
-            config.h264_bitrate = Self::default_h264_bitrate(config.fps);
+        if let Some(bitrate) = bitrate {
+            config.h264_bitrate = bitrate;
         }
         config.validate()?;
         Ok((config, rest))
@@ -248,5 +254,122 @@ impl LiveConfig {
             args.push("--native-pixels".into());
         }
         args
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const EXTEND: [&str; 6] = ["--live", "extend", "1920", "1080", "1", "right"];
+
+    fn parse_from(base: &LiveConfig, items: &[&str]) -> LiveConfig {
+        let args: Vec<String> = items.iter().map(|item| item.to_string()).collect();
+        LiveConfig::parse_args_from(base.clone(), &args).unwrap().0
+    }
+
+    /// A remembered picker configuration at 30 FPS.
+    fn remembered(h264_bitrate: u32) -> LiveConfig {
+        LiveConfig {
+            fps: 30,
+            quality: 72,
+            max_width: Some(1280),
+            pixel_mode: PixelMode::Native,
+            webrtc: false,
+            h264_bitrate,
+            encoder: EncoderMode::Software,
+            cursor: true,
+            ..LiveConfig::default()
+        }
+    }
+
+    #[test]
+    fn flags_override_the_base_and_everything_else_keeps_it() {
+        let base = remembered(LiveConfig::default_h264_bitrate(30));
+        assert_eq!(parse_from(&base, &[]), base);
+        let args: Vec<String> = ["--quality", "90", "--webrtc", "--encoder", "auto"]
+            .iter()
+            .map(|item| item.to_string())
+            .collect();
+        let (config, rest) = LiveConfig::parse_args_from(base.clone(), &args).unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(
+            config,
+            LiveConfig {
+                quality: 90,
+                webrtc: true,
+                encoder: EncoderMode::Auto,
+                ..base
+            }
+        );
+    }
+
+    #[test]
+    fn fps_flag_moves_an_automatic_bitrate_and_keeps_a_custom_one() {
+        let config = parse_from(
+            &remembered(LiveConfig::default_h264_bitrate(30)),
+            &["--fps", "60"],
+        );
+        assert_eq!(
+            (config.fps, config.h264_bitrate),
+            (60, LiveConfig::default_h264_bitrate(60))
+        );
+        let config = parse_from(&remembered(6_000_000), &["--fps", "60"]);
+        assert_eq!((config.fps, config.h264_bitrate), (60, 6_000_000));
+    }
+
+    #[test]
+    fn bitrate_flag_wins_whatever_the_flag_order() {
+        let mut extend = vec!["--h264-bitrate", "3000000"];
+        extend.extend(EXTEND);
+        for base in [
+            remembered(LiveConfig::default_h264_bitrate(30)),
+            remembered(6_000_000),
+        ] {
+            for (input, fps) in [
+                (vec!["--fps", "60", "--h264-bitrate", "3000000"], 60),
+                (vec!["--h264-bitrate", "3000000", "--fps", "60"], 60),
+                (vec!["--h264-bitrate", "3000000"], 30),
+                (extend.clone(), 60),
+            ] {
+                let config = parse_from(&base, &input);
+                assert_eq!(
+                    (config.fps, config.h264_bitrate),
+                    (fps, 3_000_000),
+                    "{input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn custom_base_bitrate_survives_without_rate_flags() {
+        let base = remembered(6_000_000);
+        for input in [vec![], vec!["--cursor", "--quality", "55"], EXTEND.to_vec()] {
+            assert_eq!(
+                parse_from(&base, &input).h264_bitrate,
+                6_000_000,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extended_desktop_defaults_to_sixty_fps_over_the_base_rate() {
+        let base = remembered(LiveConfig::default_h264_bitrate(30));
+        let config = parse_from(&base, &EXTEND);
+        assert_eq!(
+            (config.fps, config.h264_bitrate),
+            (60, LiveConfig::default_h264_bitrate(60))
+        );
+        let mut input = vec!["--fps", "24"];
+        input.extend(EXTEND);
+        let config = parse_from(&base, &input);
+        assert_eq!(
+            (config.fps, config.h264_bitrate),
+            (24, LiveConfig::default_h264_bitrate(24))
+        );
+        let config = parse_from(&remembered(6_000_000), &EXTEND);
+        assert_eq!((config.fps, config.h264_bitrate), (60, 6_000_000));
     }
 }

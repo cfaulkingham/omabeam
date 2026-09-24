@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui as Shell
 import "Session.js" as Session
@@ -19,6 +20,7 @@ Shell.Panel {
   property bool stopPending: false
   property int statusEpoch: 0
   property int pollEpoch: 0
+  property bool runtimeWatchArmed: false
   property string copiedUrl: ""
   property string qrUrl: ""
   property var qrRows: []
@@ -94,6 +96,20 @@ Shell.Panel {
     feedbackError = error === true
     feedbackTimer.restart()
   }
+  // Folds a command's captured stderr tail into a user-facing message, e.g.
+  // "Could not stop sharing. (permission denied)". Empty when there was none.
+  function withCause(message, tail) {
+    var cause = Session.plain(tail)
+    return cause ? message + " (" + cause + ")" : message
+  }
+  // live.json's directory does not exist until the first --status call has
+  // run (which creates it as a side effect, live share or not), so the
+  // watch can only be armed once that call has completed.
+  function armRuntimeWatch() {
+    if (runtimeWatchArmed) return
+    runtimeWatchArmed = true
+    runtimeWatch.path = (Quickshell.env("XDG_RUNTIME_DIR") || "") + "/omabeam"
+  }
   function refresh() {
     if (statusCommand.pending || stopCommand.pending) return
     pollEpoch = statusEpoch
@@ -108,7 +124,7 @@ Shell.Panel {
       showFeedback("Could not confirm the share stopped. Check again before leaving.", true)
     }
   }
-  function receiveStatus(raw, code, exitStatus) {
+  function receiveStatus(raw, code, exitStatus, stderrTail) {
     if (pollEpoch !== statusEpoch) { Qt.callLater(root.refresh); return }
     if (code === 127) {
       statusFailed("OmaBeam needs its native app. Run ./install.sh --backend-only in the plugin folder, then check status again.")
@@ -116,7 +132,7 @@ Shell.Panel {
     }
     var next
     try { next = Session.read(raw, code, exitStatus) }
-    catch (error) { statusFailed(error.message); return }
+    catch (error) { statusFailed(withCause(error.message, stderrTail)); return }
     if (next.url !== session.url || next.state !== session.state) {
       clearQr()
       feedback = ""
@@ -168,40 +184,81 @@ Shell.Panel {
   }
 
   Timer {
-    interval: root.opened ? 1000 : root.sessionOn ? 2000 : 5000
+    // Event-driven refresh (below) handles most changes; idle cadence is
+    // just a safety net now, so it can back off from every 5s to every 30s.
+    objectName: "pollTimer"
+    interval: root.opened ? 1000 : root.sessionOn ? 2000 : 30000
     running: true
     repeat: true
     onTriggered: root.refresh()
   }
   Timer { id: feedbackTimer; interval: root.feedbackError ? 7000 : 3000; onTriggered: root.feedback = "" }
+  // Coalesces a burst of directory-change events (e.g. a rewrite lands as an
+  // unlink+create, or a live share rewriting live.json up to once a second
+  // plus at every state change) into one refresh instead of one --status per
+  // event.
+  Timer {
+    id: watchDebounceTimer
+    objectName: "watchDebounceTimer"
+    interval: 300
+    repeat: false
+    onTriggered: root.refresh()
+  }
+  // Mirrors Omarchy's own FileView pattern: watch the live.json directory
+  // (not the file) since FileView cannot watch a path before it exists, and
+  // keep the polling Timer above as a fallback since a directory watch can
+  // stop delivering events after flag changes land in quick succession.
+  FileView {
+    id: runtimeWatch
+    objectName: "runtimeWatch"
+    watchChanges: true
+    printErrors: false
+    // A live share rewrites live.json up to once a second, and at once on a
+    // state change (each atomic rename can even surface as more than one
+    // event); restarting the timer on every event could suppress the
+    // refresh for as long as writes keep coming. Start it only on the first event
+    // of a burst so it still fires ~300ms later regardless of how many
+    // more events follow. While sharing or while the panel is open, ignore
+    // events entirely: the 2s/1s poll already covers those states, so
+    // reacting here would only add extra --status spawns.
+    onFileChanged: {
+      if (root.sessionOn || root.opened) return
+      if (!watchDebounceTimer.running) watchDebounceTimer.start()
+    }
+  }
   Command {
     id: statusCommand
     objectName: "statusCommand"
     timeoutMs: 3500
-    onCompleted: function(code, exitStatus, output) { root.receiveStatus(output, code, exitStatus) }
+    onCompleted: function(code, exitStatus, output) {
+      root.armRuntimeWatch()
+      root.receiveStatus(output, code, exitStatus, statusCommand.stderrTail)
+    }
     onFailed: function(reason) {
+      root.armRuntimeWatch()
       if (root.pollEpoch === root.statusEpoch)
-        root.statusFailed("Could not check OmaBeam. " + reason + " Check that OmaBeam is installed.")
+        root.statusFailed(root.withCause("Could not check OmaBeam. " + reason + " Check that OmaBeam is installed.", statusCommand.stderrTail))
       else Qt.callLater(root.refresh)
     }
   }
   Command {
     id: stopCommand
     objectName: "stopCommand"
-    // Native --stop can wait 10s for a graceful exit, then recover the extra display.
-    timeoutMs: 20000
+    // Native --stop waits up to 10s for the share to exit (its teardown IPC
+    // has a 6s budget), then its own recovery of an extended display gets
+    // another 6s budget: about 16s at worst, under this bound.
+    timeoutMs: 25000
     onCompleted: function(code, exitStatus, output) {
       if (code !== 0 || exitStatus !== 0) {
         root.stopPending = false
-        root.showFeedback("Could not stop sharing. Try again.", true)
+        root.showFeedback(root.withCause("Could not stop sharing. Try again.", stopCommand.stderrTail), true)
       }
       root.refresh()
     }
-    onFailed: function(reason) {
-      root.stopPending = false
-      root.showFeedback("Could not stop sharing. " + reason, true)
-      root.refresh()
-    }
+    // A timeout is not proof the share is still running: extended-display
+    // cleanup can legitimately outlast even this bound. Keep stopPending and
+    // let the status read this refresh triggers decide the real outcome.
+    onFailed: root.refresh()
   }
   Command {
     id: qrCommand
@@ -212,11 +269,11 @@ Shell.Panel {
       qrCommand.output = ""
       if (!root.qrVisible || !content.canShare || root.qrUrl !== root.session.url) return
       root.qrRows = rows
-      root.qrError = rows.length ? "" : "Could not create the QR code. Copy the link instead."
+      root.qrError = rows.length ? "" : root.withCause("Could not create the QR code. Copy the link instead.", qrCommand.stderrTail)
     }
     onFailed: {
       qrCommand.output = ""
-      if (root.qrVisible) root.qrError = "Could not create the QR code. Copy the link instead."
+      if (root.qrVisible) root.qrError = root.withCause("Could not create the QR code. Copy the link instead.", qrCommand.stderrTail)
     }
   }
   Command {
@@ -225,11 +282,11 @@ Shell.Panel {
     maxBytes: 256
     onCompleted: function(code, exitStatus, output) {
       if (!root.sessionOn || root.session.url !== root.copiedUrl) return
-      root.showFeedback(code === 0 && exitStatus === 0 ? "Share link copied." : "Could not copy the link. Check your clipboard.", code !== 0 || exitStatus !== 0)
+      root.showFeedback(code === 0 && exitStatus === 0 ? "Share link copied." : root.withCause("Could not copy the link. Check your clipboard.", copyCommand.stderrTail), code !== 0 || exitStatus !== 0)
     }
     onFailed: {
       if (root.sessionOn && root.session.url === root.copiedUrl)
-        root.showFeedback("Could not copy the link. Check that wl-copy is available.", true)
+        root.showFeedback(root.withCause("Could not copy the link. Check that wl-copy is available.", copyCommand.stderrTail), true)
     }
   }
   Command {
@@ -240,12 +297,12 @@ Shell.Panel {
     onStarted: { sendCommand.deadline.stop(); root.close() }
     onCompleted: function(code, exitStatus, output) {
       if (code !== 0 || exitStatus !== 0) {
-        root.showFeedback("Could not send the link. Copy it instead, or try again.", true)
+        root.showFeedback(root.withCause("Could not send the link. Copy it instead, or try again.", sendCommand.stderrTail), true)
         root.open()
       }
       root.refresh()
     }
-    onFailed: root.showFeedback("Could not open the send window. Copy the link instead.", true)
+    onFailed: root.showFeedback(root.withCause("Could not open the send window. Copy the link instead.", sendCommand.stderrTail), true)
   }
   Command {
     id: pickerCommand
@@ -256,12 +313,12 @@ Shell.Panel {
     onStarted: { pickerCommand.deadline.stop(); root.close() }
     onCompleted: function(code, exitStatus, output) {
       if (code !== 0 || exitStatus !== 0) {
-        root.showFeedback("OmaBeam could not open the picker. Try again.", true)
+        root.showFeedback(root.withCause("OmaBeam could not open the picker. Try again.", pickerCommand.stderrTail), true)
         root.open()
       }
       root.refresh()
     }
-    onFailed: root.showFeedback("Could not open OmaBeam. Check that it is installed.", true)
+    onFailed: root.showFeedback(root.withCause("Could not open OmaBeam. Check that it is installed.", pickerCommand.stderrTail), true)
   }
 
   Shell.KeyboardPanel {

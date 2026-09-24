@@ -1,0 +1,14 @@
+{
+  "buildtools/third_party/libc++": ["third_party/libc++/src/LICENSE.TXT"],
+  "buildtools/third_party/libc++abi": ["third_party/libc++abi/src/LICENSE.TXT"],
+  "third_party/abseil": ["third_party/abseil/src/LICENSE"],
+  "third_party/boringssl": ["third_party/boringssl/src/LICENSE", "third_party/boringssl/src/third_party/fiat/LICENSE"],
+  "third_party/googleurl": ["third_party/googleurl/src/LICENSE", "third_party/googleurl/src/url/third_party/mozilla/LICENSE.txt", "third_party/googleurl/src/base/third_party/icu/LICENSE"],
+  "third_party/jsoncpp": ["third_party/jsoncpp/src/LICENSE"],
+  "third_party/llvm-libc": ["third_party/llvm-libc/src/LICENSE.TXT"],
+  "third_party/modp_b64": ["third_party/modp_b64/LICENSE"],
+  "third_party/perfetto": ["third_party/perfetto/src/LICENSE"],
+  "third_party/protobuf": ["third_party/protobuf/LICENSE", "third_party/protobuf/third_party/utf8_range/LICENSE"],
+  "third_party/quiche": ["third_party/quiche/src/LICENSE"],
+  "third_party/zlib": ["third_party/zlib/LICENSE", "third_party/zlib/src/LICENSE"]
+}

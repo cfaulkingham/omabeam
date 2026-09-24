@@ -71,10 +71,11 @@ body.idle #stage:fullscreen #chrome, body.idle #stage.expanded #chrome { display
   line-height: 1.35;
 }
 #view:not([src]),
-#stage.ended #view, #stage.ended video, [hidden] { display: none !important; }
-#stage.ended { display: grid !important; place-items: center; }
-#stage.ended #disconnected, #stage.blocked #disconnected { display: flex; }
-#stage.blocked #disconnected-copy { letter-spacing: 0.02em; text-transform: none; }
+#stage.ended #view, #stage.ended video,
+#stage.unreachable #view, #stage.unreachable video, [hidden] { display: none !important; }
+#stage.ended, #stage.unreachable { display: grid !important; place-items: center; }
+#stage.ended #disconnected, #stage.blocked #disconnected, #stage.unreachable #disconnected { display: flex; }
+#stage.blocked #disconnected-copy, #stage.unreachable #disconnected-copy { letter-spacing: 0.02em; text-transform: none; }
 #desktop-note { overflow-wrap: anywhere; }
 #viewer-setup { flex-shrink: 0; padding: 16px 20px; border-bottom: 1px solid var(--outline); background: color-mix(in srgb, var(--accent) 6%, var(--background)); }
 #viewer-setup h2 { margin: 0 0 6px; font-size: 16px; }
@@ -193,13 +194,19 @@ const error = document.getElementById('error');
 const pause = document.getElementById('pause');
 let paused = false, ended = false, retry = null, fit = 0, failures = 0;
 let latestStats = null;
+// Missed polls leave working media alone; only a long outage stops the picture.
+const UNREACHABLE_AFTER_MS = 30000;
+let lastPollOk = performance.now();
+let unreachable = false;
 const disconnectedCopy = document.getElementById('disconnected-copy');
+const displayInUse = 'This display is already connected to another device.';
 function setStatus(message, state) { status.textContent = message; document.body.dataset.state = state; }
 function labelTransport() { transport.textContent = preferRtc ? 'Video: Auto' : 'Video: JPEG'; }
 const fits = ['contain', 'width', 'actual'];
 const fitLabels = ['contain', 'fill width', 'actual size'];
 let pc = null, peerId = null, epoch = 0, firstFrameTimer = null;
 let preferRtc = true, fallbackReason = '', playback = 'none', browserStats = null;
+let rtcPlayed = false;
 let previousInbound = null, lastDecodedAt = 0;
 const matchDevice = document.getElementById('match-device');
 const desktopNote = document.getElementById('desktop-note');
@@ -213,7 +220,7 @@ try { setupDismissed = sessionStorage.getItem(setupKey) === 'dismissed'; } catch
 function renderSetup() {
   const desktop = !!latestStats?.desktop;
   viewerSetup.hidden = setupDismissed || !latestStats || ended || latestStats.state === 'ended' ||
-    paused || desktopBlocked || (desktop && !ownsDesktop);
+    paused || unreachable || desktopBlocked || (desktop && !ownsDesktop);
   if (!viewerSetup.hidden) document.body.classList.remove('idle');
   document.getElementById('setup-desktop').hidden = !desktop;
   setupMatch.hidden = !desktop || !ownsDesktop || matchEnabled;
@@ -239,6 +246,11 @@ function randomId() {
 }
 let clientIdentity = randomId(), connectionIdentity = randomId();
 let ownsDesktop = false, desktopBlocked = false, claiming = null;
+// Bumped by each claim and each real conflict, so a lease reply sent before
+// either is recognized as late. A toggled size choice, or one refused only
+// because the lease lapsed, stays owed until the host answers one, so a
+// debounce reschedules it rather than cancels it.
+let leaseGeneration = 0, resizeOwed = false;
 let matchEnabled = false, matchTimer = null, lastSizeRequest = null, resizing = false;
 try {
   clientIdentity = sessionStorage.getItem(identityKey) || clientIdentity;
@@ -252,12 +264,20 @@ async function desktopRequest(action, body = {}, connection = connectionIdentity
   return fetch('desktop/' + action, {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({...body, connection}), signal: AbortSignal.timeout(4000)});
 }
+// 412: only this page's lease lapsed (an outage longer than its grace period)
+// and nobody took the display. Drop it without the in-use overlay; connect()
+// claims it again. The host already dropped this lease's media.
+function leaseLapsed(connection, generation) {
+  if (connection !== connectionIdentity || generation !== leaseGeneration) return false;
+  ownsDesktop = false;
+  return true;
+}
 function showDesktopBlocked() {
-  ownsDesktop = false; desktopBlocked = true;
+  ownsDesktop = false; desktopBlocked = true; leaseGeneration++; resizeOwed = false;
   renderSetup();
   stopPlayback(); clearTimeout(retry); retry = null;
   stage.classList.add('blocked');
-  disconnectedCopy.textContent = 'This display is already connected to another device.';
+  disconnectedCopy.textContent = displayInUse;
   setStatus('Display in use', 'connecting');
   desktopNote.textContent = 'Waiting for the display to become available…';
   document.getElementById('snapshot').removeAttribute('href');
@@ -279,12 +299,12 @@ async function claimDesktop() {
     if (connection !== connectionIdentity || paused || ended) return false;
     if (response.status === 409) { showDesktopBlocked(); return false; }
     if (!response.ok) throw new Error(await response.text());
-    ownsDesktop = true; desktopBlocked = false; lastSizeRequest = null;
+    ownsDesktop = true; desktopBlocked = false; lastSizeRequest = null; leaseGeneration++;
     stage.classList.remove('blocked');
     transport.disabled = false; matchDevice.disabled = false;
     document.getElementById('snapshot').href = mediaUrl('frame.jpg');
     renderDesktop(await response.json());
-    if (matchEnabled) scheduleMatch();
+    if (matchEnabled || resizeOwed) scheduleMatch();
     tryDesktopFullscreen();
     return true;
   })();
@@ -321,7 +341,7 @@ function requestedDeviceSize() {
 }
 function scheduleMatch() {
   clearTimeout(matchTimer);
-  if (!ownsDesktop || paused || ended || !matchEnabled) return;
+  if (!ownsDesktop || paused || ended || !(matchEnabled || resizeOwed)) return;
   matchTimer = setTimeout(() => resizeDesktop(), 800);
 }
 async function resizeDesktop() {
@@ -329,14 +349,16 @@ async function resizeDesktop() {
   const size = matchEnabled ? requestedDeviceSize() : null;
   const key = JSON.stringify(size);
   if (lastSizeRequest === key) return;
-  const connection = connectionIdentity;
+  const connection = connectionIdentity, generation = leaseGeneration;
   resizing = true;
   try {
     const response = await desktopRequest('size', {size}, connection);
+    // Checked before ownership: a heartbeat may already have dropped this lapsed lease.
+    if (response.status === 412) { if (leaseLapsed(connection, generation)) resizeOwed = true; return; }
     if (connection !== connectionIdentity || !ownsDesktop) return;
     if (response.status === 409) { showDesktopBlocked(); return; }
     if (response.status === 429) { matchTimer = setTimeout(() => resizeDesktop(), 1000); return; }
-    lastSizeRequest = key;
+    lastSizeRequest = key; resizeOwed = false;
     if (!response.ok) throw new Error(await response.text());
     renderDesktop(await response.json());
   } catch (failure) { desktopNote.textContent = failure.message || 'Could not resize the desktop.'; }
@@ -351,7 +373,7 @@ async function resizeDesktop() {
 }
 matchDevice.onclick = () => {
   dismissSetup();
-  matchEnabled = !matchEnabled; lastSizeRequest = null;
+  matchEnabled = !matchEnabled; lastSizeRequest = null; resizeOwed = true;
   try { sessionStorage.setItem(matchKey, String(matchEnabled)); } catch {}
   renderDesktop(latestStats.desktop);
   clearTimeout(matchTimer); matchTimer = setTimeout(() => resizeDesktop(), 800);
@@ -412,16 +434,23 @@ function connectJpeg(reason = '') {
   const url = mediaUrl('stream');
   img.src = url + (url.includes('?') ? '&' : '?') + 't=' + Date.now(); setStatus('Connecting…', 'connecting');
 }
+function fallBackToJpeg(reason, retryable = false) {
+  // H.264 that never played (blocked UDP, no decoder) is unlikely to work on a
+  // retry. Stay on JPEG until the viewer selects Auto again. While status polls
+  // fail, the host is unreachable and the failure says nothing about H.264.
+  if (!retryable && !rtcPlayed && failures === 0) preferRtc = false;
+  connectJpeg(reason);
+}
 async function connect() {
   clearTimeout(retry); retry = null;
-  if (paused || ended) return;
-  try { if (!(await claimDesktop()) || paused || ended) return; }
+  if (paused || ended || unreachable) return;
+  try { if (!(await claimDesktop()) || paused || ended || unreachable) return; }
   catch { setStatus('Reconnecting…', 'connecting'); return; }
   if (preferRtc && latestStats?.webrtc && !latestStats.webrtc.error) connectRtc();
-  else connectJpeg(preferRtc && latestStats?.webrtc?.error ? latestStats.webrtc.error : '');
+  else connectJpeg(preferRtc && latestStats?.webrtc?.error ? latestStats.webrtc.error : fallbackReason);
 }
 function reconnect() {
-  if (!paused && !ended && !desktopBlocked && retry === null) retry = setTimeout(() => { retry = null; connect(); }, 1500);
+  if (!paused && !ended && !unreachable && !desktopBlocked && retry === null) retry = setTimeout(() => { retry = null; connect(); }, 1500);
 }
 function preferLowLatency(receiver) {
   if (!receiver || !('jitterBufferTarget' in receiver)) return;
@@ -430,11 +459,11 @@ function preferLowLatency(receiver) {
   try { receiver.jitterBufferTarget = 0; } catch { /* Optional browser hint. */ }
 }
 async function connectRtc() {
-  stopPlayback();
-  if (!window.RTCPeerConnection) { connectJpeg('WebRTC unavailable in this browser'); return; }
+  stopPlayback(); rtcPlayed = false;
+  if (!window.RTCPeerConnection) { fallBackToJpeg('WebRTC unavailable in this browser'); return; }
   const current = epoch;
   const active = () => current === epoch && !paused && !ended;
-  const fallback = reason => { if (active()) connectJpeg(reason); };
+  const fallback = (reason, retryable) => { if (active()) fallBackToJpeg(reason, retryable); };
   playback = 'connecting'; fallbackReason = '';
   labelTransport(); transportNote.textContent = 'Connecting H.264…';
   setStatus('Connecting H.264…', 'connecting');
@@ -455,7 +484,7 @@ async function connectRtc() {
       video.srcObject = event.streams[0] || new MediaStream([event.track]);
       video.onplaying = () => {
         if (!active()) return;
-        clearTimeout(firstFrameTimer); firstFrameTimer = null;
+        clearTimeout(firstFrameTimer); firstFrameTimer = null; rtcPlayed = true;
         video.hidden = false; playback = 'webrtc'; lastDecodedAt = performance.now();
         transportNote.textContent = 'H.264 / WebRTC'; setStatus('Live', 'live');
       };
@@ -470,10 +499,20 @@ async function connectRtc() {
       connection.addEventListener('icegatheringstatechange', changed);
     });
     if (!active()) return;
-    const response = await fetch(mediaUrl('webrtc/offer'), {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(connection.localDescription), signal: AbortSignal.timeout(4000)});
-    if (!response.ok) throw new Error((await response.text()).slice(0, 180));
-    const result = await response.json();
+    let response, reply;
+    try {
+      response = await fetch(mediaUrl('webrtc/offer'), {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(connection.localDescription), signal: AbortSignal.timeout(4000)});
+      reply = await response.text();
+    } catch (failure) {
+      // The host may only be briefly unreachable; try H.264 again on reconnect.
+      fallback(failure.message || 'H.264 negotiation failed', true); return;
+    }
+    // This page's display lease lapsed (for example during an outage longer
+    // than its grace period); the lease path claims it again.
+    if (response.status === 409) { fallback(reply.slice(0, 180) || 'H.264 negotiation failed', true); return; }
+    if (!response.ok) throw new Error(reply.slice(0, 180));
+    const result = JSON.parse(reply);
     if (!active()) { releasePeer(result.id); return; }
     peerId = result.id;
     await connection.setRemoteDescription(result.answer);
@@ -482,14 +521,14 @@ async function connectRtc() {
 async function sampleBrowser() {
   const connection = pc;
   if (!connection) return;
-  if (['failed', 'closed', 'disconnected'].includes(connection.connectionState)) { connectJpeg('WebRTC connection lost'); return; }
+  if (['failed', 'closed', 'disconnected'].includes(connection.connectionState)) { fallBackToJpeg('WebRTC connection lost'); return; }
   if (connection.connectionState !== 'connected') return;
   try {
     const report = await connection.getStats();
     if (connection !== pc) return;
     const inbound = [...report.values()].find(s => s.type === 'inbound-rtp' && s.kind === 'video');
     if (!inbound) {
-      if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) connectJpeg('H.264 playback stalled');
+      if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) fallBackToJpeg('H.264 playback stalled');
       return;
     }
     const before = previousInbound?.id === inbound.id ? previousInbound : null;
@@ -512,7 +551,7 @@ async function sampleBrowser() {
     previousInbound = {id: inbound.id, timestamp: inbound.timestamp, framesDecoded: frames,
       bytesReceived: inbound.bytesReceived, totalDecodeTime: inbound.totalDecodeTime,
       jitterBufferDelay: inbound.jitterBufferDelay, jitterBufferEmittedCount: inbound.jitterBufferEmittedCount};
-    if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) connectJpeg('H.264 playback stalled');
+    if (playback === 'webrtc' && performance.now() - lastDecodedAt > 8000) fallBackToJpeg('H.264 playback stalled');
   } catch { /* A pause can close the peer while getStats is pending. */ }
 }
 function finish(message) {
@@ -521,9 +560,20 @@ function finish(message) {
   pause.disabled = true; transport.disabled = true; transport.hidden = true;
   document.getElementById('snapshot').removeAttribute('href');
   stage.classList.add('ended');
-  stage.classList.remove('blocked');
+  unreachable = false; stage.classList.remove('blocked', 'unreachable');
   disconnectedCopy.textContent = 'OmaBeam disconnected';
   setStatus('Share ended', 'ended'); error.textContent = message;
+}
+function showUnreachable() {
+  if (!unreachable) {
+    // Do not present a stale picture as live. The next successful poll resumes media.
+    unreachable = true; clearTimeout(retry); retry = null;
+    stopPlayback(); releaseDesktop(); renderDesktop(latestStats?.desktop);
+    stage.classList.add('unreachable');
+    disconnectedCopy.textContent = 'Can’t reach OmaBeam';
+  }
+  if (!paused) setStatus('Connection lost', 'connecting');
+  error.textContent = 'The host may have stopped sharing or left the network. Retrying…';
 }
 img.onerror = () => {
   if (!paused && !ended && playback === 'jpeg') {
@@ -533,18 +583,22 @@ img.onerror = () => {
 pause.onclick = () => {
   paused = !paused; clearTimeout(retry); retry = null;
   pause.textContent = paused ? 'Resume' : 'Pause';
-  if (paused) { stopPlayback(); releaseDesktop(); setStatus('Paused', 'paused'); } else connect();
+  if (paused) { stopPlayback(); releaseDesktop(); setStatus('Paused', 'paused'); }
+  else if (unreachable) setStatus('Connection lost', 'connecting');
+  else connect();
   renderDesktop(latestStats?.desktop);
 };
 transport.onclick = () => {
   preferRtc = !preferRtc;
   fallbackReason = '';
+  // connect() does nothing while paused or unreachable; keep the label current.
+  labelTransport();
   if (!paused) connect();
-  else labelTransport();
 };
 addEventListener('pagehide', () => { paused = true; stopPlayback(); releaseDesktop(); });
 addEventListener('pageshow', event => {
-  if (event.persisted && !ended) { paused = false; pause.textContent = 'Pause'; connect(); }
+  // Time spent in the back-forward cache is not a host outage.
+  if (event.persisted && !ended) { paused = false; pause.textContent = 'Pause'; lastPollOk = performance.now(); connect(); }
 });
 document.getElementById('fit').onclick = e => {
   stage.classList.remove(fits[fit]); fit = (fit + 1) % fits.length; stage.classList.add(fits[fit]);
@@ -631,24 +685,34 @@ document.getElementById('diagnostics').addEventListener('toggle', () => {
 async function poll() {
   try {
     const response = await fetch('stats', {cache: 'no-store', signal: AbortSignal.timeout(3000)});
+    // An unknown share token answers 404 on every route; neither status recovers.
+    if (response.status === 404 || response.status === 410) { finish('This share has ended.'); return; }
     if (!response.ok) throw new Error('Status unavailable');
-    const stats = await response.json(); failures = 0;
-    const initial = latestStats === null;
+    const stats = await response.json();
+    const initial = latestStats === null, recovered = unreachable;
+    if (recovered) {
+      unreachable = false; stage.classList.remove('unreachable');
+      // A blocked page keeps its overlay until a claim succeeds.
+      disconnectedCopy.textContent = desktopBlocked ? displayInUse : 'OmaBeam disconnected'; error.textContent = '';
+    }
     latestStats = stats;
     transport.hidden = ended || stats.state === 'ended' || !stats.webrtc;
     renderDesktop(stats.desktop);
     if (stats.desktop && stats.state !== 'ended' && !paused) {
       if (ownsDesktop) {
-        const connection = connectionIdentity;
+        const connection = connectionIdentity, generation = leaseGeneration;
         const heartbeat = await desktopRequest('heartbeat', {}, connection);
         if (connection === connectionIdentity && heartbeat.status === 409) showDesktopBlocked();
+        else if (heartbeat.status === 412) leaseLapsed(connection, generation);
         else if (!heartbeat.ok) throw new Error('Could not renew display connection');
       }
+      // Also resumes a desktop share after an outage released or lapsed the lease.
       if (!ownsDesktop) await connect();
     }
+    failures = 0; lastPollOk = performance.now();
     await sampleBrowser();
-    if (initial && !stats.desktop && stats.state !== 'ended') connect();
-    if (['webrtc', 'connecting'].includes(playback) && stats.webrtc?.error) connectJpeg(stats.webrtc.error);
+    if ((initial || recovered) && !stats.desktop && stats.state !== 'ended') connect();
+    if (['webrtc', 'connecting'].includes(playback) && stats.webrtc?.error) fallBackToJpeg(stats.webrtc.error);
     if (document.getElementById('diagnostics').open) renderDiagnostics(stats);
     document.getElementById('metrics').textContent = `${stats.width}×${stats.height} · ${stats.fps.toFixed(1)} capture fps · ${stats.viewers} viewer${stats.viewers === 1 ? '' : 's'}`;
     document.getElementById('source').textContent = stats.source;
@@ -656,16 +720,23 @@ async function poll() {
     if (stats.state === 'ended') finish(stats.error || 'The source is no longer available.');
     else if (!paused && !desktopBlocked && playback !== 'connecting') setStatus(stats.fps > 0 ? 'Live' : 'Live · waiting for changes', 'live');
   } catch {
+    // A missed poll says nothing about media, which has its own error handling.
     if (!ended) {
       failures++;
-      setStatus(paused ? 'Paused' : 'Connection lost', paused ? 'paused' : 'connecting');
-      error.textContent = 'The share may have stopped. Reconnecting…';
-      // Do not leave an old image presented as a live share.
-      stopPlayback(); reconnect();
-      if (failures >= 5) finish('The share stopped or the connection was lost. Reload to try again.');
+      if (unreachable || performance.now() - lastPollOk >= UNREACHABLE_AFTER_MS) showUnreachable();
+      else {
+        if (!paused) {
+          const showing = playback === 'webrtc' || (playback === 'jpeg' && img.naturalWidth > 0);
+          error.textContent = 'Waiting for the host…' + (showing ? ' The picture keeps playing while OmaBeam reconnects.' : '');
+          if (playback === 'none') setStatus('Reconnecting…', 'connecting');
+        }
+        // H.264 stall detection must not wait for a successful poll.
+        await sampleBrowser();
+      }
     }
   }
-  if (!ended) setTimeout(poll, 1000);
+  // Back off after consecutive failures: 1, 2, 4, then 5 seconds.
+  if (!ended) setTimeout(poll, Math.min(5000, 1000 * 2 ** Math.max(0, failures - 1)));
 }
 poll();
 </script>

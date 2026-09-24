@@ -2,7 +2,7 @@
 //! only the separate helper executable links to the system media libraries.
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, IoSliceMut, Read, Write};
 
 pub const VERSION: u32 = 1;
 pub const MAX_HEADER: usize = 4096;
@@ -15,6 +15,11 @@ pub struct Config {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Frames between IDRs. Zero keeps the historical two-second interval.
+    /// A positive value is an explicit interval; Cast uses one minute so a
+    /// keyframe is not spent on a clock.
+    #[serde(default)]
+    pub gop_frames: u32,
 }
 impl Config {
     pub fn frame_len(&self) -> Result<usize> {
@@ -33,6 +38,14 @@ impl Config {
             "invalid H.264 rate"
         );
         Ok(self.width as usize * self.height as usize * 3 / 2)
+    }
+
+    pub fn gop_frames(&self) -> u32 {
+        if self.gop_frames == 0 {
+            self.fps.saturating_mul(2).max(1)
+        } else {
+            self.gop_frames.max(1)
+        }
     }
 }
 
@@ -61,6 +74,78 @@ pub fn read_json<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
     let mut bytes = vec![0; size];
     reader.read_exact(&mut bytes)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Read `rows` rows of `width` bytes, sent back to back, into `plane`, whose
+/// rows start `stride` bytes apart. Padded rows are filled in place by
+/// vectored reads, so padding costs neither a staging copy nor a read per row.
+pub fn read_plane(
+    input: &mut impl Read,
+    plane: &mut [u8],
+    width: usize,
+    stride: usize,
+    rows: usize,
+) -> Result<()> {
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    ensure!(
+        width <= stride && stride * (rows - 1) + width <= plane.len(),
+        "plane is smaller than its rows"
+    );
+    if width == stride {
+        input.read_exact(&mut plane[..width * rows])?;
+        return Ok(());
+    }
+    let mut slices: Vec<_> = plane
+        .chunks_mut(stride)
+        .take(rows)
+        .map(|row| IoSliceMut::new(&mut row[..width]))
+        .collect();
+    let mut slices = slices.as_mut_slice();
+    while !slices.is_empty() {
+        match input.read_vectored(slices) {
+            Ok(0) => return Err(io::Error::from(ErrorKind::UnexpectedEof).into()),
+            Ok(n) => IoSliceMut::advance_slices(&mut slices, n),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Interleave planar chroma (`width` samples per row, rows back to back) into
+/// an NV12 UV plane whose rows start `stride` bytes apart.
+pub fn interleave_uv(
+    u: &[u8],
+    v: &[u8],
+    plane: &mut [u8],
+    width: usize,
+    stride: usize,
+    rows: usize,
+) -> Result<()> {
+    if rows == 0 || width == 0 {
+        return Ok(());
+    }
+    ensure!(
+        u.len() >= width * rows
+            && v.len() >= width * rows
+            && 2 * width <= stride
+            && stride * (rows - 1) + 2 * width <= plane.len(),
+        "chroma does not fit its plane"
+    );
+    let rows = plane
+        .chunks_mut(stride)
+        .zip(u.chunks_exact(width))
+        .zip(v.chunks_exact(width))
+        .take(rows);
+    for ((row, u), v) in rows {
+        for ((pair, u), v) in row[..2 * width].chunks_exact_mut(2).zip(u).zip(v) {
+            pair[0] = *u;
+            pair[1] = *v;
+        }
+    }
+    Ok(())
 }
 
 /// Inspect the actual Annex B payload, not an encoder's packet flag. New peers
@@ -122,6 +207,21 @@ pub fn inspect_h264(bytes: &[u8]) -> Result<bool> {
 mod tests {
     use super::*;
     #[test]
+    fn zero_gop_is_two_seconds_and_an_explicit_interval_is_kept() {
+        let mut config = Config {
+            version: VERSION,
+            width: 16,
+            height: 16,
+            fps: 30,
+            bitrate: 100_000,
+            gop_frames: 0,
+        };
+        assert_eq!(config.gop_frames(), 60);
+        config.gop_frames = 1_800;
+        assert_eq!(config.gop_frames(), 1_800);
+    }
+
+    #[test]
     fn rejects_unbounded_headers_and_incompatible_bitstreams() {
         assert!(read_json::<Reply>(&mut u32::MAX.to_le_bytes().as_slice()).is_err());
         assert!(inspect_h264(&[0, 0, 1, 0x65, 1]).is_err());
@@ -132,5 +232,97 @@ mod tests {
         frame[5] = 100;
         assert!(inspect_h264(&frame).is_err());
         assert!(!inspect_h264(&[0, 0, 1, 0x41, 1]).unwrap());
+    }
+
+    /// Hands out at most `step` bytes per call, splitting rows across calls
+    /// the way a pipe does.
+    struct Trickle<'a> {
+        data: &'a [u8],
+        step: usize,
+    }
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.step).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+        fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> std::io::Result<usize> {
+            let mut total = 0;
+            for buf in bufs {
+                let limit = buf.len().min(self.step - total);
+                let n = self.read(&mut buf[..limit])?;
+                total += n;
+                if n < buf.len() || total == self.step {
+                    break;
+                }
+            }
+            Ok(total)
+        }
+    }
+
+    #[test]
+    fn plane_rows_land_at_their_stride_however_the_input_arrives() {
+        // 683 × 9 is the chroma of a 1366 × 18 frame: padded rows, odd count.
+        for (width, stride, rows) in [(683, 704, 9), (8, 8, 5), (6, 32, 1), (1920, 1920, 3)] {
+            let data: Vec<u8> = (0..width * rows).map(|i| (i * 31 % 251) as u8).collect();
+            for step in [1, 7, 700, usize::MAX] {
+                // The last row needs only `width` bytes, as in a tight buffer.
+                let mut plane = vec![0xee; stride * (rows - 1) + width];
+                let mut input = Trickle { data: &data, step };
+                read_plane(&mut input, &mut plane, width, stride, rows).unwrap();
+                assert!(input.data.is_empty(), "left input unread");
+                for (row, expected) in plane.chunks(stride).zip(data.chunks(width)) {
+                    assert_eq!(&row[..width], expected, "step {step}");
+                    assert!(row[width..].iter().all(|&b| b == 0xee), "wrote padding");
+                }
+            }
+            // A plain slice fills many rows per vectored read.
+            let mut plane = vec![0xee; stride * rows];
+            read_plane(&mut data.as_slice(), &mut plane, width, stride, rows).unwrap();
+            for (row, expected) in plane.chunks(stride).zip(data.chunks(width)) {
+                assert_eq!(&row[..width], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn a_short_input_or_a_plane_smaller_than_its_rows_is_an_error() {
+        let data = [7; 20];
+        let mut plane = [0; 32];
+        assert!(read_plane(&mut &data[..], &mut plane, 6, 8, 4).is_err());
+        assert!(read_plane(&mut &data[..], &mut plane, 9, 8, 2).is_err());
+        assert!(read_plane(&mut &data[..], &mut plane[..28], 5, 8, 4).is_err());
+        assert!(read_plane(&mut &data[..], &mut plane[..29], 5, 8, 4).is_ok());
+        let (u, v) = ([1; 6], [2; 6]);
+        assert!(interleave_uv(&u, &v, &mut plane, 3, 5, 2).is_err());
+        assert!(interleave_uv(&u, &v[..5], &mut plane, 3, 8, 2).is_err());
+        assert!(interleave_uv(&u, &v, &mut plane[..13], 3, 8, 2).is_err());
+        assert!(interleave_uv(&u, &v, &mut plane[..14], 3, 8, 2).is_ok());
+    }
+
+    #[test]
+    fn nv12_chroma_matches_the_former_interleave_loop() {
+        // The helper's scalar loop before the chunked interleave.
+        fn reference(i420: &[u8], w: usize, h: usize, stride: usize) -> Vec<u8> {
+            let mut plane = vec![0xee; stride * h / 2];
+            let chroma = w * h / 4;
+            for y in 0..h / 2 {
+                let row = &mut plane[y * stride..y * stride + w];
+                for x in 0..w / 2 {
+                    row[x * 2] = i420[w * h + y * w / 2 + x];
+                    row[x * 2 + 1] = i420[w * h + chroma + y * w / 2 + x];
+                }
+            }
+            plane
+        }
+        // 18 rows of luma give 9 of chroma.
+        for (w, h, stride) in [(1366, 18, 1376), (64, 36, 64), (16, 16, 32)] {
+            let i420: Vec<u8> = (0..w * h * 3 / 2).map(|i| (i * 131 % 253) as u8).collect();
+            let (u, v) = i420[w * h..].split_at(w * h / 4);
+            let mut plane = vec![0xee; stride * h / 2];
+            interleave_uv(u, v, &mut plane, w / 2, stride, h / 2).unwrap();
+            assert_eq!(plane, reference(&i420, w, h, stride), "{w}x{h}");
+        }
     }
 }

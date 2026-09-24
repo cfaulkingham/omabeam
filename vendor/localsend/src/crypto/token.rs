@@ -7,7 +7,11 @@ use ed25519_dalek::pkcs8::{
     EncodePublicKey as EdEncodePublicKey,
 };
 use ed25519_dalek::{Signer as EdSigner, Verifier as EdVerifier};
+// RSA-PSS tokens only come from WebRTC peers: without that feature, builds
+// leave the `rsa` crate out.
+#[cfg(feature = "webrtc")]
 use rsa::pkcs8::{DecodePublicKey as RsaDecodePublicKey, EncodePublicKey as RsaEncodePublicKey};
+#[cfg(feature = "webrtc")]
 use rsa::signature::Verifier as RsaVerifier;
 
 pub struct SigningTokenKey {
@@ -34,6 +38,7 @@ struct Ed25519VerifyingKey {
     inner: ed25519_dalek::VerifyingKey,
 }
 
+#[cfg(feature = "webrtc")]
 struct RsaPssVerifyingKey {
     inner: rsa::pss::VerifyingKey<rsa::sha2::Sha256>,
 }
@@ -54,6 +59,7 @@ impl VerifyingTokenKey for Ed25519VerifyingKey {
     }
 }
 
+#[cfg(feature = "webrtc")]
 impl VerifyingTokenKey for RsaPssVerifyingKey {
     fn verify(&self, msg: &[u8], signature: &[u8]) -> anyhow::Result<()> {
         let signature = rsa::pss::Signature::try_from(signature)?;
@@ -103,6 +109,7 @@ pub fn parse_public_key(
         "ed25519" => Box::new(Ed25519VerifyingKey {
             inner: ed25519_dalek::VerifyingKey::from_public_key_pem(public_key)?,
         }),
+        #[cfg(feature = "webrtc")]
         "rsa-pss" => Box::new(RsaPssVerifyingKey {
             inner: {
                 let public_key = rsa::RsaPublicKey::from_public_key_pem(public_key)?;
@@ -254,6 +261,33 @@ mod tests {
         let fingerprint = generate_token_timestamp(&key).unwrap();
         let verified = verify_token_timestamp(&*key.to_verifying_key(), &fingerprint);
         assert!(verified);
+    }
+
+    /// RSA-PSS tokens only come from WebRTC peers, so builds without WebRTC
+    /// leave out the `rsa` crate.
+    #[cfg(not(feature = "webrtc"))]
+    #[test]
+    fn test_rsa_pss_keys_need_the_webrtc_feature() {
+        let error = parse_public_key("irrelevant", "rsa-pss")
+            .err()
+            .expect("rsa-pss must be unsupported");
+        assert_eq!(error.to_string(), "Unsupported key type");
+    }
+
+    #[cfg(feature = "webrtc")]
+    #[test]
+    fn test_rsa_pss_keys_parse_with_webrtc() {
+        let public_key = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAi9uDMYRn63SZtEPGRogZ
+Gdu5XXBAoQeMO60mycoinqLKDWyZdpMo+XWY3wYVhoAyxgzDOcPjIf+Uq1oEy/0K
+4WwfpbK8SCy851qgYkfMCT9D9mFvXwWoULJCUHFF7f947ArDE1nmuK1nNx2RodN2
+wJCXyzPjw0jn06bwGeg0EqfUC8wvW4FTZ6t1tErzmRqRdMUWuCJwsk1IMbDbFePh
+iK5jecOBG0RVVWLuw+TkuX8TUgrpIktH2+qEM1KdLyAMnL71hx2wMvE+lDKFKK9p
+37zXK8omjl+VgTC8ocjGeYDDsl43ZtW09V0pb7Vz2FM8b7BgM06kvJl48PIe5puY
+bQIDAQAB
+-----END PUBLIC KEY-----";
+        let key = parse_public_key(public_key, "rsa-pss").unwrap();
+        assert_eq!(key.signature_method(), "rsa-pss");
     }
 
     #[test]

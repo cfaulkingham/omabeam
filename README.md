@@ -31,6 +31,8 @@ falls back to JPEG automatically.
   show a scannable QR code, send it to a nearby device, or stop sharing.
 - **Nearby sharing:** send the link to OmaSend or LocalSend devices. OmaBeam
   includes the sending protocol; the receiver needs a LocalSend-compatible app.
+  If a receiver requires a PIN, the send window asks for it. OmaBeam only
+  sends: it never appears as a device others can send to.
 - **Screenshots:** copy, save, or share an image through `omarchy share file`.
 - **Portal picker:** optionally select sources for apps using
   xdg-desktop-portal-hyprland.
@@ -46,8 +48,9 @@ release bundle includes the app and needs no Rust.
 ```
 
 The installer builds or verifies the native app, installs and enables the bar
-plugin, adds a floating-window rule, and binds **Super + Shift + T** when available. It can be
-rerun. It checks TCP **9847** and UDP **9848** against UFW's incoming rules for
+plugin, adds floating-window rules for the picker and the nearby-send window,
+and binds **Super + Shift + T** when available. It can be rerun. It checks TCP
+**9847** and UDP **9848** against UFW's incoming rules for
 the detected LAN. If those ports are blocked, it prompts for sudo and adds
 persistent, subnet-scoped allows. `--check-ports` inspects without changing
 rules. `--open-firewall CIDR` still selects a specific viewer network and
@@ -87,6 +90,21 @@ See [Installation and releases](RELEASING.md) for Git-managed installs,
 bundles, updates, and removal. Run `./install.sh --backend-only` inside a
 plugin checkout to build the app without changing desktop configuration.
 
+## Experimental Google Cast
+
+This branch adds a **Google Cast** destination for native, video-only H.264
+mirroring to one receiver. Build the optional helper with
+`./install.sh --backend-only --with-cast`, then select Google Cast and a receiver
+in the picker. The bar shows the receiver and a Stop action. `omabeam --stop`
+also ends a Cast that is still looking for its receiver, before it connects.
+Cast sessions do not need a browser link.
+
+The initial profiles are 720p and 1080p at up to 30 fps, subject to receiver
+limits. Real Hyprland extended-display playback has been confirmed at 720p on a
+Google Nest Hub and 1080p on an E65-E1 TV. Sustained performance and broader
+device behavior still need qualification; see [current results and commands](docs/NATIVE-CAST-STATUS.md).
+System audio is a later milestone.
+
 ## Removing
 
 Stop an active share from the bar (or `omabeam --stop`), then:
@@ -108,6 +126,11 @@ Left on disk after removal:
 
 - `$XDG_RUNTIME_DIR/omabeam/` — `live.json` and `live.log` for the current
   session. These go away at logout. There is no `/tmp` fallback.
+- `~/.config/omabeam/settings.json` (or under `$XDG_CONFIG_HOME`) — stream
+  settings remembered by the picker
+- `~/.config/omabeam/localsend-identity.json` (or under `$XDG_CONFIG_HOME`) —
+  the certificate and private key (mode 0600) that nearby receivers recognize
+  OmaBeam by. A new one is created if you delete it.
 - Screenshots under `$OMARCHY_SCREENSHOT_DIR/omabeam`, `$XDG_PICTURES_DIR/omabeam`,
   or `~/Pictures/omabeam/`
 - Firewall rules (including ones added during install or with `--open-firewall`) and any
@@ -133,8 +156,10 @@ when idle so it does not cover the host cursor, and enters fullscreen when the
 browser allows or when you tap the picture. Move windows onto the extra display
 using your Omarchy computer's mouse or keyboard. The extra display starts empty;
 windows and notifications placed there become visible to viewers. Native pixels
-and the host cursor are selected when entering this mode. Extended desktop defaults
-to 60 FPS; an explicitly selected frame rate or quality preset takes precedence. H.264 / WebRTC is
+and the host cursor are selected when entering this mode, and any maximum-width
+cap is removed. Leaving this mode restores the earlier pixel, cursor, and width
+settings. Extended desktop defaults to 60 FPS; an explicitly selected frame rate
+or quality preset takes precedence. H.264 / WebRTC is
 the default video transport; choose **Video transport → JPEG** if you want
 MJPEG instead. JPEG and H.264 use
 the same firewall ports as other shares.
@@ -159,9 +184,21 @@ the previous mode and reports the failure in the viewer.
 Stop sharing from the bar, or run `omabeam --stop`, to remove the extra display.
 Closing or disconnecting the viewer leaves it available for reconnection.
 Hyprland returns its workspaces to remaining displays when the output is removed.
-OmaBeam leaves physical monitor settings and Hyprland configuration files alone.
+While the extra display exists, OmaBeam holds your physical monitors at their
+current positions so Hyprland's automatic placement cannot move them. Removing
+the display reloads your Hyprland configuration, which restores your own
+monitor rules and also discards settings changed at runtime (for example with
+`hyprctl keyword`). OmaBeam never edits Hyprland configuration files.
 If the process is killed, `--stop` or the next share retries cleanup using the
 saved display record.
+
+A share started from a terminal (`omabeam --live …`) also stops and removes the
+extra display when you press Ctrl-C or close that terminal. Started under
+`nohup` on Linux, it keeps running; stop it from the bar or with
+`omabeam --stop`. Cleanup gives Hyprland about six seconds to answer. If
+Hyprland is slower than that, the extra display stays and `--stop` can report
+a failure; run `omabeam --stop` again, or start the next share, to finish
+removing it.
 
 The equivalent CLI command is:
 
@@ -170,10 +207,14 @@ omabeam --native-pixels --cursor --live extend 1920 1080 1 right
 ```
 
 The four values are width, height, desktop scale (`1` or `2`), and placement
-(`right`, `left`, `above`, or `below`). This requires Hyprland with Lua monitor
-configuration and a working headless output backend. It is separate from the
-portal picker and screenshot mode. Input remains on the host computer; the
-browser is a display, with its usual viewing controls.
+(`right`, `left`, `above`, or `below`). The size must be at least 640×480, fit
+within 3840×2160 or 2160×3840 (the H.264 limit), and divide evenly by the
+scale; other sizes, such as 2880×2880, are refused before the display is
+created. The picker and **Match this device** use the same limits. This
+requires Hyprland with Lua monitor configuration and a working headless output
+backend. It is separate from the portal picker and screenshot mode. Input
+remains on the host computer; the browser is a display, with its usual viewing
+controls.
 
 ## Share your screen
 
@@ -188,12 +229,22 @@ the steps below. Hardware-accelerated H.264 is available for every live share.
 
 Window capture follows the selected window even when another window overlaps
 it. If the compositor cannot capture it separately, select an area explicitly.
-A lost source ends the share and clears the viewer image.
+A lost source ends the share and clears the viewer image. Once a share has
+ended or is stopping, its image and stream addresses (`frame.jpg`, `stream`)
+answer HTTP 410 Gone, so a player that opens them directly can tell the share
+is over. Brief network interruptions do not stop the picture. If the host
+cannot be reached for about 30 seconds, the viewer says so and keeps retrying.
 
 Defaults: 15 FPS (60 FPS for extended desktop), H.264 / WebRTC with JPEG fallback, JPEG quality 55, native
 logical width, cursor off, 4 Mbit/s at 15 FPS (16 Mbit/s at 60 FPS), and local network (TCP **9847** and UDP **9848** on
 0.0.0.0). Presets offer Balanced, Crisp text, and Smooth motion. Advanced exposes
-individual settings.
+individual settings. The picker remembers the stream settings you choose in
+`~/.config/omabeam/settings.json` (or under `$XDG_CONFIG_HOME`) and applies them
+to window, screen, and area sharing. An extended desktop uses them too, but
+still starts at 60 FPS with native pixels, the cursor, and no width cap. Flags
+that set a value, such as `--fps`, `--quality`, `--width`, or `--jpeg`, override
+remembered settings for one run; no flag turns off a remembered cursor, native
+pixels, or width cap.
 
 Crisp text uses native captured pixels at JPEG quality 90, preserving fine
 detail on HiDPI displays. Balanced and Smooth motion use logical pixels.
@@ -222,9 +273,12 @@ H.264 targets 4 Mbit/s at 15 FPS and scales with frame rate up to 16 Mbit/s
 as-is. NVIDIA NVENC uses VBR with a 2× burst cap so quality can recover after
 fast motion without adding encode delay.
 Advanced lets you adjust the target bitrate. The browser automatically falls back to JPEG
-if H.264 negotiation or playback fails, and stays on JPEG. Click **Video: Auto**
-to select JPEG manually, or **Video: JPEG** to try Auto again. Pause releases
-the connection. `--jpeg` selects JPEG/MJPEG from the command line.
+if H.264 negotiation or playback fails, and stays on JPEG. A stream that was
+playing and then dropped, or that failed while the host was unreachable,
+continues on JPEG and tries H.264 again on the next reconnect. Click
+**Video: Auto** to select JPEG manually, or **Video: JPEG** to
+try Auto again. Pause releases the connection. `--jpeg` selects JPEG/MJPEG from
+the command line.
 
 H.264 uses 4:2:0 color, which can soften fine colored text. Preview and browser
 snapshots remain JPEG; PNG screenshots are unchanged. Odd image dimensions
@@ -252,7 +306,14 @@ To test encoder detection with generated frames, without capturing your desktop:
 ```bash
 omabeam --check-encoders
 omabeam --check-encoders --encoder hardware
+omabeam --check-encoders 2560x1440 3440x1440
 ```
+
+The check encodes at 640×360, 1920×1080, and 3840×2160 with a fresh encoder
+for each size, or at the `WxH` sizes you give. `sizes` lists each result. The
+top-level fields show the first size that did not use the GPU, so `hardware`
+is true only if every size did. With `--encoder hardware`, the check fails if
+any size fails.
 
 Hardware encoding uses the adjacent `omabeam-encoder` helper and system FFmpeg
 libraries. The installer builds the helper when its dependencies are available;
@@ -261,8 +322,16 @@ permissions are also required. The main app still runs with software encoding
 if the helper or its libraries are missing. `--encoder software` skips detection.
 
 Links use a fresh random token and plain HTTP. Anyone on the local network
-with the link can view the share. If a firewall blocks viewers, allow TCP 9847
-and, for WebRTC, UDP 9848 from your intended subnet only. If JPEG works but
+with the link can view the share. A connection that has not yet sent the
+link's token must send its request within two seconds, and at most 32 such
+connections are held at a time, 8 from any one IPv4 address or IPv6 /64
+network; others get HTTP 503 until one frees. A viewer holds one of these
+places only until its request arrives, but one host with four IPv4 addresses
+can still take all 32 and keep other viewers out, and all link-local IPv6
+(`fe80::`) clients fall in one /64 and share its 8, as do viewers behind one
+shared address such as a NAT, VM, or container. If a firewall blocks
+viewers, allow TCP 9847 and, for WebRTC, UDP 9848 from your intended subnet
+only. If JPEG works but
 H.264 reports a playback timeout or a lost WebRTC connection, check UDP 9848
 with the installer commands above. A missing H.264 decoder or encoder error
 needs a separate fix. Use `--bind 127.0.0.1` to keep the stream on
@@ -309,7 +378,8 @@ Restart `xdg-desktop-portal-hyprland` or log out and back in to apply it.
 ## Command line and development
 
 Run the installed launcher with `--help` for CLI options. `--status` prints
-session JSON, `--stop` ends sharing, and `--send-link` opens nearby devices.
+session JSON, `--stop` ends sharing (including a share that is still
+starting), and `--send-link` opens nearby devices.
 [Development](docs/DEVELOPMENT.md) covers builds, architecture, demos, and tests.
 
 MIT licensed. LocalSend retains its own license and

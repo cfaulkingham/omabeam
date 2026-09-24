@@ -4,7 +4,7 @@ use x509_parser::certificate::X509Certificate;
 use x509_parser::pem::Pem;
 use x509_parser::x509::SubjectPublicKeyInfo;
 
-/// A freshly generated device identity: an RSA-2048 key pair and a
+/// A freshly generated device identity: an ECDSA P-256 key pair and a
 /// self-signed certificate whose SHA-256 fingerprint identifies the device.
 pub struct SelfSignedCert {
     /// The private key, PEM-encoded (PKCS#8).
@@ -21,8 +21,10 @@ pub struct SelfSignedCert {
 /// Generates a new device identity, used for both the HTTP server and client
 /// certificates.
 ///
-/// - RSA-2048, matching the certificates the Flutter app has historically
-///   generated in Dart.
+/// - ECDSA P-256 (local patch; upstream generates RSA-2048 like the Flutter
+///   app). Peers trust a certificate by its fingerprint, not by its key type,
+///   and a P-256 key is generated in well under a millisecond, where RSA-2048
+///   takes tens to hundreds.
 /// - `CN=LocalSend User` and no SANs: peers identify each other purely by the
 ///   certificate fingerprint, so the name carries no information.
 /// - The serial number is derived from the hash of the public key
@@ -30,16 +32,7 @@ pub struct SelfSignedCert {
 /// - Validity is rcgen's default (1975 to 4096), so certificates do not expire
 ///   in practice and never need to be rotated for time reasons.
 pub fn generate_self_signed() -> anyhow::Result<SelfSignedCert> {
-    use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
-
-    let mut rng = rsa::rand_core::OsRng;
-    let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048)?;
-    let private_key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?;
-    let public_key_pem = private_key
-        .to_public_key()
-        .to_public_key_pem(LineEnding::LF)?;
-
-    let key_pair = rcgen::KeyPair::try_from(private_key.to_pkcs8_der()?.as_bytes())?;
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
     let mut params = rcgen::CertificateParams::default();
     params.distinguished_name = rcgen::DistinguishedName::new();
     params
@@ -48,11 +41,33 @@ pub fn generate_self_signed() -> anyhow::Result<SelfSignedCert> {
     let certificate = params.self_signed(&key_pair)?;
 
     Ok(SelfSignedCert {
-        private_key_pem: private_key_pem.to_string(),
-        public_key_pem,
+        private_key_pem: key_pair.serialize_pem(),
+        // `pem` encodes with CRLF; keep the LF line endings the RSA keys had.
+        public_key_pem: public_key_from_cert_der(certificate.der())?.replace("\r\n", "\n"),
         certificate_pem: certificate.pem(),
         fingerprint: fingerprint_from_cert_der(certificate.der()),
     })
+}
+
+/// Checks an identity loaded from storage: the certificate is valid (as peers
+/// check it) and the private key belongs to it. Returns the certificate's
+/// fingerprint.
+pub fn identity_fingerprint(
+    certificate_pem: &str,
+    private_key_pem: &str,
+) -> anyhow::Result<String> {
+    use rcgen::PublicKeyData;
+
+    let key_pair = rcgen::KeyPair::from_pem(private_key_pem)?;
+    let (cert_pem, _) = Pem::read(Cursor::new(certificate_pem.as_bytes()))?;
+    let cert = cert_pem.parse_x509()?;
+    anyhow::ensure!(
+        cert.tbs_certificate.subject_pki.raw == key_pair.subject_public_key_info().as_slice(),
+        "The private key does not belong to the certificate"
+    );
+    verify_cert_from_cert(cert, None)?;
+
+    Ok(fingerprint_from_cert_der(&cert_pem.contents))
 }
 
 pub fn verify_cert_from_pem(cert: String, public_key: Option<&str>) -> anyhow::Result<()> {
@@ -271,6 +286,48 @@ nidU/qXQvBJ7NPUkXXgbcgqxK735iijOqQHmKts=
             extracted.replace("\r\n", "\n").trim(),
             generated.public_key_pem.trim()
         );
+    }
+
+    #[test]
+    fn test_generate_self_signed_uses_ecdsa_p256() {
+        use x509_parser::asn1_rs::Oid;
+
+        let generated = generate_self_signed().unwrap();
+        let (cert_pem, _) =
+            Pem::read(Cursor::new(generated.certificate_pem.as_bytes().to_vec())).unwrap();
+        let cert = cert_pem.parse_x509().unwrap();
+
+        // id-ecPublicKey on the named curve prime256v1, i.e. P-256.
+        let algorithm = &cert.tbs_certificate.subject_pki.algorithm;
+        assert_eq!(algorithm.algorithm.to_id_string(), "1.2.840.10045.2.1");
+        let curve = algorithm
+            .parameters
+            .as_ref()
+            .and_then(|parameters| Oid::try_from(parameters).ok())
+            .expect("the key must name its curve");
+        assert_eq!(curve.to_id_string(), "1.2.840.10045.3.1.7");
+        // Self-signed with ecdsa-with-SHA256.
+        assert_eq!(
+            cert.signature_algorithm.algorithm.to_id_string(),
+            "1.2.840.10045.4.3.2"
+        );
+    }
+
+    #[test]
+    fn test_identity_fingerprint_checks_the_key_pair() {
+        let generated = generate_self_signed().unwrap();
+        assert_eq!(
+            identity_fingerprint(&generated.certificate_pem, &generated.private_key_pem).unwrap(),
+            generated.fingerprint
+        );
+
+        let other = generate_self_signed().unwrap();
+        assert!(
+            identity_fingerprint(&generated.certificate_pem, &other.private_key_pem).is_err(),
+            "the key of another identity must be rejected"
+        );
+        assert!(identity_fingerprint("not a certificate", &generated.private_key_pem).is_err());
+        assert!(identity_fingerprint(&generated.certificate_pem, "not a key").is_err());
     }
 
     #[test]

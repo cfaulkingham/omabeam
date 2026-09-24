@@ -13,6 +13,7 @@ var TOKEN = /^[0-9a-f]{32}$/
 
 function empty() {
   return { state: "idle", pid: 0, title: "", source: "", url: "",
+    destination: "browser", receiver: "", connection: "",
     viewers: null, uptime: null, width: null, height: null, fps: null }
 }
 
@@ -137,6 +138,21 @@ function read(raw, code, exitStatus) {
   session.width = number(data.width, MAX_DIMENSION)
   session.height = number(data.height, MAX_DIMENSION)
   session.fps = number(data.fps, 120)
+  if (data.cast != null) {
+    var cast = data.cast
+    var states = ["connecting", "authenticating", "launching", "negotiating", "starting",
+      "streaming", "reconnecting", "stopping", "ended", "failed"]
+    if (typeof cast !== "object" || Array.isArray(cast)
+        || typeof cast.session_id !== "string" || !TOKEN.test(cast.session_id)
+        || boundedString(cast.receiver_id, 256) === null
+        || boundedString(cast.receiver_name, 160) === null
+        || states.indexOf(cast.connection) < 0)
+      throw new Error("OmaBeam returned an unknown Cast status. Try again.")
+    session.destination = "cast"
+    session.receiver = plain(cast.receiver_name, 160) || "Cast receiver"
+    session.connection = cast.connection
+    session.url = ""
+  }
   return session
 }
 

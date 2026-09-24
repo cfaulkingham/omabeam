@@ -8,6 +8,9 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -32,15 +35,16 @@ def eventually(check, timeout=10):
 
 
 class Server:
-    def __init__(self, binary, args, source=None):
+    def __init__(self, binary, args, source=None, launcher=()):
         self.binary, self.args = str(Path(binary).resolve()), args
         self.source = source or ["--demo"]
+        self.launcher = list(launcher)
 
     def __enter__(self):
         self.runtime = tempfile.TemporaryDirectory(prefix='omabeam-smoke-')
         self.env = {**os.environ, 'XDG_RUNTIME_DIR': self.runtime.name}
         self.log = tempfile.TemporaryFile(mode='w+b')
-        self.proc = subprocess.Popen([self.binary, '--bind', '127.0.0.1', '--port', '0', *self.args, *self.source], stdout=self.log, stderr=self.log, env=self.env)
+        self.proc = subprocess.Popen([*self.launcher, self.binary, '--bind', '127.0.0.1', '--port', '0', *self.args, *self.source], stdout=self.log, stderr=self.log, env=self.env)
         try:
             def ready():
                 if self.proc.poll() is not None:
@@ -99,10 +103,10 @@ def frame(stream):
     return decode(stream.read(int(headers['content-length'])))
 
 
-def browser_check(server, screenshot):
+def browser_check(server, screenshot, executable=None):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, executable_path=executable)
         page = browser.new_page(viewport={'width': 480, 'height': 380})
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
@@ -148,6 +152,37 @@ def browser_check(server, screenshot):
             assert page.get_by_role('link', name='Snapshot').get_attribute('href') == 'frame.jpg'
             if screenshot:
                 page.screenshot(path=screenshot)
+            # Missed status polls must not stop a working picture. Wait longer
+            # than the old five-failure limit; page waits keep route handlers running.
+            page.route('**/stats', lambda route: route.abort())
+            page.wait_for_timeout(7000)
+            assert page.evaluate('ended') is False
+            assert page.locator('#view').get_attribute('src')
+            assert server.stats()['viewers'] == 1
+            assert 'Waiting for the host' in page.locator('#error').inner_text()
+            page.unroute('**/stats')
+            page.wait_for_function('["Live", "Live · waiting for changes"].includes(document.getElementById("status").textContent)')
+            # The picture kept playing, so also wait for a poll to succeed.
+            page.wait_for_function('!document.getElementById("error").textContent.includes("Waiting for the host")')
+            # A long outage must not present a stale picture as live. Shift the
+            # last success only after a poll has failed, so none still in flight resets it.
+            page.route('**/stats', lambda route: route.abort())
+            page.wait_for_function('failures > 0')
+            page.evaluate('lastPollOk -= 31000')
+            page.get_by_role('heading', name='Can’t reach OmaBeam').wait_for()
+            assert page.locator('#view').get_attribute('src') is None
+            assert page.evaluate('ended') is False
+            page.unroute('**/stats')
+            page.wait_for_function('document.getElementById("view").naturalWidth > 0')
+            page.locator('#disconnected').wait_for(state='hidden')
+            eventually(lambda: server.stats()['viewers'] == 1)
+            # An unknown or removed share ends at once instead of retrying.
+            gone = browser.new_page()
+            gone.route('**/stats', lambda route: route.fulfill(status=404, body='not found'))
+            gone.goto(server.url, wait_until='domcontentloaded')
+            gone.wait_for_function('document.getElementById("status").textContent === "Share ended"')
+            assert gone.locator('#error').inner_text() == 'This share has ended.'
+            gone.close()
             # Simulate the public diagnostics contract after source loss. Frames
             # must disappear even if the TCP stream itself has not errored yet.
             page.route('**/stats', lambda route: route.fulfill(json={**server.stats(), 'state': 'ended', 'error': 'Selected window closed'}))
@@ -163,13 +198,118 @@ def browser_check(server, screenshot):
             assert not errors, errors
         finally:
             browser.close()
-    print('PASS browser: native-pixel diagnostics, viewer cleanup, live image, pause/resume, fit modes, fullscreen, source-loss feedback')
+    print('PASS browser: native-pixel diagnostics, viewer cleanup, live image, pause/resume, fit modes, fullscreen, missed polls, unreachable host, ended share, source-loss feedback')
+
+
+# Recovery prints this to stderr when the recorded display is already gone
+# but Hyprland refuses the reload; the share then starts as usual.
+RELOAD_WARNING = 'did not reload its configuration'
+
+
+def signal_during_recovery(binary, sig, output):
+    """Signal a --demo start while it recovers a display left on a slow
+    compositor, then let recovery finish with a refused reload. The warning
+    is printed after the signal; the share then starts, sees the stop, and
+    exits. `output` is 'file' (stdout and stderr in one regular file, like
+    live.log), 'pipe', or 'dead-pipe' (pipes whose reader is gone, as after
+    a hang-up). Returns the exit status and what was captured."""
+    with tempfile.TemporaryDirectory(prefix='ob-hup-', dir='/tmp') as root:
+        root = Path(root)
+        (root / 'omabeam').mkdir(mode=0o700)
+        record = root / 'omabeam/display.json'
+        record.write_text(json.dumps({'name': 'OMABEAM-' + '0' * 32, 'instance': 'slow'}))
+        record.chmod(0o600)
+        (root / 'hypr/slow').mkdir(parents=True)
+        with socket.socket(socket.AF_UNIX) as compositor, (root / 'share.log').open('w+b') as log:
+            compositor.bind(str(root / 'hypr/slow/.socket.sock'))
+            compositor.listen()
+            compositor.settimeout(10)
+
+            def request():
+                while True:
+                    connection, _ = compositor.accept()
+                    connection.settimeout(10)
+                    data = connection.recv(64)
+                    if data:
+                        return connection, data
+                    connection.close()  # The listening probe sends nothing.
+
+            stdio = log if output == 'file' else subprocess.PIPE
+            proc = subprocess.Popen([str(Path(binary).resolve()), '--bind', '127.0.0.1', '--port', '0', '--jpeg', '--demo'],
+                stdout=stdio, stderr=stdio, env={**os.environ, 'XDG_RUNTIME_DIR': str(root)})
+            try:
+                connection, data = request()
+                assert data == b'j/monitors all', data
+                if output == 'dead-pipe':
+                    proc.stdout.close()
+                    proc.stderr.close()
+                proc.send_signal(sig)
+                time.sleep(0.2)
+                try:
+                    with connection:
+                        connection.sendall(b'[]')
+                    connection, data = request()
+                    with connection:
+                        assert data == b'/reload', data
+                        connection.sendall(b'error: reload refused')
+                except OSError:
+                    pass  # The share died; the caller reports its status.
+                if output == 'pipe':
+                    text = b''.join(proc.communicate(timeout=10)).decode(errors='replace')
+                else:
+                    proc.wait(timeout=10)
+                    log.seek(0)
+                    text = log.read().decode(errors='replace')
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+        if proc.returncode == 0:
+            assert not record.exists(), 'recovery clears the display record'
+        return proc.returncode, text
+
+
+def hang_up_checks(binary):
+    if signal.getsignal(signal.SIGHUP) == signal.SIG_IGN:
+        print('SKIP hang-up checks: this run ignores SIGHUP (nohup), and omabeam would too')
+        return
+    # Closing the terminal of `omabeam --live ...` must clean up like Ctrl-C.
+    with Server(binary, ['--jpeg']) as server:
+        record = Path(server.runtime.name) / 'omabeam/live.json'
+        server.proc.send_signal(signal.SIGHUP)
+        code = server.proc.wait(timeout=10)
+        server.log.seek(0)
+        assert code == 0, (code, server.log.read().decode(errors='replace'))
+        assert not record.exists()
+    # After a hang-up, writes to the terminal (or a pipe whose reader died)
+    # fail; they must not become a panic.
+    code, _ = signal_during_recovery(binary, signal.SIGHUP, 'dead-pipe')
+    assert code == 0, code
+    # A regular file (live.log, `> file 2>&1`) keeps logging through a hang-up.
+    code, text = signal_during_recovery(binary, signal.SIGHUP, 'file')
+    assert code == 0 and RELOAD_WARNING in text, (code, text)
+    # Ctrl-C keeps the terminal, so its messages stay visible.
+    code, text = signal_during_recovery(binary, signal.SIGINT, 'pipe')
+    assert code == 0 and RELOAD_WARNING in text, (code, text)
+    if sys.platform.startswith('linux'):
+        # nohup asks to keep sharing through a hang-up; SIGTERM still stops it.
+        with Server(binary, ['--jpeg'], launcher=['nohup']) as server:
+            server.proc.send_signal(signal.SIGHUP)
+            time.sleep(0.5)
+            assert server.proc.poll() is None
+            assert server.get('frame.jpg')[0] == 200
+            server.proc.terminate()
+            assert server.proc.wait(timeout=10) == 0
+    else:
+        print('SKIP nohup check: an ignored SIGHUP is read from Linux /proc')
+    print('PASS hang-up ends the share cleanly: dead terminals are silenced, log files keep logging, Ctrl-C keeps messages')
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', default='target/debug/omabeam')
     parser.add_argument('--browser', action='store_true')
+    parser.add_argument('--browser-executable', default=os.environ.get('OMABEAM_TEST_CHROMIUM') or shutil.which('google-chrome') or shutil.which('chromium'))
     parser.add_argument('--screenshot')
     parser.add_argument('--capture-output', help='Test an output in an existing Wayland session')
     parser.add_argument('--capture-scale', type=int, help='Assert this integer output scale in capture tests')
@@ -250,9 +390,10 @@ def main():
         result = subprocess.run([opts.binary, *arguments], capture_output=True, timeout=5)
         assert result.returncode == 1 and result.stderr, arguments
     print('PASS invalid arguments rejected before starting capture')
+    hang_up_checks(opts.binary)
     if opts.browser:
         with Server(opts.binary, ['--jpeg', '--fps', '10', '--native-pixels']) as server:
-            browser_check(server, opts.screenshot)
+            browser_check(server, opts.screenshot, opts.browser_executable)
 
 
 if __name__ == '__main__':

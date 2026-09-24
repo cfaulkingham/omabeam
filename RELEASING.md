@@ -21,10 +21,20 @@ omarchy plugin enable io.github.cfaulkingham.omabeam --section right
 
 The build installs `omarchy-plugin/native/bin/omabeam` in the checkout.
 `--backend-only` leaves desktop configuration and the shell process alone.
-The full `./install.sh` also adds a floating-window rule and shortcut.
+The full `./install.sh` also adds floating-window rules for the picker and the
+nearby-send window, and a shortcut.
 
 After `omarchy plugin update io.github.cfaulkingham.omabeam`, rerun that
 checkout's `./install.sh --backend-only` to rebuild the app.
+
+For the experimental native Cast destination, use
+`./install.sh --backend-only --with-cast`. It also builds the pinned Open Screen
+helper and installs its notices under `licenses/cast`. This requires Python 3,
+Git, pkg-config and the C/C++ build dependencies, and downloads several
+gigabytes of dependency/toolchain files to `$XDG_CACHE_HOME/omabeam/cast`
+(default `~/.cache/omabeam/cast`). The Cast helper is optional for browser shares.
+Read [Cast qualification status](docs/NATIVE-CAST-STATUS.md) before distributing
+a Cast-enabled build; physical-device qualification is still outstanding.
 
 ## Firewall checks
 
@@ -69,39 +79,64 @@ viewing. After the check, start a share and test its link from another device.
 Custom `--port` or `--webrtc-port` values need their own rules. Blocked UDP can
 cause H.264 playback timeouts while the HTTP page and JPEG fallback still work.
 
+Native Cast uses different traffic: mDNS discovery on UDP 5353, an outgoing TLS
+connection to the receiver's advertised TCP port, and negotiated UDP media and
+feedback. `--check-ports` only diagnoses browser ports; opening 9847/9848 does
+not diagnose Cast. See the [Cast network checks](docs/NATIVE-CAST-STATUS.md#network-checks).
+
 ## Build a release bundle
 
 Keep the versions aligned in `manifest.json` and `Cargo.toml`. Run the
 **Package OmaBeam** workflow on the release commit. It builds and tests
-Linux x86_64, then uploads an archive, SHA-256 checksum, and runtime-library
-report. It does not publish automatically.
+Linux x86_64, building the hardware helper in an Arch Linux container so it
+links the FFmpeg Omarchy ships, then uploads an archive, SHA-256 checksum,
+and runtime-library report. It does not publish automatically.
 
-To build locally on Linux with Python 3.11+, Rust, and the dependencies in
-[Development](docs/DEVELOPMENT.md):
+A bundle's helper matches the FFmpeg major version current on Arch when it
+was built. Rebuild bundles after Arch moves FFmpeg to a new major version, or
+the installer will warn that the helper cannot load. Source installs are
+unaffected: they always build the helper against the machine's own FFmpeg.
+
+To build a bundle locally, use an Arch or Omarchy machine with Python 3.11+,
+Rust, and the dependencies in [Development](docs/DEVELOPMENT.md), so the
+packaged helper matches Omarchy's FFmpeg:
 
 ```bash
 cargo build --release --locked
+python3 scripts/build-cast.py --sync
 cargo install cargo-bundle-licenses --locked
 cargo bundle-licenses --format yaml --output target/THIRDPARTY.yml
 # Review the report and fill missing license texts before distribution.
 python3 scripts/package-plugin.py \
   --binary target/release/omabeam \
   --encoder-helper target/release/omabeam-encoder \
+  --cast-helper target/release/omabeam-cast \
+  --cast-licenses target/native-cast/notices \
   --target x86_64-unknown-linux-gnu \
   --licenses target/THIRDPARTY.yml
 ```
 
 The packager checks the ELF architecture, entry point, and absence of symlinks.
 It includes runtime files, the binary, installer, documentation, and licenses.
-Both executables must have the target architecture; the hardware helper is
+All included executables must have the target architecture; the hardware helper is
 installed beside the app. It links system FFmpeg (`libavcodec`, `libavutil`,
 `libavformat`); include it in the runtime-library report and verify the target
 system has the matching ABI and GPU drivers. The main app can fall back to
 software if the helper cannot load. Build caches and session data are excluded. Identical inputs produce identical
 archives. Review `licenses/THIRDPARTY.yml` before distributing workflow artifacts.
 
+Omit both Cast options for a browser-only bundle. Cast bundles also include
+`licenses/cast/manifest.json` and the license/notice files collected from the
+actual GN dependency graph. The packager verifies their hashes and the helper
+binary hash; Cargo's license collector does not cover these C++ dependencies.
+Include all three executables in the runtime-library report. The production
+Cast helper does not link FFmpeg, SDL, Opus or VPX; the optional software test
+receiver uses those libraries.
+
 The workflow targets x86_64 GNU/Linux. The packager also accepts
 `aarch64-unknown-linux-gnu` given a binary built and tested for that target.
+Native Cast has not been qualified on Linux aarch64; omit it until its helper
+has been built and tested there.
 Executables use system libraries; check the workflow's
 `linux-runtime-libraries.txt` against the target Omarchy machine.
 
@@ -132,9 +167,12 @@ omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" omarchy-plugin/BarWidget.qml omarchy-plugin/Panel.qml
 ```
 
-Verify bar click, Escape, summon/hide, disable/re-enable, shell restart, and
-removal. Test capture, the viewer, clipboard, portal picker, and nearby-device
-sharing on real Hyprland.
+Verify bar click, Escape, summon/hide, disable/re-enable, shell restart (an
+open picker or send window stays open), and removal. Test capture, the viewer,
+clipboard, portal picker, and nearby-device sharing on real Hyprland, including
+a PIN-protected receiver and the official LocalSend apps. Sending to those apps
+has not been verified yet; see
+[Nearby sending](docs/DEVELOPMENT.md#nearby-sending).
 
 Publish the source in a public GitHub repository with the root manifest,
 README, and MIT license. Attach the verified bundle and checksum to a release,
@@ -152,6 +190,7 @@ The plugin-local binary is removed with the plugin. If you used the full
 installer, run `./install.sh --remove-desktop` first (or delete the blocks
 marked `-- omabeam (install.sh)` from `hyprland.lua` and `bindings.lua`).
 Stop the share before removing the plugin; a detached live process can outlive
-the checkout. Screenshots and any firewall or portal settings you configured
+the checkout. Screenshots, `~/.config/omabeam/` (picker settings and the
+LocalSend identity), and any firewall or portal settings you configured
 separately are left in place. Session files live in `$XDG_RUNTIME_DIR/omabeam/`
 and vanish at logout.

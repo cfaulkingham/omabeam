@@ -158,6 +158,10 @@ pub struct InfoResponseDtoV2 {
     pub device_type: Option<DeviceType>,
 
     /// Fingerprint for device identification.
+    /// Ignored in HTTPS mode (certificate is used instead). Optional when
+    /// parsing, like in [`RegisterResponseDtoV2`], since discovery confirms
+    /// devices with this response too.
+    #[serde(default)]
     pub fingerprint: String,
 
     /// Whether the download API (sections 5.2, 5.3) is active.

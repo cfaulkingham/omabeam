@@ -26,7 +26,7 @@ impl OmaBeam {
             dropdown(
                 "desktop-resolution",
                 format!("{} × {}", config.width, config.height),
-                self.busy,
+                self.busy || self.cast_mode,
                 cx,
             ),
             RESOLUTIONS
@@ -100,7 +100,7 @@ impl OmaBeam {
             dropdown(
                 "desktop-orientation",
                 if portrait { "Portrait" } else { "Landscape" },
-                self.busy,
+                self.busy || self.cast_mode,
                 cx,
             ),
             ["Landscape", "Portrait"]
@@ -115,16 +115,16 @@ impl OmaBeam {
             move |index, window, cx| orientation_changed(&index, window, cx),
         );
         div().flex().flex_col().gap_3()
-            .child(div().text_sm().child("Use a tablet, laptop, or another browser as an extra screen."))
+            .child(div().text_sm().child(if self.cast_mode { "Use your Cast receiver as an extra screen." } else { "Use a tablet, laptop, or another browser as an extra screen." }))
             .child(div().flex().flex_wrap().gap_3()
                 .child(field("Display resolution", resolution, cx))
                 .child(field("Desktop scale", scale, cx))
                 .child(field("Placement", position, cx))
                 .child(field("Orientation", orientation, cx)))
             .child(div().text_xs().text_color(cx.omarchy().secondary)
-                .child("Start sharing and open the link on your other device. The viewer hides the local pointer when idle and enters fullscreen when you tap the picture. Move windows onto the extra screen using this computer’s mouse or keyboard."))
+                .child(if self.cast_mode { "Choose Cast quality below to set the display resolution. Move windows onto the extra screen using this computer’s mouse or keyboard." } else { "Start sharing and open the link on your other device. The viewer hides the local pointer when idle and enters fullscreen when you tap the picture. Move windows onto the extra screen using this computer’s mouse or keyboard." }))
             .child(div().text_xs().text_color(cx.omarchy().secondary)
-                .child("Stop sharing from the bar to remove the extra display. Closing the browser keeps it available for reconnection."))
+                .child(if self.cast_mode { "Stop casting from the bar to remove the extra display." } else { "Stop sharing from the bar to remove the extra display. Closing the browser keeps it available for reconnection." }))
     }
 
     pub(super) fn render_desktop_preview(&self, cx: &Context<Self>) -> impl IntoElement {

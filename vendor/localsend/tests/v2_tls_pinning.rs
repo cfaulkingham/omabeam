@@ -38,6 +38,68 @@ fn generate_identity() -> Identity {
     }
 }
 
+/// A test-only RSA-2048 identity like the ones LocalSend apps generate
+/// (`CN=LocalSend User`, no extensions), valid from 2000 to 2126. Generated
+/// identities are ECDSA, so this keeps RSA peers covered.
+const RSA_CERT: &str = "-----BEGIN CERTIFICATE-----
+MIICwDCCAaigAwIBAgIURjN9PVLn4ChGSf9VxdTervPTYycwDQYJKoZIhvcNAQEL
+BQAwGTEXMBUGA1UEAwwOTG9jYWxTZW5kIFVzZXIwIBcNMDAwMTAxMDAwMDAwWhgP
+MjEyNjAxMDEwMDAwMDBaMBkxFzAVBgNVBAMMDkxvY2FsU2VuZCBVc2VyMIIBIjAN
+BgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8r092IiIOQxJDaM2allA4jJTzRGn
+w3xhyM8//VX+kNRGgLhvdliMqOEi/8ciGWDql1q0lgW+xTk/HWpZGajtUTcCXtVI
+XmhBTzJ00HJssQe8bzaM4WufrDtnsCmjSv9O3Pp1jQ3ID5OiK4Ap8osRPVCQG3kb
+k0zpB5q/he+z+izUoq4Bxs8gGXtHP2sAeSQ3AVXAR48Ol6XgYNPr4M9iX22rxEQe
+f7oqsSdQ5ntM/qVd0Fve2f6PHAStMOUDBqrrr0d2M8yDjv9l8HvjSYdYA7nkbMGQ
+Z8zY5gohRuVxMF3Og5thgJoVdZ0NFrywgrz/o7eaRKsRllduu+0EeDsPuQIDAQAB
+MA0GCSqGSIb3DQEBCwUAA4IBAQDvVV7GIIBqaJnYl7h13ATxq7ekLEASO6Gnm8G2
+GvOrZ1+9MjhTJEL29vazdDVFECjMGt/IIBBDKlOVLN+5gSaB69GDD1Xmgu596BTy
+2pHRt5Au9JyqhKex3gbcGLX7Gfi98wEiR2GpYqCSEV6r7T04NCSzR/bq5NL14nfl
+AscWdquE2zA7CthtFDudAatMuHTGyKesp5H7lpqF2qbUQ9LfcVMD+8ZiO1J6H4M4
+r6HpM4wUYxqOwltSIxPaHzkSlHD1eCSUSwjgrdI4ODMcgCru6YAJ9YvsvuKBCj7P
+oKV9a/+Mf2m6D/o/woKHF8xGSzJLHft/5bXWjt7TcAwAMUFm
+-----END CERTIFICATE-----";
+
+/// The private key of [RSA_CERT]; it protects nothing outside this test.
+const RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDyvT3YiIg5DEkN
+ozZqWUDiMlPNEafDfGHIzz/9Vf6Q1EaAuG92WIyo4SL/xyIZYOqXWrSWBb7FOT8d
+alkZqO1RNwJe1UheaEFPMnTQcmyxB7xvNozha5+sO2ewKaNK/07c+nWNDcgPk6Ir
+gCnyixE9UJAbeRuTTOkHmr+F77P6LNSirgHGzyAZe0c/awB5JDcBVcBHjw6XpeBg
+0+vgz2JfbavERB5/uiqxJ1Dme0z+pV3QW97Z/o8cBK0w5QMGquuvR3YzzIOO/2Xw
+e+NJh1gDueRswZBnzNjmCiFG5XEwXc6Dm2GAmhV1nQ0WvLCCvP+jt5pEqxGWV267
+7QR4Ow+5AgMBAAECggEANUp+rW8sGPotf6T5aVe2+vH5m+foYO6JuUBm2ANtI/a2
+k8PqFJ1UJC9pM6ZQQioY1qm/Q8B3JW1wAdE7RnrjvxTInHFOtgtFa1G0e57jZepA
+4FmljEfIglN4bCB4DRsIAVOrQxBnf6P10n8Mtob5ffCV8rIf77LO5jB/I7SAWsfX
+XW2wBWAPj6jFmFhYHiDE12u034Kgc9OXC8MHJBlzKmJbkhKG1IEYbzrO5uB4rLzh
+UrvWN6sqPUrI1oDBQlqUsKALTe1j+WyxMcY0CoJ8PQJ4yvYS0oIidfD6c7HKV/wO
+EZuO86Nm55QeTZuTtt89eY/6SesQrb0dMuPqybOgQQKBgQD95YlAIkDPwHoehS6a
+r1GNBQb9F3fvLDYzgV3zbKQhS/+70Ldl/KVfc9Nzho//rfDzUnqDpK/OrEbiedu6
+3/qgMrFWFmAj/y2Jfi4OfH+izvS4HeFh03RkRaOAjUoKUN2zIpQ2iRDAqm54qsRH
+iftbtnXiNdfkpvoyIPWOl4iQnQKBgQD0wAr3iRUqRsdq5WbgzExQBdWyQ2Lrfic+
+bY0e1IXwOrA7vX54edSU3A0VWxc43inz7b1Tvn/lghXKsSwEaamxarWnuw2uy6mI
+NUAiXS0qbswLZuFcMHn1qD1XjMPuxudo7NlS+qBGJpUIHTjwJuS4n4NFA0Vt1AC7
+7dw+VgOqzQKBgQDMlVBq5S7kOGwue5J6AhrsTsi611ZE2pMyHWPe6gO28M44QI4H
+F/UJXQNda2hM1ZP5/NPLj8A6AId9pkNv6VrCCxbqD02Ys921lH74HUmbnreCRFF/
+yitXQOXmh/LJLS/3UD2tU/SzyqEJilBudLidxgBnLouwKvwfuH8lTuUz4QKBgQCT
+2LKHR3rOmAT80OjtoNv0dyHY1pYZ1ZIVRw45cn4aWQl+fQC5/DZrWeZZYTZM9v92
+x8VXojsWRBev4ojJfZ6xetmTIg6o6YRWsHw2hfyzpkyCErrN+sahm+i6S2FMi0Dd
+BD5fvuA0oDfkt+peP9BoqosclFZLewaaf5xM157NfQKBgQDWI6Ad8bZBm1mAyJf7
+BaF7H0uwyqIPJX506diQTrFmlQdyZ8hOr7zx75hdFWAHiDWylannqoor1L07dYu+
+77NyQCSelLPpF1psbvQ1yDyVRzxjRKfOs7GzNVIya9iUGzL5qPqB+uVHci5Ijcrb
+rfxZdbayNo8PVBxpMZG5KCSm9w==
+-----END PRIVATE KEY-----";
+
+fn rsa_identity() -> Identity {
+    use rustls::pki_types::pem::PemObject;
+    let der = rustls::pki_types::CertificateDer::from_pem_slice(RSA_CERT.as_bytes()).unwrap();
+
+    Identity {
+        cert: RSA_CERT.to_string(),
+        private_key: RSA_KEY.to_string(),
+        fingerprint: localsend::crypto::cert::fingerprint_from_cert_der(&der),
+    }
+}
+
 struct TestServer {
     port: u16,
     /// Requests that reached the application layer.
@@ -429,4 +491,77 @@ async fn test_register_without_pin_returns_public_key() {
 
     assert!(response.public_key.is_some());
     assert_eq!(response.body.fingerprint, server_identity.fingerprint);
+}
+
+/// `info` reports the certificate its response came over, like `register`,
+/// so a device that probes with it still identifies HTTPS peers by their
+/// certificate.
+#[tokio::test]
+async fn test_info_reports_the_peer_certificate() {
+    let server_identity = generate_identity();
+    let sender = generate_identity();
+    let server = start_tls_server(&server_identity).await;
+
+    let info = client(&sender, None)
+        .info(ProtocolType::Https, "127.0.0.1", server.port)
+        .await
+        .expect("info over TLS");
+
+    assert_eq!(
+        info.cert_fingerprint.as_deref(),
+        Some(server_identity.fingerprint.as_str())
+    );
+    assert!(info.public_key.is_some());
+    assert_eq!(info.body.alias, "Test Server");
+}
+
+/// Identities of either key type work with each other: a new ECDSA identity
+/// with a peer that still generates RSA ones, and the other way round. Peers
+/// trust each other by certificate fingerprint, not by key algorithm.
+#[tokio::test]
+async fn test_rsa_and_ecdsa_identities_interoperate() {
+    let rsa = rsa_identity();
+    let ecdsa = generate_identity();
+
+    for (server_identity, sender) in [(&rsa, &ecdsa), (&ecdsa, &rsa)] {
+        let server = start_tls_server(server_identity).await;
+        let client = client(sender, Some(&server_identity.fingerprint));
+
+        let info = client
+            .info(ProtocolType::Https, "127.0.0.1", server.port)
+            .await
+            .expect("info over TLS");
+        assert_eq!(
+            info.cert_fingerprint.as_deref(),
+            Some(server_identity.fingerprint.as_str())
+        );
+
+        // prepare-upload requires the client certificate (mTLS).
+        let files = vec![file_dto("file-1", 5)];
+        let result = client
+            .prepare_upload(
+                ProtocolType::Https,
+                "127.0.0.1",
+                server.port,
+                None,
+                prepare_upload_request(sender, &files),
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("prepare-upload should succeed");
+        let response = result.response.expect("expected a session");
+        let token = response.files.get("file-1").unwrap();
+        let (upload_result, _) = upload_bytes(
+            &client,
+            server.port,
+            &response.session_id,
+            "file-1",
+            token,
+            b"hello",
+        )
+        .await;
+        upload_result.expect("upload should succeed");
+        assert_eq!(server.received.lock().await[0].1, b"hello");
+    }
 }

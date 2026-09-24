@@ -9,9 +9,13 @@ Process {
   property bool collectOutput: true
   property int timeoutMs: 5000
   property int maxBytes: 8192
+  property int maxStderrBytes: 512
   property string output: ""
   property string stdinData: ""
   property bool overflowed: false
+  // Diagnostic only: bounded to the last maxStderrBytes so a long-lived
+  // command (timeoutMs: 0) cannot grow this without limit.
+  property string stderrTail: ""
   signal completed(int code, int exitStatus, string output)
   signal failed(string reason)
 
@@ -35,6 +39,7 @@ Process {
   function start(args, input) {
     if (pending || running) return false
     output = ""
+    stderrTail = ""
     overflowed = false
     killTimer.stop()
     command = args
@@ -74,7 +79,11 @@ Process {
   }
   stderr: SplitParser {
     splitMarker: ""
-    onRead: function() {}
+    onRead: function(chunk) {
+      root.stderrTail += chunk
+      if (root.stderrTail.length > root.maxStderrBytes)
+        root.stderrTail = root.stderrTail.slice(root.stderrTail.length - root.maxStderrBytes)
+    }
   }
   onStarted: {
     if (root.stdinData !== "") {
@@ -104,10 +113,16 @@ Process {
     interval: 2000
     onTriggered: if (root.running) root.signal(9)
   }
-  Component.onDestruction: {
-    if (root.running) {
+  // A timeoutMs: 0 command is a deliberately long-lived UI launch (the
+  // picker, the send window); leaving the panel must not kill it. Only a
+  // bounded command still running at destruction gets signaled. Exposed as
+  // a function so tests can exercise it without racing Qt's own async
+  // object teardown.
+  function teardown() {
+    if (root.running && root.timeoutMs > 0) {
       root.signal(15)
       root.signal(9)
     }
   }
+  Component.onDestruction: teardown()
 }
