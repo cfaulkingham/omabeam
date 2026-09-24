@@ -176,6 +176,7 @@ class Packaging(unittest.TestCase):
         (self.source / "omarchy-plugin/native/bin").mkdir(parents=True)
         (self.source / "omarchy-plugin/native/bin/old-binary").write_text("must not ship")
         archive = self.package()
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o644)
         original = archive.read_bytes()
         self.assertEqual(original, self.package().read_bytes())
         self.assertTrue(archive.with_suffix(".gz.sha256").read_text().startswith(hashlib.sha256(original).hexdigest()))

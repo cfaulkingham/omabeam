@@ -107,6 +107,9 @@ def package(binary, target, licenses, output, root=ROOT, encoder_helper=None, ca
                         with path.open("rb") as source:
                             tar.addfile(info, source)
             temporary.flush()
+            # NamedTemporaryFile starts at 0600; release artifacts must also be
+            # readable by the host runner when built by a container user.
+            temporary_path.chmod(0o644)
             temporary_path.replace(archive)
         finally:
             temporary_path.unlink(missing_ok=True)

@@ -69,9 +69,27 @@ enter the `io.github.cfaulkingham.omabeam` directory, and run:
 ```
 
 No Rust toolchain is needed. Use a bundle matching your machine's architecture
-and runtime libraries. For a plugin-only bundle install, copy the extracted
+and runtime libraries. Release bundles target Omarchy on x86_64 and experimental
+ARM64, and include the hardware encoder and experimental Google Cast helper.
+ARM64 requires an existing compatible Omarchy installation. For a plugin-only bundle install, copy the extracted
 directory into `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/`, then run
 `omarchy-shell shell rescanPlugins` and the enable command above.
+
+### Arch / AUR packaging
+
+Stable release workflows generate an `omabeam-bin` AUR recipe alongside the
+bundles; this does not mean it has been published to AUR. After installing that
+package with `makepkg -si` or an AUR helper once available, run as your desktop
+user:
+
+```bash
+bash /usr/share/omabeam/plugin/install.sh
+```
+
+Run it again after package upgrades to refresh the bar plugin. Pacman manages
+the app, encoder and Cast binaries; this installer configures the user plugin,
+desktop integration and network access. See [AUR packaging](RELEASING.md#aur-binary-package)
+for building and publishing the package.
 
 ### Network access
 
@@ -114,6 +132,9 @@ If you enabled Google Cast, add `--with-cast` when rebuilding. To update a
 bundle installation, verify and extract the new bundle and rerun its
 `./install.sh`. The installer refuses to overwrite a Git-managed installation
 from another directory; update that checkout instead.
+
+For `omabeam-bin` installations, update the package and rerun
+`bash /usr/share/omabeam/plugin/install.sh` to refresh the user plugin.
 
 ## Share your screen
 
@@ -299,6 +320,9 @@ Skip `--remove-desktop` if you used only `--backend-only` or copied a bundle
 without running the full installer. If removing the rules by hand, delete the
 blocks marked `-- omabeam (install.sh)` from `hyprland.lua` and `bindings.lua`,
 then reload Hyprland. Removing the plugin alone does not stop a detached share.
+
+If you installed `omabeam-bin`, also remove the system package with
+`sudo pacman -R omabeam-bin` after removing the user plugin.
 
 Screenshots, `~/.config/omabeam/` (saved settings and the LocalSend identity),
 firewall rules, and any portal-picker configuration remain. `XDG_CONFIG_HOME`

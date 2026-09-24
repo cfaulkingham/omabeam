@@ -1,0 +1,34 @@
+# Generated from verified release archives by scripts/release-assets.py.
+pkgname=omabeam-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='Window, screen, area and Google Cast sharing for Omarchy'
+arch=('x86_64' 'aarch64')
+url='https://github.com/cfaulkingham/omabeam'
+license=('MIT')
+depends=('omarchy>=4' 'hyprland' 'bash' 'glibc' 'gcc-libs' 'ffmpeg'
+         'libavcodec.so' 'libavutil.so'
+         'fontconfig' 'freetype2' 'wayland' 'libxkbcommon' 'libxkbcommon-x11'
+         'libxcb' 'openssl' 'vulkan-icd-loader' 'wl-clipboard' 'rsync' 'jq' 'python')
+provides=("omabeam=$pkgver")
+conflicts=('omabeam')
+# Keep the native Cast binary identical to its license inventory's hash.
+options=('!strip' '!debug')
+source_x86_64=("$url/releases/download/v$pkgver/omabeam-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
+source_aarch64=("$url/releases/download/v$pkgver/omabeam-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  cd "$srcdir/io.github.cfaulkingham.omabeam"
+  install -Dm755 omarchy-plugin/native/bin/omabeam "$pkgdir/usr/lib/omabeam/omabeam"
+  install -Dm755 omarchy-plugin/native/bin/omabeam-encoder "$pkgdir/usr/lib/omabeam/omabeam-encoder"
+  install -Dm755 omarchy-plugin/native/bin/omabeam-cast "$pkgdir/usr/lib/omabeam/omabeam-cast"
+  install -d "$pkgdir/usr/bin" "$pkgdir/usr/share/omabeam/plugin"
+  ln -s ../lib/omabeam/omabeam "$pkgdir/usr/bin/omabeam"
+  cp -a manifest.json README.md LICENSE RELEASING.md install.sh docs omarchy-plugin vendor \
+    "$pkgdir/usr/share/omabeam/plugin/"
+  rm -r "$pkgdir/usr/share/omabeam/plugin/omarchy-plugin/native"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  cp -a licenses/. "$pkgdir/usr/share/licenses/$pkgname/"
+}

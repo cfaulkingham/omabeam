@@ -20,6 +20,10 @@ BINDINGS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
 SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 BIN="$PLUGIN_DIR/omarchy-plugin/omabeam"
 NATIVE="$ROOT/omarchy-plugin/native/bin/omabeam"
+# AUR installations keep pacman-owned executables outside the user plugin.
+if [[ ! -f $ROOT/Cargo.toml && ! -x $NATIVE && -x /usr/lib/omabeam/omabeam ]]; then
+  NATIVE="/usr/lib/omabeam/omabeam"
+fi
 BIND_KEYS="SUPER + SHIFT + T"
 USAGE="Usage: ./install.sh [--backend-only|--remove-desktop|--check-ports] [--with-cast] [--subnet CIDR|--open-firewall CIDR]"
 
@@ -441,7 +445,7 @@ elif [[ ! -x $NATIVE ]]; then
   echo "install.sh: this bundle has neither source nor a native binary." >&2
   exit 1
 fi
-CAST_NATIVE="$ROOT/omarchy-plugin/native/bin/omabeam-cast"
+CAST_NATIVE="$(dirname "$NATIVE")/omabeam-cast"
 if [[ -x $CAST_NATIVE ]]; then
   case "$("$CAST_NATIVE" --version)" in
     "omabeam-cast protocol=1 "*) ;;
@@ -456,7 +460,7 @@ fi
   exit 1
 }
 echo "Check GPU encoding with: $NATIVE --check-encoders"
-ENCODER_NATIVE="$ROOT/omarchy-plugin/native/bin/omabeam-encoder"
+ENCODER_NATIVE="$(dirname "$NATIVE")/omabeam-encoder"
 if [[ -x $ENCODER_NATIVE ]] && command -v ldd >/dev/null 2>&1; then
   # ldd exits non-zero for a non-dynamic executable (e.g. a test double); the
   # `|| true` keeps that from tripping `set -e` through the pipefail'd pipe.

@@ -92,10 +92,27 @@ def library_includes(package, include_root):
         if link.exists():
             raise RuntimeError(f"Unexpected dependency header cache entry: {link}")
         link.symlink_to(source, target_is_directory=True)
-    return [str(destination)]
+    includes = [str(destination)]
+    if package == "sdl2":
+        # Debian/Ubuntu's public SDL_config.h includes a second header from
+        # /usr/include/<multiarch>/SDL2. Expose that SDL-only directory too;
+        # adding the whole host multiarch directory would shadow sysroot libc.
+        multiarch = subprocess.check_output(["cc", "-print-multiarch"], text=True).strip()
+        source = directory / multiarch / "SDL2" if multiarch else None
+        if source is not None and source.is_dir() and source != directory / "SDL2":
+            extra = include_root / "sdl2-multiarch"
+            extra.mkdir(parents=True, exist_ok=True)
+            link = extra / "SDL2"
+            if link.is_symlink():
+                link.unlink()
+            if link.exists():
+                raise RuntimeError(f"Unexpected dependency header cache entry: {link}")
+            link.symlink_to(source, target_is_directory=True)
+            includes.append(str(extra))
+    return includes
 
 
-def gn_arguments(upstream, include_root):
+def gn_arguments(upstream, include_root, target_cpu=None):
     args = {
         "is_debug": False,
         "symbol_level": 0,
@@ -104,6 +121,8 @@ def gn_arguments(upstream, include_root):
         "build_python_bindings": False,
         "is_component_build": False,
     }
+    if target_cpu:
+        args["target_cpu"] = target_cpu
     if platform.system() == "Darwin":
         args["mac_deployment_target"] = platform.mac_ver()[0]
     if upstream:
@@ -218,11 +237,19 @@ def main():
     parser.add_argument("--upstream", action="store_true", help="Also build decoding test receiver and reference sender")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--prepare-only", action="store_true", help="Fetch/configure without compiling")
+    parser.add_argument("--target-cpu", choices=("x64", "arm64"),
+                        help="Linux target CPU (cross-build the production helper on an x86_64 host)")
     options = parser.parse_args()
     if platform.system() not in ("Darwin", "Linux"):
         parser.error("The native Cast helper currently builds on Linux and macOS")
+    if platform.system() == "Linux" and platform.machine() != "x86_64":
+        parser.error("The pinned Linux build tools require x86_64; build ARM64 there with --target-cpu arm64")
     if options.jobs < 1:
         parser.error("--jobs must be positive")
+    if options.target_cpu and (platform.system() != "Linux" or platform.machine() != "x86_64"):
+        parser.error("--target-cpu requires a Linux x86_64 build host")
+    if options.target_cpu == "arm64" and options.upstream:
+        parser.error("Cross-build only the production helper; reference tools link host libraries")
     cache = options.cache.resolve()
     cache.mkdir(parents=True, exist_ok=True)
     spec = json.loads((NATIVE / "upstream.json").read_text())
@@ -247,6 +274,11 @@ def main():
     revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     if revision != spec["openscreen"]["revision"]:
         parser.error("Cached Open Screen revision differs from upstream.json; run with --sync")
+    if options.target_cpu == "arm64" and options.sync:
+        # The pinned Clang/GN tools run on x86_64; the pinned target sysroot
+        # and GN's clang_arm64 toolchain produce a native ARM64 executable.
+        run([sys.executable, source / "build/linux/sysroot_scripts/install-sysroot.py",
+             "--arch=arm64"], cwd=source, env=env)
     pin_sender_inflight(source)
     gn = source / "buildtools" / ("mac" if platform.system() == "Darwin" else "linux64") / "gn"
     ninja = source / "third_party/ninja/ninja"
@@ -296,13 +328,14 @@ def main():
         parser.error("No helper source yet; use --upstream for the feasibility build")
     output = source / "out/omabeam"
     output.mkdir(parents=True, exist_ok=True)
-    (output / "args.gn").write_text(gn_arguments(options.upstream, cache / "system-headers"))
+    (output / "args.gn").write_text(gn_arguments(options.upstream, cache / "system-headers", options.target_cpu))
     run([gn, "gen", output], cwd=source, env=env)
     if not options.prepare_only:
         run([ninja, "-C", output, "-j", options.jobs, *targets], cwd=source, env=env)
         if "omabeam-cast" in targets:
             collect_notices(source, output, gn, spec)
-            for profile in ("debug", "release"):
+            # Do not replace a host helper with a cross-compiled executable.
+            for profile in (() if options.target_cpu == "arm64" else ("debug", "release")):
                 dest = ROOT / "target" / profile
                 if dest.is_dir():
                     shutil.copy2(output / "omabeam-cast", dest / "omabeam-cast")
