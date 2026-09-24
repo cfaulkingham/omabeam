@@ -12,10 +12,13 @@ use localsend::crypto::cert::generate_self_signed;
 use localsend::discovery::{
     self, DeviceIdentity, DiscoveryConfig, DiscoveryEvent, DiscoveryHandle,
 };
+use localsend::http::server::v2::ServerEventV2;
 use localsend::http::server::web::WebConfig;
 use localsend::http::server::{start_with_port, ServerConfigV2, TlsConfig};
 use localsend::http::state::ClientInfo;
-use localsend::model::discovery::{DeviceType, ProtocolType, PROTOCOL_VERSION_V2};
+use localsend::model::discovery::{
+    DeviceType, MulticastMessageV2, ProtocolType, PROTOCOL_VERSION_V2,
+};
 use localsend::multicast::MulticastDevice;
 use localsend::util::interface::InterfaceFilter;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -52,10 +55,21 @@ async fn start_register_server(
     fingerprint: &str,
     tls: Option<TlsConfig>,
 ) -> (u16, oneshot::Sender<()>) {
+    // The receiver is dropped: the register endpoint responds either way.
+    let (port, stop_tx, _) = start_observed_server(alias, fingerprint, tls).await;
+    (port, stop_tx)
+}
+
+/// Like [start_register_server], but also returns the server's event
+/// receiver, so a test can see which requests reached the application.
+async fn start_observed_server(
+    alias: &str,
+    fingerprint: &str,
+    tls: Option<TlsConfig>,
+) -> (u16, oneshot::Sender<()>, mpsc::Receiver<ServerEventV2>) {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-    // The receiver is dropped: the register endpoint responds either way.
-    let (event_tx, _) = mpsc::channel(16);
+    let (event_tx, event_rx) = mpsc::channel(16);
     let (stop_tx, stop_rx) = oneshot::channel();
 
     // Port 0 lets the OS pick a free port, avoiding collisions between tests.
@@ -81,7 +95,55 @@ async fn start_register_server(
     .await
     .expect("Failed to start server");
 
-    (handle.port(), stop_tx)
+    (handle.port(), stop_tx, event_rx)
+}
+
+/// Asserts that no register request reached the server's application layer.
+///
+/// The server emits `Register` before it answers, so a registration made by a
+/// probe is already in the channel once the probing call has returned.
+fn assert_not_registered(events: &mut mpsc::Receiver<ServerEventV2>) {
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, ServerEventV2::Register { .. }),
+            "a device that cannot receive must not register: {event:?}"
+        );
+    }
+}
+
+/// Delivers an announcement straight to a discovery instance's multicast
+/// port. The sockets are bound to the unspecified address, so they take
+/// unicast datagrams too, which makes the answering path testable on
+/// machines that do not route multicast.
+async fn announce_to(multicast_port: u16, message: &MulticastMessageV2) {
+    let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("Failed to bind a UDP socket");
+    socket
+        .send_to(
+            &serde_json::to_vec(message).unwrap(),
+            (Ipv4Addr::LOCALHOST, multicast_port),
+        )
+        .await
+        .expect("Failed to send the announcement");
+}
+
+fn announcement(
+    alias: &str,
+    fingerprint: &str,
+    port: u16,
+    protocol: ProtocolType,
+) -> MulticastMessageV2 {
+    MulticastMessageV2 {
+        alias: alias.to_string(),
+        version: PROTOCOL_VERSION_V2.to_string(),
+        device_model: Some("Rust".to_string()),
+        device_type: Some(DeviceType::Headless),
+        fingerprint: fingerprint.to_string(),
+        port,
+        protocol,
+        download: false,
+    }
 }
 
 struct TestInstance {
@@ -132,6 +194,23 @@ async fn start_instance_with_cert(
     server_port: u16,
     cert: localsend::crypto::cert::SelfSignedCert,
 ) -> Option<TestInstance> {
+    start_instance_with(alias, multicast_port, server_port, cert, true).await
+}
+
+/// Starts an instance that runs no server, like a sender-only application:
+/// it confirms peers without registering with them.
+async fn start_probe_only_instance(alias: &str, multicast_port: u16) -> Option<TestInstance> {
+    let cert = generate_self_signed().expect("Failed to generate an identity");
+    start_instance_with(alias, multicast_port, announce_port(), cert, false).await
+}
+
+async fn start_instance_with(
+    alias: &str,
+    multicast_port: u16,
+    server_port: u16,
+    cert: localsend::crypto::cert::SelfSignedCert,
+    receivable: bool,
+) -> Option<TestInstance> {
     let (event_tx, events) = mpsc::channel(32);
     let (stop_tx, stop_rx) = oneshot::channel();
 
@@ -157,6 +236,7 @@ async fn start_instance_with_cert(
             },
             timeout: discovery::DEFAULT_DISCOVERY_TIMEOUT,
             event_tx: Some(event_tx),
+            receivable,
         },
         stop_rx,
     )
@@ -385,6 +465,7 @@ async fn test_discovery_works_without_multicast() {
             },
             timeout: discovery::DEFAULT_DISCOVERY_TIMEOUT,
             event_tx: None,
+            receivable: true,
         },
         stop_rx,
     )
@@ -454,4 +535,247 @@ async fn test_announcement_is_answered_and_device_stored() {
             .is_none(),
         "answering over HTTP must not make the receiver appear on the announcer's side"
     );
+}
+
+/// Upstream behavior, and the control for the probe-only tests below: a
+/// receivable device registers with the peers it probes, announcing its port.
+#[tokio::test]
+async fn test_receivable_discovery_registers_with_the_peer() {
+    let multicast_port = NEXT_MULTICAST_PORT.fetch_add(1, Ordering::Relaxed);
+    let (server_port, _server_stop, mut server_events) =
+        start_observed_server("Target", "target-fingerprint", None).await;
+    let own_port = announce_port();
+    let cert = generate_self_signed().expect("Failed to generate an identity");
+    let Some(instance) =
+        start_instance_with("Receiver", multicast_port, own_port, cert, true).await
+    else {
+        return skip("no network interface available for multicast");
+    };
+
+    instance
+        .handle
+        .discover("127.0.0.1", server_port, ProtocolType::Http)
+        .await
+        .expect("Targeted discovery failed")
+        .expect("The target must not be mistaken for the device itself");
+
+    match server_events.try_recv() {
+        Ok(ServerEventV2::Register { info, .. }) => {
+            assert_eq!(info.alias, "Receiver");
+            assert_eq!(info.port, own_port);
+        }
+        other => panic!("expected the probe to register, got {other:?}"),
+    }
+}
+
+/// A device that runs no server confirms peers over `GET /info`: it finds
+/// them through targeted discovery and subnet scans alike, but never
+/// registers, so no peer stores it at a port nobody serves.
+#[tokio::test]
+async fn test_probe_only_discovery_confirms_devices_without_registering() {
+    let multicast_port = NEXT_MULTICAST_PORT.fetch_add(1, Ordering::Relaxed);
+    let (server_port, _server_stop, mut server_events) =
+        start_observed_server("Target", "target-fingerprint", None).await;
+    let Some(mut instance) = start_probe_only_instance("Prober", multicast_port).await else {
+        return skip("no network interface available for multicast");
+    };
+
+    let device = instance
+        .handle
+        .discover("127.0.0.1", server_port, ProtocolType::Http)
+        .await
+        .expect("Targeted discovery failed")
+        .expect("The target must not be mistaken for the device itself");
+    assert_eq!(device.device.alias, "Target");
+    assert_eq!(device.device.fingerprint, "target-fingerprint");
+    assert_eq!(device.device.device_model.as_deref(), Some("Rust"));
+    let http = device
+        .device
+        .http()
+        .expect("The device must have an HTTP channel");
+    assert_eq!((http.host.as_str(), http.port), ("127.0.0.1", server_port));
+    assert_eq!(http.protocol, ProtocolType::Http);
+    assert_not_registered(&mut server_events);
+
+    let found = instance
+        .handle
+        .scan_subnet(
+            Ipv4Addr::new(127, 0, 0, 99),
+            server_port,
+            ProtocolType::Http,
+        )
+        .await
+        .expect("Subnet scan failed");
+    assert!(!found.is_empty(), "the scan must find the loopback server");
+    assert!(found
+        .iter()
+        .all(|device| device.device.fingerprint == "target-fingerprint"));
+    assert_not_registered(&mut server_events);
+
+    let stored = instance
+        .handle
+        .device_by_fingerprint("target-fingerprint")
+        .expect("The probed device must be stored");
+    assert_eq!(stored.device.alias, "Target");
+    let emitted = instance
+        .next_discovery("target-fingerprint")
+        .await
+        .expect("The probed device must be emitted");
+    assert_eq!(emitted.alias, "Target");
+}
+
+/// Without a register request, the HTTPS identity still comes from the
+/// certificate, never from the fingerprint the info body claims.
+#[tokio::test]
+async fn test_probe_only_discovery_reads_fingerprint_from_certificate_on_https() {
+    let multicast_port = NEXT_MULTICAST_PORT.fetch_add(1, Ordering::Relaxed);
+    let server_cert = generate_self_signed().expect("Failed to generate an identity");
+    let (server_port, _server_stop, mut server_events) = start_observed_server(
+        "TlsTarget",
+        "claimed-fingerprint",
+        Some(TlsConfig {
+            cert: server_cert.certificate_pem.clone(),
+            private_key: server_cert.private_key_pem.clone(),
+        }),
+    )
+    .await;
+    let Some(instance) = start_probe_only_instance("TlsProber", multicast_port).await else {
+        return skip("no network interface available for multicast");
+    };
+
+    let device = instance
+        .handle
+        .discover("127.0.0.1", server_port, ProtocolType::Https)
+        .await
+        .expect("Targeted discovery failed")
+        .expect("The target must not be mistaken for the device itself");
+
+    assert_eq!(device.device.fingerprint, server_cert.fingerprint);
+    assert_eq!(device.device.alias, "TlsTarget");
+    assert!(instance
+        .handle
+        .device_by_fingerprint("claimed-fingerprint")
+        .is_none());
+    assert_not_registered(&mut server_events);
+}
+
+/// Upstream behavior, and the control for the probe-only announcement test:
+/// answering an announcement registers with the announcer.
+#[tokio::test]
+async fn test_announcement_answer_registers_when_receivable() {
+    let multicast_port = NEXT_MULTICAST_PORT.fetch_add(1, Ordering::Relaxed);
+    let (announcer_port, _server_stop, mut announcer_events) =
+        start_observed_server("Announcer", "announcer-fingerprint", None).await;
+    let own_port = announce_port();
+    let cert = generate_self_signed().expect("Failed to generate an identity");
+    let Some(mut receiver) =
+        start_instance_with("Receiver", multicast_port, own_port, cert, true).await
+    else {
+        return skip("no network interface available for multicast");
+    };
+
+    announce_to(
+        multicast_port,
+        &announcement(
+            "Announcer",
+            "announcer-fingerprint",
+            announcer_port,
+            ProtocolType::Http,
+        ),
+    )
+    .await;
+    receiver
+        .next_discovery("announcer-fingerprint")
+        .await
+        .expect("The announcement must be answered");
+
+    match announcer_events.try_recv() {
+        Ok(ServerEventV2::Register { info, .. }) => assert_eq!(info.port, own_port),
+        other => panic!("expected the answer to register, got {other:?}"),
+    }
+}
+
+/// A device that runs no server answers announcements with `GET /info`: the
+/// announcer is stored, but never learns of a device it could send to.
+#[tokio::test]
+async fn test_probe_only_announcement_answer_does_not_register() {
+    let multicast_port = NEXT_MULTICAST_PORT.fetch_add(1, Ordering::Relaxed);
+    let (announcer_port, _server_stop, mut announcer_events) =
+        start_observed_server("Announcer", "announcer-fingerprint", None).await;
+    let Some(mut receiver) = start_probe_only_instance("Receiver", multicast_port).await else {
+        return skip("no network interface available for multicast");
+    };
+
+    announce_to(
+        multicast_port,
+        &announcement(
+            "Announcer",
+            "announcer-fingerprint",
+            announcer_port,
+            ProtocolType::Http,
+        ),
+    )
+    .await;
+    let device = receiver
+        .next_discovery("announcer-fingerprint")
+        .await
+        .expect("The announcement must be answered");
+
+    assert_eq!(device.alias, "Announcer");
+    let http = device.http().expect("The device must have an HTTP channel");
+    assert_eq!(http.port, announcer_port);
+    assert!(receiver
+        .handle
+        .device_by_fingerprint("announcer-fingerprint")
+        .is_some());
+    assert_not_registered(&mut announcer_events);
+}
+
+/// The info request that answers an HTTPS announcement is still pinned to the
+/// announced fingerprint: an announcer without the matching certificate is
+/// neither stored nor sent anything.
+#[tokio::test]
+async fn test_probe_only_announcement_answer_is_pinned_on_https() {
+    let multicast_port = NEXT_MULTICAST_PORT.fetch_add(1, Ordering::Relaxed);
+    let server_cert = generate_self_signed().expect("Failed to generate an identity");
+    let (announcer_port, _server_stop, mut announcer_events) = start_observed_server(
+        "Impostor",
+        "claimed-fingerprint",
+        Some(TlsConfig {
+            cert: server_cert.certificate_pem.clone(),
+            private_key: server_cert.private_key_pem.clone(),
+        }),
+    )
+    .await;
+    let Some(mut receiver) = start_probe_only_instance("Receiver", multicast_port).await else {
+        return skip("no network interface available for multicast");
+    };
+
+    announce_to(
+        multicast_port,
+        &announcement(
+            "Impostor",
+            "claimed-fingerprint",
+            announcer_port,
+            ProtocolType::Https,
+        ),
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + RECEIVE_TIMEOUT;
+    loop {
+        let event = tokio::time::timeout_at(deadline, receiver.events.recv())
+            .await
+            .expect("The failed answer must be reported")
+            .expect("The event channel closed");
+        match event {
+            DiscoveryEvent::ProbeFailed { alias, .. } if alias == "Impostor" => break,
+            DiscoveryEvent::Discovered { device } | DiscoveryEvent::Updated { device } => {
+                assert_ne!(device.alias, "Impostor", "the impostor must not be stored");
+            }
+            _ => {}
+        }
+    }
+    assert!(receiver.handle.devices().is_empty());
+    assert_not_registered(&mut announcer_events);
 }

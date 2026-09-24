@@ -1,10 +1,15 @@
 use super::*;
-use crate::localsend::{self, Device, Discovery, SenderInfo, ShareUrl};
+use crate::localsend::{self, Device, Discovery, PinRejected, SenderInfo, ShareUrl};
 use anyhow::Context as _;
-use gpui_kit::AnyElement;
+use gpui_kit::base::input::{InputEvent, InputState};
+use gpui_kit::{AnyElement, Entity};
+use gpui_omarchy::input as text_input;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
+/// Distinct from the picker's "omabeam": Hyprland treats a window with that
+/// class as the picker. install.sh floats this one with its own rule.
+const APP_ID: &str = "omabeam-send";
 const WINDOW_W: f32 = 440.0;
 const WINDOW_H: f32 = 560.0;
 
@@ -12,9 +17,63 @@ const WINDOW_H: f32 = 560.0;
 enum SendPhase {
     Starting,
     Ready,
-    Sending { alias: String },
-    Sent { alias: String },
-    Failed { message: String },
+    Sending {
+        alias: String,
+    },
+    /// The receiver answered 401; the next send to it carries the typed PIN.
+    NeedsPin {
+        fingerprint: String,
+        alias: String,
+        incorrect: bool,
+    },
+    Sent {
+        alias: String,
+    },
+    Failed {
+        message: String,
+    },
+}
+
+impl SendPhase {
+    fn asks_pin_for(&self, device: &str) -> bool {
+        matches!(self, Self::NeedsPin { fingerprint, .. } if fingerprint == device)
+    }
+}
+
+/// The phase and hint a finished send leaves: a PIN request keeps the send
+/// open for a retry, anything else ends it.
+fn outcome(fingerprint: &str, alias: &str, result: anyhow::Result<()>) -> (SendPhase, String) {
+    let error = match result {
+        Ok(()) => {
+            return (
+                SendPhase::Sent {
+                    alias: alias.into(),
+                },
+                format!("Sent to {alias}. They can open the link in a browser."),
+            );
+        }
+        Err(error) => error,
+    };
+    match error.downcast_ref::<PinRejected>() {
+        Some(rejected) => (
+            SendPhase::NeedsPin {
+                fingerprint: fingerprint.into(),
+                alias: alias.into(),
+                incorrect: rejected.pin_sent,
+            },
+            if rejected.pin_sent {
+                format!("{rejected} Try again.")
+            } else {
+                format!("{rejected} Enter it to send the link.")
+            },
+        ),
+        None => (
+            SendPhase::Failed {
+                message: error.to_string(),
+            },
+            error.to_string(),
+        ),
+    }
 }
 
 pub struct SendLink {
@@ -29,6 +88,10 @@ pub struct SendLink {
     phase: SendPhase,
     hint: SharedString,
     cancel: Option<CancellationToken>,
+    /// Counts sends, so a cancelled send finishing late cannot overwrite a
+    /// newer one.
+    sends: u64,
+    pin: Entity<InputState>,
     scroll: ScrollHandle,
 }
 
@@ -40,21 +103,32 @@ impl SendLink {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Letters and arrows belong to the PIN field while it has focus; Enter
+        // and Escape still reach the window (the field passes them on).
+        const SHORTCUTS: &str = "OmaBeamSend && !Input";
         cx.bind_keys([
             KeyBinding::new("escape", Cancel, Some("OmaBeamSend")),
             KeyBinding::new("enter", Confirm, Some("OmaBeamSend")),
-            KeyBinding::new("c", CopyShot, Some("OmaBeamSend")),
-            KeyBinding::new("h", MoveLeft, Some("OmaBeamSend")),
-            KeyBinding::new("left", MoveLeft, Some("OmaBeamSend")),
-            KeyBinding::new("l", MoveRight, Some("OmaBeamSend")),
-            KeyBinding::new("right", MoveRight, Some("OmaBeamSend")),
-            KeyBinding::new("k", MoveUp, Some("OmaBeamSend")),
-            KeyBinding::new("up", MoveUp, Some("OmaBeamSend")),
-            KeyBinding::new("j", MoveDown, Some("OmaBeamSend")),
-            KeyBinding::new("down", MoveDown, Some("OmaBeamSend")),
+            KeyBinding::new("c", CopyShot, Some(SHORTCUTS)),
+            KeyBinding::new("h", MoveLeft, Some(SHORTCUTS)),
+            KeyBinding::new("left", MoveLeft, Some(SHORTCUTS)),
+            KeyBinding::new("l", MoveRight, Some(SHORTCUTS)),
+            KeyBinding::new("right", MoveRight, Some(SHORTCUTS)),
+            KeyBinding::new("k", MoveUp, Some(SHORTCUTS)),
+            KeyBinding::new("up", MoveUp, Some(SHORTCUTS)),
+            KeyBinding::new("j", MoveDown, Some(SHORTCUTS)),
+            KeyBinding::new("down", MoveDown, Some(SHORTCUTS)),
         ]);
         let focus = cx.focus_handle();
         focus.focus(window, cx);
+        let pin = cx.new(|cx| InputState::new(window, cx).placeholder("PIN").masked(true));
+        // Typing enables the Send button.
+        cx.subscribe(&pin, |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
         let view = Self {
             focus,
             runtime: runtime.clone(),
@@ -67,6 +141,8 @@ impl SendLink {
             phase: SendPhase::Starting,
             hint: "Starting LocalSend discovery…".into(),
             cancel: None,
+            sends: 0,
+            pin,
             scroll: ScrollHandle::new(),
         };
         view.start(cx);
@@ -76,7 +152,7 @@ impl SendLink {
     fn start(&self, cx: &mut Context<Self>) {
         let runtime = self.runtime.clone();
         let task = runtime.spawn(async move {
-            let info = tokio::task::spawn_blocking(SenderInfo::generate)
+            let info = tokio::task::spawn_blocking(SenderInfo::load_or_create)
                 .await
                 .context("LocalSend identity task stopped")??;
             let discovery = Discovery::start(&info).await?;
@@ -140,7 +216,7 @@ impl SendLink {
         self.devices = discovery.devices();
         if !matches!(
             self.phase,
-            SendPhase::Failed { .. } | SendPhase::Sent { .. }
+            SendPhase::Failed { .. } | SendPhase::Sent { .. } | SendPhase::NeedsPin { .. }
         ) {
             self.hint = discovery.hint().into();
         }
@@ -179,14 +255,14 @@ impl SendLink {
         self.scroll.scroll_to_item(next);
     }
 
-    fn send_selected(&mut self, cx: &mut Context<Self>) {
+    fn send_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        self.send_to(id, cx);
+        self.send_to(id, window, cx);
     }
 
-    fn send_to(&mut self, fingerprint: String, cx: &mut Context<Self>) {
+    fn send_to(&mut self, fingerprint: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_busy() {
             return;
         }
@@ -201,44 +277,58 @@ impl SendLink {
         else {
             return;
         };
-        self.selected = Some(fingerprint);
+        let pin = if self.phase.asks_pin_for(&fingerprint) {
+            let typed = self.pin.read(cx).value();
+            if typed.is_empty() {
+                self.pin.update(cx, |pin, cx| pin.focus(window, cx));
+                return;
+            }
+            Some(typed.to_string())
+        } else {
+            None
+        };
+        // The PIN field goes away while sending; keep the keys working.
+        self.focus.focus(window, cx);
+        self.selected = Some(fingerprint.clone());
         self.phase = SendPhase::Sending {
             alias: device.alias.clone(),
         };
         self.hint = format!("Waiting for {} to accept…", device.alias).into();
         let cancel = CancellationToken::new();
         self.cancel = Some(cancel.clone());
+        self.sends += 1;
+        let send = self.sends;
         let url = self.url.clone();
         let alias = device.alias.clone();
         let runtime = self.runtime.clone();
-        let task = runtime
-            .spawn(async move { localsend::send_text(&sender, &device, &url, cancel).await });
+        let task = runtime.spawn(async move {
+            localsend::send_text(&sender, &device, &url, pin.as_deref(), cancel).await
+        });
         cx.notify();
-        cx.spawn(async move |view, cx| {
+        cx.spawn_in(window, async move |view, cx| {
             let result = task.await;
-            let _ = view.update(cx, |this, cx| {
-                this.cancel = None;
-                match result {
-                    Ok(Ok(())) => {
-                        this.phase = SendPhase::Sent {
-                            alias: alias.clone(),
-                        };
-                        this.hint =
-                            format!("Sent to {alias}. They can open the link in a browser.").into();
-                    }
-                    Ok(Err(error)) => {
-                        this.phase = SendPhase::Failed {
-                            message: error.to_string(),
-                        };
-                        this.hint = error.to_string().into();
-                    }
-                    Err(_) => {
-                        this.phase = SendPhase::Failed {
-                            message: "Send stopped.".into(),
-                        };
-                        this.hint = "Send stopped.".into();
-                    }
+            let _ = view.update_in(cx, |this, window, cx| {
+                if this.sends != send {
+                    return;
                 }
+                this.cancel = None;
+                let (phase, hint) = match result {
+                    Ok(result) => outcome(&fingerprint, &alias, result),
+                    Err(_) => (
+                        SendPhase::Failed {
+                            message: "Send stopped.".into(),
+                        },
+                        "Send stopped.".into(),
+                    ),
+                };
+                if matches!(phase, SendPhase::NeedsPin { .. }) {
+                    this.pin.update(cx, |pin, cx| {
+                        pin.set_value("", window, cx);
+                        pin.focus(window, cx);
+                    });
+                }
+                this.phase = phase;
+                this.hint = hint.into();
                 cx.notify();
             });
         })
@@ -335,7 +425,7 @@ impl SendLink {
         .when(selected, |card| {
             card.child(icon(IconName::Check).text_color(theme.accent))
         })
-        .on_click(cx.listener(move |this, _, _, cx| this.send_to(id.clone(), cx)))
+        .on_click(cx.listener(move |this, _, window, cx| this.send_to(id.clone(), window, cx)))
         .into_any_element()
     }
 }
@@ -347,19 +437,31 @@ impl Focusable for SendLink {
 }
 
 impl Render for SendLink {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ready = matches!(
             self.phase,
-            SendPhase::Ready | SendPhase::Sent { .. } | SendPhase::Failed { .. }
+            SendPhase::Ready
+                | SendPhase::NeedsPin { .. }
+                | SendPhase::Sent { .. }
+                | SendPhase::Failed { .. }
         );
         let sending = matches!(self.phase, SendPhase::Sending { .. });
-        let status_color = if matches!(self.phase, SendPhase::Failed { .. }) {
-            cx.omarchy().danger
-        } else if matches!(self.phase, SendPhase::Sent { .. }) {
-            cx.omarchy().success
-        } else {
-            cx.omarchy().secondary
+        let pin_for_selected = self
+            .selected
+            .as_deref()
+            .is_some_and(|id| self.phase.asks_pin_for(id));
+        let pin_missing = pin_for_selected && self.pin.read(cx).value().is_empty();
+        let status_color = match self.phase {
+            SendPhase::Failed { .. }
+            | SendPhase::NeedsPin {
+                incorrect: true, ..
+            } => cx.omarchy().danger,
+            SendPhase::NeedsPin { .. } => cx.omarchy().warning,
+            SendPhase::Sent { .. } => cx.omarchy().success,
+            _ => cx.omarchy().secondary,
         };
+        let pin_field = matches!(self.phase, SendPhase::NeedsPin { .. })
+            .then(|| text_input("send-pin", &self.pin, window, cx));
         let mut cards = Vec::new();
         for device in self.devices.clone() {
             cards.push(self.device_card(&device, cx));
@@ -376,7 +478,9 @@ impl Render for SendLink {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .on_action(cx.listener(|this, _: &Confirm, _, cx| this.send_selected(cx)))
+                    .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                        this.send_selected(window, cx)
+                    }))
                     .on_action(cx.listener(|this, _: &Cancel, _, cx| this.cancel(cx)))
                     .on_action(cx.listener(|this, _: &CopyShot, _, cx| this.copy_link(cx)))
                     .on_action(cx.listener(|this, _: &MoveLeft, _, cx| {
@@ -448,6 +552,7 @@ impl Render for SendLink {
                                     .text_color(status_color)
                                     .child(self.hint.clone()),
                             )
+                            .children(pin_field)
                             .child(
                                 div()
                                     .flex()
@@ -461,14 +566,24 @@ impl Render for SendLink {
                                     .child(
                                         button(
                                             "send-selected",
-                                            if sending { "Waiting…" } else { "Send" },
+                                            if sending {
+                                                "Waiting…"
+                                            } else if pin_for_selected {
+                                                "Send with PIN"
+                                            } else {
+                                                "Send"
+                                            },
                                             ButtonVariant::Primary,
                                             cx,
                                         )
                                         .bg(cx.omarchy().accent)
                                         .text_color(cx.omarchy().background)
-                                        .disabled(!ready || self.selected_device().is_none())
-                                        .on_click(cx.listener(|this, _, _, cx| this.send_selected(cx))),
+                                        .disabled(
+                                            !ready || self.selected_device().is_none() || pin_missing,
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.send_selected(window, cx)
+                                        })),
                                     )
                                     .child(
                                         button("done", "Done", ButtonVariant::Outline, cx)
@@ -525,7 +640,7 @@ pub fn open(url: String) {
                 show: true,
                 kind: WindowKind::Normal,
                 is_resizable: true,
-                app_id: Some("omabeam".into()),
+                app_id: Some(APP_ID.into()),
                 window_min_size: Some(size(px(360.), px(400.))),
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
@@ -540,12 +655,85 @@ pub fn open(url: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::device_initials;
+    use super::{APP_ID, SendPhase, device_initials, outcome};
+    use crate::localsend::PinRejected;
 
     #[test]
     fn initials_use_the_visible_name() {
         assert_eq!(device_initials("Kitchen PC"), "KP");
         assert_eq!(device_initials("pixel"), "P");
         assert_eq!(device_initials("   "), "TS");
+    }
+
+    fn rejected(pin_sent: bool) -> anyhow::Result<()> {
+        Err(PinRejected {
+            alias: "Kitchen".into(),
+            pin_sent,
+        }
+        .into())
+    }
+
+    #[test]
+    fn a_pin_request_asks_for_the_pin_instead_of_failing() {
+        let (phase, hint) = outcome("kitchen-id", "Kitchen", rejected(false));
+        assert_eq!(
+            phase,
+            SendPhase::NeedsPin {
+                fingerprint: "kitchen-id".into(),
+                alias: "Kitchen".into(),
+                incorrect: false,
+            }
+        );
+        assert_eq!(hint, "Kitchen requires a PIN. Enter it to send the link.");
+        assert!(phase.asks_pin_for("kitchen-id"));
+        assert!(!phase.asks_pin_for("other-id"));
+
+        let (phase, hint) = outcome("kitchen-id", "Kitchen", rejected(true));
+        assert_eq!(
+            phase,
+            SendPhase::NeedsPin {
+                fingerprint: "kitchen-id".into(),
+                alias: "Kitchen".into(),
+                incorrect: true,
+            }
+        );
+        assert_eq!(hint, "Incorrect PIN for Kitchen. Try again.");
+    }
+
+    #[test]
+    fn other_results_end_the_send() {
+        let (phase, hint) = outcome("kitchen-id", "Kitchen", Ok(()));
+        assert_eq!(
+            phase,
+            SendPhase::Sent {
+                alias: "Kitchen".into()
+            }
+        );
+        assert_eq!(
+            hint,
+            "Sent to Kitchen. They can open the link in a browser."
+        );
+        assert!(!phase.asks_pin_for("kitchen-id"));
+
+        let (phase, hint) = outcome(
+            "kitchen-id",
+            "Kitchen",
+            Err(anyhow::anyhow!("Kitchen declined the transfer.")),
+        );
+        assert_eq!(
+            phase,
+            SendPhase::Failed {
+                message: "Kitchen declined the transfer.".into()
+            }
+        );
+        assert_eq!(hint, "Kitchen declined the transfer.");
+    }
+
+    #[test]
+    fn the_installer_floats_the_send_window_apart_from_the_picker() {
+        // The picker is the window whose class is "omabeam".
+        assert_ne!(APP_ID, "omabeam");
+        let rule = format!("o.window({APP_ID:?}, {{");
+        assert!(include_str!("../../install.sh").contains(&rule), "{rule}");
     }
 }

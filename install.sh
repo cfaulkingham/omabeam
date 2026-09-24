@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Install OmaBeam on this Omarchy/Hyprland machine:
 #   1. build the plugin-local native app (or use the release's bundled binary)
-#   2. float the picker (sized to the monitor) and bind SUPER+SHIFT+T
+#   2. float the picker (sized to the monitor) and the send window, and bind
+#      SUPER+SHIFT+T
 #   3. copy and enable the Omarchy bar widget
 #
 # Safe to re-run. Missing UFW allows for the detected LAN are added after a
@@ -117,6 +118,8 @@ from collections import Counter
 
 hypr_path, bind_path, bind_binary, ipc_binary, action, bind_keys = sys.argv[1:7]
 MAX = 1_048_576
+# The send window ("omabeam-send") follows the picker's rule, so its own size
+# wins wherever the picker's class would match it too.
 WINDOW = """-- omabeam (install.sh)
 o.window("omabeam", {
   float = true,
@@ -126,14 +129,24 @@ o.window("omabeam", {
   size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },
   max_size = { 980, 560 },
 })
+o.window("omabeam-send", {
+  float = true,
+  center = true,
+  focus_on_activate = false,
+  animation = "popin",
+  size = { 440, 560 },
+})
 """
 BIND = (
     "-- omabeam (install.sh)\n"
     f'o.bind({json.dumps(bind_keys)}, "OmaBeam", {{ launch = {json.dumps(bind_binary)} }})\n'
 )
+# The send window's rule is optional: blocks written before it existed hold
+# only the picker's rule, and are upgraded or removed the same way.
 WINDOW_RE = re.compile(
     r"-- omabeam \(install.sh\)\n"
-    r'o\.window\("omabeam", \{.*?\}\)\n?',
+    r'o\.window\("omabeam", \{.*?\}\)\n?'
+    r'(?:o\.window\("omabeam-send", \{.*?\}\)\n?)?',
     re.S,
 )
 BIND_RE = re.compile(
@@ -252,12 +265,12 @@ if action == "remove":
 else:
     if WINDOW_RE.search(hypr):
         hypr = WINDOW_RE.sub(WINDOW, hypr, count=1)
-        print("  updated window rule")
+        print("  updated window rules")
     elif 'o.window("omabeam"' in hypr:
         print("  window rule present (left unchanged)")
     else:
         hypr = hypr.rstrip() + "\n\n" + WINDOW
-        print("  appended window rule")
+        print("  appended window rules")
     if bind_keys in bind and "OmaBeam" not in bind:
         print(f"  {bind_keys} is already used; not replacing it", file=sys.stderr)
     elif BIND_RE.search(bind):
@@ -459,7 +472,7 @@ if $BACKEND_ONLY; then
   exit 0
 fi
 
-echo "==> Hyprland window rule and bind $BIND_KEYS"
+echo "==> Hyprland window rules and bind $BIND_KEYS"
 hypr_rc=0
 edit_hypr apply || hypr_rc=$?
 case $hypr_rc in
@@ -503,7 +516,7 @@ echo "  binary:  $BIN"
 echo "  plugin:  $PLUGIN_DIR"
 if $HYPR_MANUAL; then
   echo "  launch:  $BIN"
-  echo "  Hyprland window rule and key bind were not added automatically; add them by hand (see above)."
+  echo "  Hyprland window rules and key bind were not added automatically; add them by hand (see above)."
 else
   echo "  launch:  $BIND_KEYS  or  $BIN"
 fi

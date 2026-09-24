@@ -5,7 +5,7 @@ pub use store::{
     StatefulDevice,
 };
 
-use crate::http::client::{ClientError, LsHttpClientV2};
+use crate::http::client::{ClientError, LsHttpClientV2, ResultWithPublicKey};
 use crate::http::dto_v2::{RegisterDtoV2, RegisterResponseDtoV2};
 use crate::model::discovery::{MulticastMessageV2, ProtocolType};
 use crate::multicast::{self, MulticastConfig, MulticastDevice, MulticastEvent, MulticastHandle};
@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 use store::DeviceStore;
 use tokio::sync::{mpsc, oneshot};
 
-/// The default timeout of the register requests sent by discovery, matching
+/// The default timeout of the requests sent by discovery, matching
 /// the Flutter app's default discovery timeout. Discovery only talks to LAN
 /// peers, which answer quickly or not at all.
 pub const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_millis(500);
@@ -32,7 +32,7 @@ const MULTICAST_CHANNEL_SIZE: usize = 64;
 /// legacy HTTP discovery.
 const SCAN_CONCURRENCY: usize = 50;
 
-/// This device's TLS identity, sent as client certificate with every register
+/// This device's TLS identity, sent as client certificate with every discovery
 /// request (client certificates are mandatory in HTTPS mode).
 ///
 /// Its fingerprint is the one carried in [`MulticastDevice::fingerprint`].
@@ -64,10 +64,10 @@ pub struct DiscoveryConfig {
     /// requests.
     pub device: MulticastDevice,
 
-    /// The TLS identity used for the register requests.
+    /// The TLS identity used for the discovery requests.
     pub identity: DeviceIdentity,
 
-    /// Timeout of each register request sent by discovery, usually
+    /// Timeout of each request sent by discovery, usually
     /// [`DEFAULT_DISCOVERY_TIMEOUT`]. Bounds how long an unresponsive host
     /// stalls a subnet scan, so keep it short.
     pub timeout: Duration,
@@ -75,6 +75,14 @@ pub struct DiscoveryConfig {
     /// Channel on which discovery events are emitted. `None` when the
     /// application only polls [`DiscoveryHandle::devices`].
     pub event_tx: Option<mpsc::Sender<DiscoveryEvent>>,
+
+    /// Whether this device runs a server that receives files, usually `true`.
+    ///
+    /// Peers are then confirmed with a register request, which also makes
+    /// them store this device at [`MulticastDevice::port`]. A device that only
+    /// sends (and runs no server) sets `false`: peers are confirmed with
+    /// `GET /info` instead, which tells them nothing about this device.
+    pub receivable: bool,
 }
 
 /// An event emitted by the discovery. Every confirmation is also logged in
@@ -120,6 +128,9 @@ struct DiscoveryState {
     store: DeviceStore,
     event_tx: Option<mpsc::Sender<DiscoveryEvent>>,
 
+    /// See [`DiscoveryConfig::receivable`].
+    receivable: bool,
+
     /// Whether announcements of other devices are answered, see
     /// [`DiscoveryHandle::set_answer_announcements`].
     answering: AtomicBool,
@@ -158,9 +169,41 @@ impl DiscoveryState {
         )
     }
 
-    /// Registers with `host:port` and, when a device answers, puts it into
-    /// the store. Returns the device's stored state after the merge, or
-    /// `None` when the answer carried this device's own fingerprint.
+    /// Asks `host:port` for its device information: with a register request,
+    /// which also tells the peer about this device, or, when this device
+    /// cannot receive, with `GET /info`, which tells it nothing.
+    async fn request_info(
+        &self,
+        client: &LsHttpClientV2,
+        host: &str,
+        port: u16,
+        protocol: ProtocolType,
+    ) -> Result<ResultWithPublicKey<RegisterResponseDtoV2>, ClientError> {
+        if self.receivable {
+            return client
+                .register(protocol, host, port, self.register_dto())
+                .await;
+        }
+
+        let info = client.info(protocol, host, port).await?;
+        Ok(ResultWithPublicKey {
+            public_key: info.public_key,
+            cert_fingerprint: info.cert_fingerprint,
+            body: RegisterResponseDtoV2 {
+                alias: info.body.alias,
+                version: info.body.version,
+                device_model: info.body.device_model,
+                device_type: info.body.device_type,
+                fingerprint: info.body.fingerprint,
+                download: info.body.download,
+            },
+        })
+    }
+
+    /// Asks `host:port` for its device information (see
+    /// [`Self::request_info`]) and, when a device answers, puts it into the
+    /// store. Returns the device's stored state after the merge, or `None`
+    /// when the answer carried this device's own fingerprint.
     async fn probe(
         &self,
         client: &LsHttpClientV2,
@@ -168,9 +211,7 @@ impl DiscoveryState {
         port: u16,
         protocol: ProtocolType,
     ) -> Result<Option<StatefulDevice>, ClientError> {
-        let response = client
-            .register(protocol, host, port, self.register_dto())
-            .await?;
+        let response = self.request_info(client, host, port, protocol).await?;
 
         // In HTTPS mode the certificate is the peer's identity; the
         // fingerprint claimed in the body only counts without encryption.
@@ -253,7 +294,8 @@ impl DiscoveryHandle {
     }
 
     /// Discovers a device at a known address, e.g. a favorite or a peer that
-    /// multicast does not reach, by sending it a register request.
+    /// multicast does not reach, by sending it a register request (or an info
+    /// request, see [`DiscoveryConfig::receivable`]).
     ///
     /// On success the device is put into the store (and emitted, as
     /// `Discovered` or `Updated`), and its full stored state — all known
@@ -270,8 +312,8 @@ impl DiscoveryHandle {
         self.state.probe(&client, host, port, protocol).await
     }
 
-    /// Discovers devices at known addresses, e.g. the favorites, by sending
-    /// each channel a register request: [`DiscoveryHandle::discover`] for a
+    /// Discovers devices at known addresses, e.g. the favorites, by probing
+    /// each channel like [`DiscoveryHandle::discover`] does: for a
     /// whole list, probed concurrently.
     ///
     /// Channels that do not answer are skipped; returns the stored state of
@@ -341,7 +383,7 @@ impl DiscoveryHandle {
     }
 
     /// Scans the `/24` subnet of the local interface address `interface_ip`
-    /// by sending every other host a register request,
+    /// by probing every other host like [`DiscoveryHandle::discover`] does,
     /// for networks that do not carry multicast.
     ///
     /// At most one scan runs per interface: a call for an address that is
@@ -389,8 +431,10 @@ impl DiscoveryHandle {
     /// register request (the answer is what makes the announcing device
     /// enter the store). On by default.
     ///
-    /// An application whose server is not running turns this off: the answer
-    /// would advertise an HTTP port that nobody listens on.
+    /// An application whose server is not running turns this off, or starts
+    /// discovery with [`DiscoveryConfig::receivable`] set to `false`, which
+    /// answers with an info request instead: a register request would
+    /// advertise an HTTP port that nobody listens on.
     pub fn set_answer_announcements(&self, answer: bool) {
         self.state.answering.store(answer, Ordering::Relaxed);
     }
@@ -469,6 +513,7 @@ pub async fn start(config: DiscoveryConfig, stop_rx: oneshot::Receiver<()>) -> D
         timeout: config.timeout,
         store: DeviceStore::new(),
         event_tx: config.event_tx,
+        receivable: config.receivable,
         answering: AtomicBool::new(true),
         scanning: std::sync::Mutex::new(HashSet::new()),
         confirmations: AtomicU64::new(0),
@@ -507,9 +552,11 @@ pub async fn start(config: DiscoveryConfig, stop_rx: oneshot::Receiver<()>) -> D
     DiscoveryHandle { multicast, state }
 }
 
-/// Answers an announcement with a register request, as the protocol requires.
-/// The device enters the store only once that request succeeded, so that
-/// everything in the store is known to be reachable.
+/// Answers an announcement with a register request, as the protocol requires,
+/// or with an info request when this device cannot receive (see
+/// [`DiscoveryConfig::receivable`]). The device enters the store only once
+/// that request succeeded, so that everything in the store is known to be
+/// reachable.
 async fn answer_announcement(
     state: Arc<DiscoveryState>,
     ip: IpAddr,
@@ -543,8 +590,8 @@ async fn answer_announcement(
         }
     };
 
-    let result = client
-        .register(message.protocol, &host, message.port, state.register_dto())
+    let result = state
+        .request_info(&client, &host, message.port, message.protocol)
         .await;
 
     match result {
@@ -563,7 +610,7 @@ async fn answer_announcement(
         Err(err) => {
             let url = format!("{}://{host}:{}", message.protocol.as_str(), message.port);
             tracing::debug!(
-                "Could not register with announcing device {} ({url}): {}",
+                "Could not answer announcing device {} ({url}): {}",
                 message.alias,
                 ErrorChain(&err),
             );
@@ -578,8 +625,8 @@ async fn answer_announcement(
     }
 }
 
-/// Builds the stored device from the register response of a peer confirmed
-/// over HTTP.
+/// Builds the stored device from the register (or info) response of a peer
+/// confirmed over HTTP.
 fn confirmed_device(
     response: RegisterResponseDtoV2,
     host: String,

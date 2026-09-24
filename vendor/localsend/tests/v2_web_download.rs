@@ -263,7 +263,7 @@ async fn test_web_page() {
         .info(ProtocolType::Http, "127.0.0.1", server.port)
         .await
         .unwrap();
-    assert!(info.download);
+    assert!(info.body.download);
 
     let _ = std::fs::remove_file(disk_path);
 }
@@ -289,7 +289,7 @@ async fn test_web_page_disabled() {
         .info(ProtocolType::Http, "127.0.0.1", server.port)
         .await
         .unwrap();
-    assert!(!info.download);
+    assert!(!info.body.download);
 }
 
 #[tokio::test]

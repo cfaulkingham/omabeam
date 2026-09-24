@@ -405,6 +405,42 @@ path.chmod(0o755)
         self.assertNotIn("OmaBeam", (hypr / "bindings.lua").read_text())
         self.assertNotIn("omabeam (install.sh)", (hypr / "hyprland.lua").read_text())
 
+    def test_window_rules_float_the_picker_and_the_send_window(self):
+        env, hypr = install_env(self.base)
+        # An installation from before the send window had its own app id.
+        picker_only = (
+            '-- user config\n'
+            '-- omabeam (install.sh)\n'
+            'o.window("omabeam", {\n'
+            '  float = true,\n'
+            '  center = true,\n'
+            '  focus_on_activate = false,\n'
+            '  animation = "popin",\n'
+            '  size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },\n'
+            '  max_size = { 980, 560 },\n'
+            '})\n'
+        )
+        (hypr / "hyprland.lua").write_text(picker_only)
+        self.run_install(self.source, env=env)
+        upgraded = (hypr / "hyprland.lua").read_text()
+        self.assertEqual(upgraded.count("-- omabeam (install.sh)"), 1, upgraded)
+        self.assertEqual(upgraded.count('o.window("omabeam", {'), 1, upgraded)
+        self.assertEqual(upgraded.count('o.window("omabeam-send", {'), 1, upgraded)
+        send_rule = upgraded[upgraded.index('o.window("omabeam-send", {'):]
+        self.assertIn("float = true", send_rule)
+        self.assertIn("center = true", send_rule)
+        self.assertIn("size = { 440, 560 }", send_rule)
+        # After the picker's rule, so the send window's size wins even where
+        # the picker's class would also match it.
+        self.assertLess(upgraded.index('o.window("omabeam", {'), upgraded.index('o.window("omabeam-send", {'))
+        # Reinstalling keeps a single up-to-date block.
+        self.run_install(self.source, env=env)
+        self.assertEqual((hypr / "hyprland.lua").read_text(), upgraded)
+        self.run_install(self.source, "--remove-desktop", env=env)
+        removed = (hypr / "hyprland.lua").read_text()
+        self.assertNotIn("omabeam", removed)
+        self.assertIn("-- user config", removed)
+
     def test_symlinked_hyprland_lua_is_not_edited_and_prints_both_blocks(self):
         env, hypr = install_env(self.base)
         external = self.base / "external-hyprland.lua"
@@ -417,6 +453,7 @@ path.chmod(0o755)
         # (edit_hypr never edits one file without the other), so the printed
         # guidance must cover both files, not just the one that tripped it.
         self.assertIn('o.window("omabeam"', result.stdout)
+        self.assertIn('o.window("omabeam-send"', result.stdout)
         self.assertIn("o.bind(", result.stdout)
         self.assertIn("bindings.lua", result.stdout)
         self.assertTrue((hypr / "hyprland.lua").is_symlink())
