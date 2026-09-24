@@ -154,7 +154,10 @@ Live options (also apply when opening the picker):
   --h264-bitrate N      Target bits/s for H.264 (default 4000000 at 15 FPS,
                          scaled with FPS up to 16000000)
   --encoder MODE        auto (default), hardware, or software
-  --check-encoders      Test H.264 encoding and report the selected backend
+  --check-encoders [WxH ...]
+                         Test H.264 encoding at 640x360, 1920x1080, and
+                         3840x2160, or at the WxH sizes given, and report
+                         the selected backend
   --cursor              Include cursor
   --bind ADDRESS        Default 0.0.0.0 (local network); 127.0.0.1 for this computer only
   --port N              Default 9847; 0 chooses an available port

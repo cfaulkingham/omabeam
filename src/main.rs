@@ -30,10 +30,10 @@ fn run() -> anyhow::Result<()> {
         return Ok(());
     }
     if args.first().is_some_and(|arg| arg == "--check-encoders") {
-        anyhow::ensure!(args.len() == 1, "unexpected command argument");
+        let sizes = encoder_check_sizes(&args[1..])?;
         println!(
             "{}",
-            serde_json::to_string_pretty(&omabeam::live::probe_encoder(&config)?)?
+            serde_json::to_string_pretty(&omabeam::live::probe_encoder(&config, &sizes)?)?
         );
         return Ok(());
     }
@@ -181,4 +181,58 @@ fn run() -> anyhow::Result<()> {
     }
     omabeam::app::open(options);
     Ok(())
+}
+
+/// Optional `--check-encoders` sizes, which replace the default 640x360,
+/// 1080p, and 4K checks. Width and height are separated by x, X, or ×; a
+/// repeated size is checked once.
+fn encoder_check_sizes(args: &[String]) -> anyhow::Result<Vec<(u32, u32)>> {
+    let mut sizes = Vec::new();
+    for size in args {
+        let parsed = size
+            .split_once(['x', 'X', '×'])
+            .and_then(|(width, height)| Some((width.parse().ok()?, height.parse().ok()?)))
+            .ok_or_else(|| anyhow::anyhow!("invalid size {size}; use WxH, e.g. 1920x1080"))?;
+        if !sizes.contains(&parsed) {
+            sizes.push(parsed);
+        }
+    }
+    Ok(sizes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::encoder_check_sizes;
+
+    fn sizes(args: &[&str]) -> anyhow::Result<Vec<(u32, u32)>> {
+        encoder_check_sizes(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn encoder_check_sizes_accept_any_times_sign_and_skip_repeats() {
+        assert_eq!(sizes(&[]).unwrap(), []);
+        assert_eq!(
+            sizes(&[
+                "2560x1440",
+                "1920X1080",
+                "2560×1440",
+                "1920x1080",
+                "720x1280"
+            ])
+            .unwrap(),
+            [(2560, 1440), (1920, 1080), (720, 1280)]
+        );
+        for bad in [
+            "1920",
+            "1920x",
+            "x1080",
+            "1920x1080x2",
+            "-1x2",
+            "1920*1080",
+            "wxh",
+        ] {
+            let error = sizes(&[bad]).unwrap_err().to_string();
+            assert!(error.contains(bad) && error.contains("WxH"), "{error}");
+        }
+    }
 }
