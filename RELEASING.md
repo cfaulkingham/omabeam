@@ -121,6 +121,10 @@ recipe but does not publish an AUR entry. AUR publishing uses a separate
 repository and account. Pre-release versions produce test bundles without an
 AUR recipe.
 
+`makepkg` records the encoder's required FFmpeg library ABI versions from the
+bundled executable. Rebuild and update `omabeam-bin` when those ABIs change;
+do not bypass pacman's resulting dependency conflict.
+
 Pacman owns the three executables in `/usr/lib/omabeam/`, the `omabeam` command,
 plugin runtime files in `/usr/share/omabeam/plugin/`, and license notices in
 `/usr/share/licenses/omabeam-bin/`. As the desktop user, enable the plugin with:

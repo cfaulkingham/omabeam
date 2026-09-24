@@ -7,6 +7,7 @@ arch=('x86_64' 'aarch64')
 url='https://github.com/cfaulkingham/omabeam'
 license=('MIT')
 depends=('omarchy>=4' 'hyprland' 'bash' 'glibc' 'gcc-libs' 'ffmpeg'
+         'libavcodec.so' 'libavutil.so'
          'fontconfig' 'freetype2' 'wayland' 'libxkbcommon' 'libxkbcommon-x11'
          'libxcb' 'openssl' 'vulkan-icd-loader' 'wl-clipboard' 'rsync' 'jq' 'python')
 provides=("omabeam=$pkgver")
