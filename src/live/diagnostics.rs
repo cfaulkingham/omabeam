@@ -11,6 +11,23 @@ const TIMING_WINDOW: Duration = Duration::from_secs(5);
 const MAX_TIMINGS: usize = 256;
 const RATE_WINDOW: Duration = Duration::from_secs(2);
 const RATE_BUCKET: Duration = Duration::from_millis(250);
+const LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// One log line per interval, so a persistent fault cannot flood the live log.
+#[derive(Default)]
+pub(super) struct LogThrottle(Option<Instant>);
+
+impl LogThrottle {
+    pub(super) fn allow(&mut self, now: Instant) -> bool {
+        let allowed = self
+            .0
+            .is_none_or(|last| now.duration_since(last) >= LOG_INTERVAL);
+        if allowed {
+            self.0 = Some(now);
+        }
+        allowed
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TimingStats {
@@ -35,6 +52,9 @@ pub struct StreamDiagnostics {
     pub frames_sent: u64,
     pub frames_skipped: u64,
     pub write_errors: u64,
+    /// Failed JPEG encodes, counted once per frame: lazy ones and frames capture skipped.
+    #[serde(default)]
+    pub encode_errors: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -225,6 +245,7 @@ pub(super) struct DiagnosticsState {
     encode: Timings,
     delivery: Delivery,
     write_errors: u64,
+    encode_errors: u64,
     next_viewer: u64,
     viewers: BTreeMap<u64, Delivery>,
 }
@@ -238,6 +259,7 @@ impl DiagnosticsState {
             encode: Timings::default(),
             delivery: Delivery::new(now),
             write_errors: 0,
+            encode_errors: 0,
             next_viewer: 1,
             viewers: BTreeMap::new(),
         }
@@ -255,6 +277,10 @@ impl DiagnosticsState {
     pub fn jpeg_encoded(&mut self, now: Instant, bytes: usize, elapsed: Duration) {
         self.jpeg_bytes = bytes;
         self.encode.record(now, elapsed);
+    }
+
+    pub fn jpeg_failed(&mut self) {
+        self.encode_errors += 1;
     }
 
     pub fn add_viewer(&mut self, now: Instant) -> u64 {
@@ -294,6 +320,7 @@ impl DiagnosticsState {
             frames_sent: self.delivery.frames,
             frames_skipped: self.delivery.skipped,
             write_errors: self.write_errors,
+            encode_errors: self.encode_errors,
         }
     }
 
@@ -341,6 +368,16 @@ mod tests {
             timings.record(now, Duration::from_millis(1));
         }
         assert_eq!(timings.0.len(), MAX_TIMINGS);
+    }
+
+    #[test]
+    fn log_throttle_allows_one_line_per_interval() {
+        let now = Instant::now();
+        let mut log = LogThrottle::default();
+        assert!(log.allow(now));
+        assert!(!log.allow(now + Duration::from_secs(9)));
+        assert!(log.allow(now + LOG_INTERVAL));
+        assert!(!log.allow(now + LOG_INTERVAL + Duration::from_secs(1)));
     }
 
     #[test]

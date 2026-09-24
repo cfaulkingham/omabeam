@@ -57,11 +57,15 @@ impl Default for DesktopConfig {
 
 impl DesktopConfig {
     pub fn validate(&self) -> Result<()> {
+        // The only size rule, shared with viewer resizes. H.264 encodes at most
+        // 3840×2160 in either orientation, so an equal-area shape such as
+        // 2880×2880 would silently leave the share on JPEG.
         ensure!(
-            (640..=3840).contains(&self.width)
-                && (480..=3840).contains(&self.height)
-                && u64::from(self.width) * u64::from(self.height) <= 3840 * 2160,
-            "extended display must be at least 640×480 and no larger than 4K (landscape or portrait)"
+            self.width >= 640
+                && self.height >= 480
+                && self.width.max(self.height) <= 3840
+                && self.width.min(self.height) <= 2160,
+            "extended display must be at least 640×480 and fit within 3840×2160 or 2160×3840"
         );
         ensure!(matches!(self.scale, 1 | 2), "desktop scale must be 1 or 2");
         ensure!(
@@ -439,6 +443,30 @@ mod tests {
             ["2160", "3840", "2", "above"],
         ] {
             assert!(DesktopConfig::from_args(&args.map(str::to_owned)).is_ok());
+        }
+    }
+
+    #[test]
+    fn modes_fit_within_3840x2160_in_either_orientation() {
+        // Each equals 4K in area but cannot be encoded as H.264. A script that
+        // asks for one fails at startup instead of silently losing H.264.
+        for args in [
+            ["2880", "2880", "1", "right"],
+            ["2400", "3456", "1", "right"],
+        ] {
+            let error = DesktopConfig::from_args(&args.map(str::to_owned)).unwrap_err();
+            assert!(error.to_string().contains("3840×2160"), "{args:?}: {error}");
+        }
+        for args in [
+            ["640", "3840", "1", "right"],
+            ["3840", "2160", "1", "right"],
+            ["2160", "3840", "1", "right"],
+            ["1920", "1080", "1", "right"],
+        ] {
+            assert!(
+                DesktopConfig::from_args(&args.map(str::to_owned)).is_ok(),
+                "{args:?}"
+            );
         }
     }
 

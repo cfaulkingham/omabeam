@@ -2,7 +2,7 @@ use super::*;
 use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Read, Write},
-    net::{Shutdown, TcpStream},
+    net::{Shutdown, SocketAddr, TcpStream},
     sync::atomic::AtomicUsize,
 };
 
@@ -17,6 +17,9 @@ fn eventually(mut condition: impl FnMut() -> bool) {
     }
 }
 fn exchange(frames: &Arc<FrameState>, request: &[u8]) -> Vec<u8> {
+    exchange_with(frames, false, request)
+}
+fn exchange_with(frames: &Arc<FrameState>, stopped: bool, request: &[u8]) -> Vec<u8> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let frames = frames.clone();
@@ -25,7 +28,7 @@ fn exchange(frames: &Arc<FrameState>, request: &[u8]) -> Vec<u8> {
             listener.accept().unwrap().0,
             "/s/test",
             frames,
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(stopped)),
         )
     });
     let mut socket = TcpStream::connect(address).unwrap();
@@ -35,8 +38,42 @@ fn exchange(frames: &Arc<FrameState>, request: &[u8]) -> Vec<u8> {
     socket.write_all(request).unwrap();
     let mut response = Vec::new();
     socket.read_to_end(&mut response).unwrap();
+    // Close first: a rejection waits for the client to close, up to a deadline.
+    drop(socket);
     worker.join().unwrap();
     response
+}
+
+/// The production accept loop on a loopback port, with the token "test".
+fn serve_loopback(frames: &Arc<FrameState>) -> (SocketAddr, Arc<AtomicBool>, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let (frames, server_stop) = (frames.clone(), stop.clone());
+    let server = thread::spawn(move || http::serve(listener, "test".into(), frames, server_stop));
+    (address, stop, server)
+}
+
+/// Sends a request and reads to EOF. A reset fails the read, and so the test.
+fn round_trip(address: SocketAddr, request: &[u8]) -> Vec<u8> {
+    let mut socket = TcpStream::connect(address).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    socket.write_all(request).unwrap();
+    let mut response = Vec::new();
+    socket.read_to_end(&mut response).unwrap();
+    response
+}
+
+fn post(path: &str, body: usize) -> Vec<u8> {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {body}\r\n\r\n"
+    )
+    .into_bytes();
+    request.resize(request.len() + body, b' ');
+    request
 }
 
 fn desktop_post(frames: &Arc<FrameState>, path: &str, body: serde_json::Value) -> Vec<u8> {
@@ -616,6 +653,8 @@ fn http_validates_methods_routes_and_token_before_serving_frames_or_stats() {
         ("GET /s/test/ HTTP/0.9\r\n\r\n", "400"),
         ("GET /s/test-more/stats HTTP/1.1\r\n\r\n", "404"),
         ("GET /s/wrong/frame.jpg HTTP/1.1\r\n\r\n", "404"),
+        ("GET /s/tesu/stats HTTP/1.1\r\n\r\n", "404"),
+        ("GET /s/tes HTTP/1.1\r\n\r\n", "404"),
         ("GET /stats HTTP/1.1\r\n\r\n", "404"),
         ("GET /s/test HTTP/1.1\r\n\r\n", "302"),
         ("GET /s/test/stats HTTP/1.1\r\n\r\n", "200"),
@@ -623,6 +662,14 @@ fn http_validates_methods_routes_and_token_before_serving_frames_or_stats() {
         let response = exchange(&frames, request.as_bytes());
         assert!(String::from_utf8_lossy(&response).starts_with(&format!("HTTP/1.1 {expected}")));
     }
+    // Only "no frame yet" is worth retrying.
+    assert!(
+        String::from_utf8_lossy(&exchange(
+            &frames,
+            b"GET /s/test/frame.jpg HTTP/1.1\r\n\r\n"
+        ))
+        .contains("\r\nRetry-After: 1\r\n")
+    );
     frames.publish(
         vec![0xff, 0xd8, 0xff, 0xd9],
         1,
@@ -634,17 +681,211 @@ fn http_validates_methods_routes_and_token_before_serving_frames_or_stats() {
             .ends_with(&[0xff, 0xd8, 0xff, 0xd9])
     );
     frames.fail("window closed".into());
+    // An ended share is gone, not temporarily unavailable (this was 503).
     assert!(
         String::from_utf8_lossy(&exchange(
             &frames,
             b"GET /s/test/frame.jpg HTTP/1.1\r\n\r\n"
         ))
-        .starts_with("HTTP/1.1 503")
+        .starts_with("HTTP/1.1 410")
     );
     assert!(
         String::from_utf8_lossy(&exchange(&frames, b"GET /s/test/stats HTTP/1.1\r\n\r\n"))
             .contains("window closed")
     );
+}
+
+#[test]
+fn media_routes_answer_gone_for_an_ended_or_stopping_share() {
+    let frames = Arc::new(FrameState::new("ending".into()));
+    frames.publish(
+        vec![0xff, 0xd8, 0xff, 0xd9],
+        1,
+        1,
+        FrameMeasurement::default(),
+    );
+    // A stopping session serves no media, although a frame is still cached.
+    for route in ["frame.jpg", "stream"] {
+        let reply = exchange_with(
+            &frames,
+            true,
+            format!("GET /s/test/{route} HTTP/1.1\r\n\r\n").as_bytes(),
+        );
+        assert!(reply.starts_with(b"HTTP/1.1 410"), "{route}");
+    }
+    frames.fail("window closed".into());
+    for route in ["frame.jpg", "stream"] {
+        let reply = String::from_utf8_lossy(&exchange(
+            &frames,
+            format!("GET /s/test/{route} HTTP/1.1\r\n\r\n").as_bytes(),
+        ))
+        .into_owned();
+        assert!(reply.starts_with("HTTP/1.1 410"), "{route}: {reply}");
+        assert!(!reply.contains("Retry-After"), "{route}: {reply}");
+    }
+}
+
+#[test]
+fn jpeg_encode_failures_answer_500_count_once_per_frame_and_streams_skip_them() {
+    let frames = Arc::new(FrameState::new("broken encoder".into()));
+    // An out-of-range quality makes the lazy encode fail like an encoder error.
+    let unencodable = || {
+        Some(Arc::new(h264::RawFrame {
+            frame: omabeam_capture::demo_frame(0),
+            config: LiveConfig {
+                quality: 0,
+                ..Default::default()
+            },
+            captured_at: Instant::now(),
+        }))
+    };
+    // Read through JSON: this is what /stats and live.json carry.
+    let encode_errors = |frames: &FrameState| {
+        serde_json::to_value(frames.stats()).unwrap()["diagnostics"]["encode_errors"].clone()
+    };
+    frames.publish_raw(
+        Vec::new(),
+        640,
+        360,
+        FrameMeasurement::default(),
+        unencodable(),
+    );
+    for _ in 0..2 {
+        let reply = exchange(&frames, b"GET /s/test/frame.jpg HTTP/1.1\r\n\r\n");
+        assert!(
+            reply.starts_with(b"HTTP/1.1 500"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    // The failure is remembered for the frame, so the second request did not
+    // encode it again.
+    assert_eq!(encode_errors(&frames), 1);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let (socket, _) = listener.accept().unwrap();
+    let worker_frames = frames.clone();
+    let worker = thread::spawn(move || {
+        http::handle_client(
+            socket,
+            "/s/test",
+            worker_frames,
+            Arc::new(AtomicBool::new(false)),
+        )
+    });
+    client
+        .write_all(b"GET /s/test/stream HTTP/1.1\r\n\r\n")
+        .unwrap();
+    let mut reader = BufReader::new(client);
+    let mut line = String::new();
+    while line != "\r\n" {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(!line.is_empty(), "stream closed in its header");
+    }
+    eventually(|| frames.viewers.load(Ordering::SeqCst) == 1);
+    // Only the stream consumes this frame, so the count shows its own attempt.
+    frames.publish_raw(
+        Vec::new(),
+        640,
+        360,
+        FrameMeasurement::default(),
+        unencodable(),
+    );
+    eventually(|| encode_errors(&frames) == 2);
+    frames.publish(
+        vec![0xff, 0xd8, 0xff, 0xd9],
+        1,
+        1,
+        FrameMeasurement::default(),
+    );
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "--omabeamframe\r\n");
+    while line != "\r\n" {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(!line.is_empty(), "stream closed in a part header");
+    }
+    let mut jpeg = [0; 4];
+    reader.read_exact(&mut jpeg).unwrap();
+    assert_eq!(jpeg, [0xff, 0xd8, 0xff, 0xd9]);
+    reader.get_ref().shutdown(Shutdown::Both).unwrap();
+    drop(reader);
+    worker.join().unwrap();
+
+    // live.json written before this counter existed still parses.
+    let mut old = serde_json::to_value(StreamDiagnostics::default()).unwrap();
+    old.as_object_mut().unwrap().remove("encode_errors");
+    assert_eq!(
+        serde_json::from_value::<StreamDiagnostics>(old).unwrap(),
+        StreamDiagnostics::default()
+    );
+}
+
+#[test]
+fn pre_auth_budget_closes_idle_sockets_and_refuses_the_excess_cleanly() {
+    let frames = Arc::new(FrameState::new("budget".into()));
+    let (address, stop, server) = serve_loopback(&frames);
+    let opened = Instant::now();
+    // Eight silent sockets take this host's whole pre-auth budget.
+    let idle: Vec<_> = (0..8)
+        .map(|_| TcpStream::connect(address).unwrap())
+        .collect();
+    // Beyond it a client reads a 503 and a clean close, never a reset, even
+    // with a request body the server never reads.
+    for request in [&b""[..], &post("/s/test/webrtc/offer", 4096)] {
+        let reply = round_trip(address, request);
+        assert!(
+            reply.starts_with(b"HTTP/1.1 503"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    // Silent sockets end at the two-second header deadline.
+    for mut socket in idle {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(4)))
+            .unwrap();
+        assert_eq!(socket.read(&mut [0; 1]).unwrap(), 0);
+    }
+    let elapsed = opened.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1900) && elapsed < Duration::from_millis(2500),
+        "{elapsed:?}"
+    );
+    // Which frees the budget.
+    assert!(
+        round_trip(address, b"GET /s/test/stats HTTP/1.1\r\n\r\n").starts_with(b"HTTP/1.1 200")
+    );
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
+fn early_rejections_drain_the_body_so_clients_read_the_status_not_a_reset() {
+    let mut frames = FrameState::new("extended".into());
+    frames.desktop = Some(Arc::new(desktop::DesktopControl::new(Default::default())));
+    let frames = Arc::new(frames);
+    let (address, stop, server) = serve_loopback(&frames);
+    for (path, status) in [
+        ("/s/test/webrtc/offer", "409"), // no display lease
+        ("/s/wrong/webrtc/offer", "404"),
+        ("/s/test/stats", "405"),
+    ] {
+        let reply = round_trip(address, &post(path, 4096));
+        assert!(
+            reply.starts_with(format!("HTTP/1.1 {status}").as_bytes()),
+            "{path}: {}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+    stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
 }
 
 #[test]

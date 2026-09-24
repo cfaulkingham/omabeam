@@ -22,12 +22,12 @@ pub use desktop::DesktopStats;
 use diagnostics::FrameMeasurement;
 pub use diagnostics::{StreamDiagnostics, TimingStats, ViewerDiagnostics};
 pub use http::viewer_html;
-use omabeam_capture::{CaptureSession, CapturedFrame};
+use omabeam_capture::{AlphaMode, CaptureOptions, CaptureSession, CapturedFrame};
 use serde::{Deserialize, Serialize};
 use state::FrameState;
 pub use state::StreamStats;
 use std::{
-    io::Read,
+    io::{Read, Write as _},
     net::{IpAddr, TcpListener},
     process::{Command, Stdio},
     sync::{
@@ -42,6 +42,27 @@ pub use webrtc::WebRtcStats;
 const BOUNDARY: &str = "omabeamframe";
 pub const LIVE_PORT: u16 = 9847;
 const ERROR_GRACE: Duration = Duration::from_secs(30);
+
+/// Live and Cast capture. JPEG and H.264 composite over black, so frames
+/// arrive opaque instead of un-premultiplied only to be multiplied again.
+fn stream_options(cursor: bool) -> CaptureOptions {
+    CaptureOptions {
+        cursor,
+        alpha: AlphaMode::Opaque,
+    }
+}
+
+#[cfg(test)]
+mod stream_options_tests {
+    use super::*;
+
+    #[test]
+    fn live_and_cast_capture_opaque_frames() {
+        let options = stream_options(true);
+        assert_eq!((options.cursor, options.alpha), (true, AlphaMode::Opaque));
+        assert!(!stream_options(false).cursor);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LiveSource {
@@ -188,8 +209,16 @@ pub fn run_headless(source: LiveSource, config: LiveConfig) -> Result<()> {
         current_status().is_none(),
         "a share is already running; stop it before starting another"
     );
-    let session = LiveSession::start_with_config(source, config)?;
+    let Some(session) = LiveSession::start_until(source, config, &|| signals.stopped())? else {
+        stopped_while_starting();
+        return Ok(());
+    };
     run_session(session, &signals)
+}
+
+/// A stop during startup is not a failure; the launcher shows this line.
+fn stopped_while_starting() {
+    let _ = writeln!(std::io::stderr(), "Stopped before the share started.");
 }
 
 /// Synthetic frames use the real encoder, HTTP server, viewer accounting, and
@@ -197,7 +226,7 @@ pub fn run_headless(source: LiveSource, config: LiveConfig) -> Result<()> {
 pub fn run_demo(config: LiveConfig) -> Result<()> {
     let signals = signals::SessionSignals::new()?;
     ensure!(current_status().is_none(), "a share is already running");
-    let lock = status::session_lock()?;
+    let lock = status::session_lock_owned()?;
     crate::hypr::desktop::recover()?;
     let mut counter = 0u32;
     let started = Instant::now();
@@ -217,11 +246,11 @@ pub fn run_demo(config: LiveConfig) -> Result<()> {
     run_session(session, &signals)
 }
 
-fn run_session(session: LiveSession, signals: &signals::SessionSignals) -> Result<()> {
+fn run_session(mut session: LiveSession, signals: &signals::SessionSignals) -> Result<()> {
     println!("{}", session.url);
     loop {
         let status = session.status();
-        write_live_status(&status)?;
+        session.status_writer.write(&status)?;
         if let Some(ended) = session.frames.inner.lock().unwrap().ended {
             if ended.elapsed() >= ERROR_GRACE {
                 bail!("{}", status.stats.error.as_deref().unwrap_or("share ended"));
@@ -291,6 +320,7 @@ pub struct LiveSession {
     rtc_worker: Option<JoinHandle<()>>,
     display: Option<Arc<Mutex<crate::hypr::desktop::VirtualDisplay>>>,
     session_lock: Option<std::fs::File>,
+    status_writer: status::StatusWriter,
 }
 
 impl LiveSession {
@@ -299,23 +329,48 @@ impl LiveSession {
     }
 
     pub fn start_with_config(source: LiveSource, config: LiveConfig) -> Result<Self> {
+        Self::start_until(source, config, &|| false)?.context("the share stopped while starting")
+    }
+
+    /// Checks `stopped` between the slow startup steps, so a stop requested
+    /// before the first status write ends startup (`None`) instead of
+    /// publishing a share. Returning early drops the extended display, which
+    /// removes it while the session lock is still held.
+    fn start_until(
+        source: LiveSource,
+        config: LiveConfig,
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Option<Self>> {
         config.validate()?;
-        let lock = status::session_lock()?;
+        let lock = status::session_lock_owned()?;
         crate::hypr::desktop::recover()?;
+        if stopped() {
+            return Ok(None);
+        }
         let display = match &source {
             LiveSource::Extend(config) => Some(Arc::new(Mutex::new(
                 crate::hypr::desktop::VirtualDisplay::create(config)?,
             ))),
             _ => None,
         };
+        if stopped() {
+            return Ok(None);
+        }
         let request = match &display {
             Some(display) => CaptureRequest::Output(display.lock().unwrap().name().to_owned()),
             None => source.request()?,
         };
-        let mut capturer = CaptureSession::new_with_cursor(request.target()?, config.cursor)
-            .context("live share capture initialization failed")?;
+        let mut capturer =
+            CaptureSession::with_options(request.target()?, stream_options(config.cursor))
+                .context("live share capture initialization failed")?;
+        if stopped() {
+            return Ok(None);
+        }
         let started = Instant::now();
         let first = capturer.capture()?;
+        if stopped() {
+            return Ok(None);
+        }
         let desktop = match &source {
             LiveSource::Extend(config) => {
                 Some(Arc::new(desktop::DesktopControl::new(config.clone())))
@@ -340,7 +395,10 @@ impl LiveSession {
                         display.resize(size)?;
                         // Reopen capture after a mode switch to discard in-flight
                         // buffers from the old geometry on either capture protocol.
-                        capturer = CaptureSession::new_with_cursor(request.target()?, cursor)?;
+                        capturer = CaptureSession::with_options(
+                            request.target()?,
+                            stream_options(cursor),
+                        )?;
                         let frame = capturer.capture()?;
                         ensure!(
                             frame.image.dimensions() == (size.width, size.height),
@@ -355,7 +413,7 @@ impl LiveSession {
         )?;
         session.display = display;
         session.session_lock = Some(lock);
-        Ok(session)
+        Ok(Some(session))
     }
 
     fn start_frames(
@@ -425,7 +483,7 @@ impl LiveSession {
                 return Err(error.into());
             }
         };
-        let session = Self {
+        let mut session = Self {
             url,
             title,
             stop,
@@ -435,8 +493,10 @@ impl LiveSession {
             rtc_worker,
             display: None,
             session_lock: None,
+            status_writer: status::StatusWriter::new(),
         };
-        write_live_status(&session.status())?;
+        let status = session.status();
+        session.status_writer.force(&status)?;
         Ok(session)
     }
 
@@ -479,7 +539,8 @@ impl Drop for LiveSession {
         // Release capture before removing its output, while retaining the lock.
         drop(self.display.take());
         if failed {
-            let _ = write_live_status(&self.status());
+            let status = self.status();
+            let _ = self.status_writer.force(&status);
         } else {
             clear_own_status(&self.url);
         }
@@ -501,7 +562,8 @@ fn publish_frame(
     let (width, height) = frame.stream_dimensions(config.max_width, config.pixel_mode)?;
     let jpeg = if !config.webrtc || frames.viewers.load(Ordering::SeqCst) > 0 {
         frame
-            .jpeg_with_mode(config.quality, config.max_width, config.pixel_mode)?
+            .jpeg_with_mode(config.quality, config.max_width, config.pixel_mode)
+            .context(JpegFailed)?
             .0
     } else {
         Vec::new()
@@ -527,12 +589,23 @@ fn publish_frame(
     Ok(())
 }
 
+/// The eager JPEG for a captured frame could not be encoded.
+#[derive(Debug)]
+struct JpegFailed;
+
+impl std::fmt::Display for JpegFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("could not encode a JPEG frame")
+    }
+}
+
 fn capture_loop(
     mut next: impl FnMut(Duration) -> Result<Option<CapturedFrame>>,
     config: LiveConfig,
     frames: Arc<FrameState>,
     stop: Arc<AtomicBool>,
 ) {
+    let mut encode_log = None;
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
             let started = Instant::now();
@@ -541,7 +614,19 @@ fn capture_loop(
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                publish_frame(&frames, frame, &config, capture_wait)?;
+                match publish_frame(&frames, frame, &config, capture_wait) {
+                    // Skip the frame and keep sharing; the next one may encode.
+                    Err(error) if error.is::<JpegFailed>() => {
+                        frames.jpeg_skipped();
+                        if status::log_due(&mut encode_log, Instant::now()) {
+                            let _ = writeln!(
+                                std::io::stderr(),
+                                "live share: skipped a frame: {error:#}"
+                            );
+                        }
+                    }
+                    result => result?,
+                }
             }
             // Viewer changes wake the wait so a new viewer need not wait out
             // a full idle second. Spurious wakeups retain the original deadline.
@@ -589,6 +674,9 @@ pub use status::{
 pub fn stop_and_cleanup() -> Result<bool> {
     let stopped = stop_live_process();
     let _lock = status::session_lock()?;
+    // A share holds this lock for as long as it publishes live.json, so a
+    // record left now is stale: a crash, a reused pid, or an ended share.
+    clear_live_status();
     Ok(crate::hypr::desktop::recover()? || stopped)
 }
 
@@ -597,7 +685,11 @@ pub fn clear_live_status() {
 }
 
 fn clear_own_status(url: &str) {
-    if current_status().is_some_and(|s| s.pid == std::process::id() && s.url == url) {
+    // Match this process's identity rather than liveness, which needs /proc.
+    let own = status::read_status().ok().flatten().is_some_and(|s| {
+        s.pid == std::process::id() && s.starttime == status::self_starttime() && s.url == url
+    });
+    if own {
         clear_live_status();
     }
 }
@@ -642,4 +734,49 @@ pub fn random_token() -> Result<String> {
         .read_exact(&mut bytes)
         .context("could not create share token")?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn a_frame_that_cannot_be_encoded_is_skipped_and_capture_continues() {
+        let frames = Arc::new(FrameState::new("demo".into()));
+        // A viewer paces capture at the stream rate instead of once a second.
+        frames.viewers.store(1, Ordering::SeqCst);
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = LiveConfig {
+            webrtc: false,
+            fps: 60,
+            ..LiveConfig::default()
+        };
+        // Baseline JPEG allows at most 65535 pixels per side.
+        let oversized = CapturedFrame {
+            image: image::RgbaImage::new(65_536, 1),
+            logical_width: 65_536,
+            logical_height: 1,
+        };
+        let mut queue = VecDeque::from([
+            omabeam_capture::demo_frame(1),
+            oversized,
+            omabeam_capture::demo_frame(2),
+        ]);
+        let done = stop.clone();
+        let next = move |_| {
+            let frame = queue.pop_front();
+            if frame.is_none() {
+                done.store(true, Ordering::SeqCst);
+            }
+            Ok(frame)
+        };
+        capture_loop(next, config, frames.clone(), stop);
+        let stats = frames.stats();
+        assert_eq!(stats.state, "live", "{:?}", stats.error);
+        // The good frame after the failure was published.
+        assert_eq!(stats.frames, 2);
+        // /stats counts the skipped frame like a failed lazy encode.
+        assert_eq!(stats.diagnostics.encode_errors, 1);
+    }
 }

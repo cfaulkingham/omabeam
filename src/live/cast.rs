@@ -183,6 +183,7 @@ impl ResumeSession<'_> {
         frames: &FrameState,
         cast: &mut CastStats,
         status: &mut LiveStatus,
+        writer: &mut status::StatusWriter,
     ) -> Result<Option<Helper>> {
         let deadline = Instant::now() + Duration::from_secs(15);
         let cancelled = || -> Result<bool> {
@@ -200,7 +201,7 @@ impl ResumeSession<'_> {
         cast.connection = "reconnecting".into();
         status.stats.viewers = 0;
         status.stats.cast = Some(cast.clone());
-        write_live_status(status)?;
+        writer.force(status)?;
         let mut last_error = String::from("Receiver is unavailable on the local network");
         while Instant::now() < deadline {
             if cancelled()? {
@@ -302,8 +303,28 @@ pub fn run_receiver_demo(id: &str, config: LiveConfig) -> Result<()> {
     run_selected(id, None, config)
 }
 
-fn run_selected(id: &str, source: Option<LiveSource>, config: LiveConfig) -> Result<()> {
-    let receiver = discover(Duration::from_secs(5))?
+/// Held from before any slow startup step until the Cast exits: its stop
+/// signals, and the session lock whose record lets `--stop` find it.
+struct Owner {
+    signals: SessionSignals,
+    _lock: std::fs::File,
+}
+
+/// Takes the session lock before discovery, which runs for seconds, so
+/// `--stop` can find this Cast through the lock record meanwhile. A stop
+/// then ends discovery and startup (`None`) before anything connects.
+fn discover_selected(
+    id: &str,
+    stopped: &dyn Fn() -> bool,
+    discover: impl FnOnce(&dyn Fn() -> Result<bool>) -> Result<Vec<Receiver>>,
+) -> Result<Option<(std::fs::File, Receiver, SocketAddr)>> {
+    let lock = status::session_lock_owned()?;
+    crate::hypr::desktop::recover()?;
+    let receivers = discover(&|| Ok(stopped()))?;
+    if stopped() {
+        return Ok(None);
+    }
+    let receiver = receivers
         .into_iter()
         .find(|r| r.id == id)
         .context("Selected Cast receiver is unavailable; run --cast-devices again")?;
@@ -314,7 +335,25 @@ fn run_selected(id: &str, source: Option<LiveSource>, config: LiveConfig) -> Res
         .or(receiver.addresses.first())
         .copied()
         .context("Receiver has no usable address")?;
-    run(source, receiver, endpoint, config, None)
+    Ok(Some((lock, receiver, endpoint)))
+}
+
+fn run_selected(id: &str, source: Option<LiveSource>, config: LiveConfig) -> Result<()> {
+    config.validate()?;
+    let signals = SessionSignals::new()?;
+    let Some((lock, receiver, endpoint)) =
+        discover_selected(id, &|| signals.stopped(), |cancelled| {
+            discover_until(Duration::from_secs(5), cancelled)
+        })?
+    else {
+        stopped_while_starting();
+        return Ok(());
+    };
+    let owner = Owner {
+        signals,
+        _lock: lock,
+    };
+    run(owner, source, receiver, endpoint, config, None)
 }
 
 /// Explicit development command for exercising the real capture/encoder
@@ -327,7 +366,15 @@ pub fn run_demo(endpoint: SocketAddr, certificate: &Path, config: LiveConfig) ->
         busy: false,
         addresses: vec![endpoint],
     };
-    run(None, receiver, endpoint, config, Some(certificate))
+    config.validate()?;
+    let signals = SessionSignals::new()?;
+    let lock = status::session_lock_owned()?;
+    crate::hypr::desktop::recover()?;
+    let owner = Owner {
+        signals,
+        _lock: lock,
+    };
+    run(owner, None, receiver, endpoint, config, Some(certificate))
 }
 
 struct CaptureWorker {
@@ -345,17 +392,21 @@ impl Drop for CaptureWorker {
     }
 }
 
+/// Callers validate `config`, then take the `Owner` and recover.
 fn run(
+    owner: Owner,
     source: Option<LiveSource>,
     receiver: Receiver,
     endpoint: SocketAddr,
     mut config: LiveConfig,
     certificate: Option<&Path>,
 ) -> Result<()> {
-    config.validate()?;
-    let signals = SessionSignals::new()?;
-    let _lock = status::session_lock()?;
-    crate::hypr::desktop::recover()?;
+    let Owner { signals, _lock } = owner;
+    // Stopped before anything is published, e.g. by --stop via the lock record.
+    if signals.stopped() {
+        stopped_while_starting();
+        return Ok(());
+    }
     config.fps = config.fps.min(30);
     config.webrtc = true; // Request shared raw H.264 frames; no WebRTC service.
     let (width, height) = if config.max_width.is_some_and(|w| w >= 1920) {
@@ -395,7 +446,8 @@ fn run(
             ..Default::default()
         },
     };
-    write_live_status(&session)?;
+    let mut writer = status::StatusWriter::new();
+    writer.force(&session)?;
     let result = (|| -> Result<()> {
         let mut helper = Helper::spawn(&helper_path()?, certificate)?;
         helper.connect(endpoint, &video)?;
@@ -408,7 +460,7 @@ fn run(
             if let Some(event) = helper.event(Duration::from_millis(50))? {
                 apply_event(&event, &mut cast)?;
                 session.stats.cast = Some(cast.clone());
-                write_live_status(&session)?;
+                writer.force(&session)?;
                 if event["event"] == "negotiated" {
                     break receiver_session(&event)?;
                 }
@@ -417,7 +469,11 @@ fn run(
                 }
             }
         };
-        // Do not create an extended output until this receiver accepts media.
+        // Do not create an extended output until this receiver accepts media,
+        // or once the share has been stopped.
+        if signals.stopped() {
+            return Ok(());
+        }
         let _display = match &source {
             Some(LiveSource::Extend(desktop)) => {
                 Some(crate::hypr::desktop::VirtualDisplay::create(desktop)?)
@@ -431,7 +487,7 @@ fn run(
                     None => source.request()?,
                 };
                 Some(
-                    CaptureSession::new_with_cursor(request.target()?, config.cursor)
+                    CaptureSession::with_options(request.target()?, stream_options(config.cursor))
                         .context("Cast capture initialization failed")?,
                 )
             }
@@ -537,7 +593,7 @@ fn run(
                     certificate,
                     id: &receiver_session_id,
                 };
-                match resume.connect(&signals, &frames, &mut cast, &mut session)? {
+                match resume.connect(&signals, &frames, &mut cast, &mut session, &mut writer)? {
                     Some(next) => helper = next,
                     None => return Ok(()),
                 }
@@ -617,7 +673,8 @@ fn run(
                 session.stats.width = width;
                 session.stats.height = height;
                 session.stats.cast = Some(cast.clone());
-                write_live_status(&session)?;
+                // Readiness and connection changes are written at once.
+                writer.write(&session)?;
                 last_status = Instant::now();
             }
             thread::sleep(Duration::from_millis(2));
@@ -646,7 +703,7 @@ fn run(
             session.stats.error = Some(format!("Casting stopped: {error:#}"));
             cast.connection = "failed".into();
             session.stats.cast = Some(cast);
-            let _ = write_live_status(&session);
+            let _ = writer.force(&session);
             Err(error)
         }
     }
@@ -782,6 +839,66 @@ mod tests {
         let mut floor = stats(400_000);
         apply_event(&feedback(400_000, 1, 0), &mut floor).unwrap();
         assert_eq!(floor.target_bitrate, 300_000);
+    }
+
+    fn receiver(id: &str, addresses: &[&str]) -> Receiver {
+        Receiver {
+            id: id.into(),
+            name: "Living room".into(),
+            model: "Chromecast".into(),
+            busy: false,
+            addresses: addresses.iter().map(|a| a.parse().unwrap()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_stop_during_discovery_ends_startup_before_connecting() {
+        status::tests::with_runtime(|root| {
+            let stop = std::cell::Cell::new(false);
+            let record = root.join("omabeam/session.lock");
+            let selected = discover_selected("tv", &|| stop.get(), |cancelled| {
+                // `--stop` finds a Cast that is still discovering through the
+                // record in the lock it holds.
+                assert!(status::session_lock().is_err(), "lock not held");
+                let owner = format!("{} {}\n", std::process::id(), status::self_starttime());
+                assert_eq!(std::fs::read_to_string(&record).unwrap(), owner);
+                assert!(!cancelled()?);
+                stop.set(true); // --stop's SIGTERM
+                assert!(cancelled()?, "a stop must end discovery early");
+                Ok(Vec::new()) // Nothing found yet.
+            });
+            assert!(selected.unwrap().is_none());
+            assert!(status::read_status().unwrap().is_none());
+            // Startup released the lock.
+            drop(status::tests::session_lock_when_free());
+        });
+    }
+
+    #[test]
+    fn discovery_selects_the_receiver_by_id_and_prefers_ipv4() {
+        let found = || {
+            Ok(vec![
+                receiver("other", &["192.0.2.9:8009"]),
+                receiver("tv", &["[2001:db8::1]:8009", "192.0.2.1:8009"]),
+            ])
+        };
+        status::tests::with_runtime(|_| {
+            let (_lock, chosen, endpoint) = discover_selected("tv", &|| false, |_| found())
+                .unwrap()
+                .unwrap();
+            assert_eq!(chosen.id, "tv");
+            assert_eq!(endpoint, "192.0.2.1:8009".parse().unwrap());
+        });
+        // A fresh lock file: a child another test spawns may still share the
+        // lock above for a moment after it is dropped.
+        status::tests::with_runtime(|_| {
+            let error = discover_selected("gone", &|| false, |_| found()).unwrap_err();
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("Selected Cast receiver is unavailable"),
+                "{error}"
+            );
+        });
     }
 
     #[test]

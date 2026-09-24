@@ -6,14 +6,45 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 
 BINARY = str(Path('target/debug/omabeam').resolve())
+# --stop and --status identify share processes through /proc.
+LINUX = sys.platform.startswith('linux')
+
+
+def wait_for(check, timeout):
+    deadline = time.monotonic() + timeout
+    while not check():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(.01)
+    return True
+
+
+def all_threads_stopped(pid):
+    """Every thread of `pid` is in a job-control stop (SIGSTOP)."""
+    for task in Path(f'/proc/{pid}/task').iterdir():
+        try:
+            state = Path(task, 'stat').read_text().rsplit(')', 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # The thread exited after the listing; it cannot run.
+        if state != 'T':
+            return False
+    return True
+
+
+def signal_pending(pid, sig):
+    """`sig` was sent to `pid` and not yet handled."""
+    return any(line.startswith(('ShdPnd:', 'SigPnd:')) and int(line.split(':', 1)[1], 16) >> (sig - 1) & 1
+               for line in Path(f'/proc/{pid}/status').read_text().splitlines())
 
 
 def monitor(name, width=1920, height=1080, scale=1, x=0, y=0):
@@ -236,6 +267,102 @@ class ExtendedDesktop(unittest.TestCase):
                 result = self.run_cli(*args)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn('already running or starting', result.stderr)
+        self.assertEqual(self.compositor.commands, [])
+
+    def test_a_signal_during_startup_unwinds_before_capture(self):
+        self.compositor.hold_create = True
+        share = subprocess.Popen([BINARY, '--port', '0', '--live', 'extend', '1920', '1080', '1', 'right'],
+            env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(self.compositor.created.wait(5))
+            share.terminate()  # Queued before the compositor answers.
+            self.compositor.release.set()
+            error = share.communicate(timeout=15)[1]
+        finally:
+            if share.poll() is None:
+                share.kill()
+                share.wait()
+            self.compositor.release.set()
+        self.assertEqual(share.returncode, 0, error)
+        self.assertIn('Stopped before the share started.', error)
+        self.assertNotIn('capture initialization failed', error)
+        self.assertEqual(list(self.compositor.outputs), ['DP-1'])
+        self.assertFalse(self.journal.exists())
+        self.assertFalse((self.root / 'omabeam/live.json').exists())
+        commands = self.compositor.commands
+        removes = [i for i, command in enumerate(commands) if command.startswith('/output remove ')]
+        self.assertTrue(removes, commands)
+        self.assertEqual(commands[-1], '/reload')
+        self.assertLess(removes[-1], commands.index('/reload'), commands)
+
+    @unittest.skipUnless(LINUX, 'finding the starting share needs /proc')
+    def test_stop_during_startup_ends_the_share_and_removes_its_display(self):
+        self.compositor.hold_create = True
+        share = subprocess.Popen([BINARY, '--port', '0', '--live', 'extend', '1920', '1080', '1', 'right'],
+            env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        stop = None
+        try:
+            self.assertTrue(self.compositor.created.wait(5))
+            # Nothing is published yet; --stop must find the share through its lock.
+            self.assertFalse((self.root / 'omabeam/live.json').exists())
+            # Stopped, the share leaves --stop's SIGTERM pending where the test
+            # can see it, instead of handling it at once. Creation is released
+            # only after that, so the share cannot reach capture first.
+            share.send_signal(signal.SIGSTOP)
+            self.assertTrue(wait_for(lambda: all_threads_stopped(share.pid), .5))
+            stop = subprocess.Popen([BINARY, '--stop'], env=self.env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # Bounded, so creation is still released well inside the share's
+            # 5 s Hyprland IPC timeout.
+            signaled = wait_for(lambda: signal_pending(share.pid, signal.SIGTERM), 2.5)
+            share.send_signal(signal.SIGCONT)
+            self.assertTrue(signaled, '--stop did not signal the starting share')
+            self.compositor.release.set()
+            stopped, stop_error = stop.communicate(timeout=15)
+            share_error = share.communicate(timeout=15)[1]
+        finally:
+            for process in (share, stop):
+                if process is not None and process.poll() is None:
+                    process.kill()
+                    process.wait()
+            self.compositor.release.set()
+        self.assertEqual(stop.returncode, 0, stop_error)
+        self.assertEqual(stopped.strip(), 'stopped', stop_error)
+        # The share saw the stop before capture started, rather than failing there.
+        self.assertEqual(share.returncode, 0, share_error)
+        self.assertNotIn('capture initialization failed', share_error)
+        self.assertEqual(list(self.compositor.outputs), ['DP-1'])
+        self.assertFalse(self.journal.exists())
+        self.assertFalse((self.root / 'omabeam/live.json').exists())
+        commands = self.compositor.commands
+        removes = [i for i, command in enumerate(commands) if command.startswith('/output remove ')]
+        self.assertTrue(removes, commands)
+        self.assertEqual(commands[-1], '/reload')
+        self.assertLess(removes[-1], commands.index('/reload'), commands)
+
+    @unittest.skipUnless(LINUX, 'process start times come from /proc')
+    def test_a_record_naming_a_reused_pid_is_stale(self):
+        sleeper = subprocess.Popen(['sleep', '30'])
+        self.addCleanup(sleeper.wait)
+        self.addCleanup(sleeper.kill)
+        stat = Path(f'/proc/{sleeper.pid}/stat').read_text()
+        started = int(stat.rsplit(')', 1)[1].split()[19])
+        directory = self.root / 'omabeam'
+        directory.mkdir(mode=0o700)
+        record = directory / 'live.json'
+        # A crashed share's pid, now reused by a process that started later.
+        record.write_text(json.dumps(dict(
+            pid=sleeper.pid, starttime=started - 1, url='http://127.0.0.1:9847/s/' + '0' * 32 + '/',
+            title='Output DP-1', fps=0.0, width=640, height=360, frames=1, uptime=1, viewers=0,
+            source='Output DP-1', state='live', error=None)))
+        record.chmod(0o600)
+        result = self.run_cli('--status')
+        self.assertEqual(result.returncode, 1, result.stdout)
+        result = self.run_cli('--stop')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'not live')
+        self.assertFalse(record.exists())
+        self.assertIsNone(sleeper.poll(), 'an unrelated process was signaled')
         self.assertEqual(self.compositor.commands, [])
 
     def test_invalid_config_and_foreign_display_journal_never_mutate(self):

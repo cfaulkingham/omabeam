@@ -246,6 +246,11 @@ function randomId() {
 }
 let clientIdentity = randomId(), connectionIdentity = randomId();
 let ownsDesktop = false, desktopBlocked = false, claiming = null;
+// Bumped by each claim and each real conflict, so a lease reply sent before
+// either is recognized as late. A toggled size choice, or one refused only
+// because the lease lapsed, stays owed until the host answers one, so a
+// debounce reschedules it rather than cancels it.
+let leaseGeneration = 0, resizeOwed = false;
 let matchEnabled = false, matchTimer = null, lastSizeRequest = null, resizing = false;
 try {
   clientIdentity = sessionStorage.getItem(identityKey) || clientIdentity;
@@ -259,8 +264,16 @@ async function desktopRequest(action, body = {}, connection = connectionIdentity
   return fetch('desktop/' + action, {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({...body, connection}), signal: AbortSignal.timeout(4000)});
 }
+// 412: only this page's lease lapsed (an outage longer than its grace period)
+// and nobody took the display. Drop it without the in-use overlay; connect()
+// claims it again. The host already dropped this lease's media.
+function leaseLapsed(connection, generation) {
+  if (connection !== connectionIdentity || generation !== leaseGeneration) return false;
+  ownsDesktop = false;
+  return true;
+}
 function showDesktopBlocked() {
-  ownsDesktop = false; desktopBlocked = true;
+  ownsDesktop = false; desktopBlocked = true; leaseGeneration++; resizeOwed = false;
   renderSetup();
   stopPlayback(); clearTimeout(retry); retry = null;
   stage.classList.add('blocked');
@@ -286,12 +299,12 @@ async function claimDesktop() {
     if (connection !== connectionIdentity || paused || ended) return false;
     if (response.status === 409) { showDesktopBlocked(); return false; }
     if (!response.ok) throw new Error(await response.text());
-    ownsDesktop = true; desktopBlocked = false; lastSizeRequest = null;
+    ownsDesktop = true; desktopBlocked = false; lastSizeRequest = null; leaseGeneration++;
     stage.classList.remove('blocked');
     transport.disabled = false; matchDevice.disabled = false;
     document.getElementById('snapshot').href = mediaUrl('frame.jpg');
     renderDesktop(await response.json());
-    if (matchEnabled) scheduleMatch();
+    if (matchEnabled || resizeOwed) scheduleMatch();
     tryDesktopFullscreen();
     return true;
   })();
@@ -328,7 +341,7 @@ function requestedDeviceSize() {
 }
 function scheduleMatch() {
   clearTimeout(matchTimer);
-  if (!ownsDesktop || paused || ended || !matchEnabled) return;
+  if (!ownsDesktop || paused || ended || !(matchEnabled || resizeOwed)) return;
   matchTimer = setTimeout(() => resizeDesktop(), 800);
 }
 async function resizeDesktop() {
@@ -336,14 +349,16 @@ async function resizeDesktop() {
   const size = matchEnabled ? requestedDeviceSize() : null;
   const key = JSON.stringify(size);
   if (lastSizeRequest === key) return;
-  const connection = connectionIdentity;
+  const connection = connectionIdentity, generation = leaseGeneration;
   resizing = true;
   try {
     const response = await desktopRequest('size', {size}, connection);
+    // Checked before ownership: a heartbeat may already have dropped this lapsed lease.
+    if (response.status === 412) { if (leaseLapsed(connection, generation)) resizeOwed = true; return; }
     if (connection !== connectionIdentity || !ownsDesktop) return;
     if (response.status === 409) { showDesktopBlocked(); return; }
     if (response.status === 429) { matchTimer = setTimeout(() => resizeDesktop(), 1000); return; }
-    lastSizeRequest = key;
+    lastSizeRequest = key; resizeOwed = false;
     if (!response.ok) throw new Error(await response.text());
     renderDesktop(await response.json());
   } catch (failure) { desktopNote.textContent = failure.message || 'Could not resize the desktop.'; }
@@ -358,7 +373,7 @@ async function resizeDesktop() {
 }
 matchDevice.onclick = () => {
   dismissSetup();
-  matchEnabled = !matchEnabled; lastSizeRequest = null;
+  matchEnabled = !matchEnabled; lastSizeRequest = null; resizeOwed = true;
   try { sessionStorage.setItem(matchKey, String(matchEnabled)); } catch {}
   renderDesktop(latestStats.desktop);
   clearTimeout(matchTimer); matchTimer = setTimeout(() => resizeDesktop(), 800);
@@ -685,12 +700,13 @@ async function poll() {
     renderDesktop(stats.desktop);
     if (stats.desktop && stats.state !== 'ended' && !paused) {
       if (ownsDesktop) {
-        const connection = connectionIdentity;
+        const connection = connectionIdentity, generation = leaseGeneration;
         const heartbeat = await desktopRequest('heartbeat', {}, connection);
         if (connection === connectionIdentity && heartbeat.status === 409) showDesktopBlocked();
+        else if (heartbeat.status === 412) leaseLapsed(connection, generation);
         else if (!heartbeat.ok) throw new Error('Could not renew display connection');
       }
-      // Also resumes a desktop share after an outage released the lease.
+      // Also resumes a desktop share after an outage released or lapsed the lease.
       if (!ownsDesktop) await connect();
     }
     failures = 0; lastPollOk = performance.now();

@@ -80,6 +80,18 @@ class Fixture:
         return json.loads(body)
 
 
+def watch_overlay(page):
+    # Class records keep their old value, so a blocked/unreachable state that
+    # appears and clears within one task is still recorded.
+    page.evaluate("""() => {
+        window.overlaySeen = false;
+        const shown = value => /\\b(blocked|unreachable)\\b/.test(value || '');
+        new MutationObserver(records => {
+            overlaySeen ||= shown(stage.className) || records.some(record => shown(record.oldValue));
+        }).observe(stage, {attributes: true, attributeFilter: ['class'], attributeOldValue: true});
+    }""")
+
+
 def leave_fullscreen(page):
     # Chrome can retain user activation across refresh/resume, allowing the
     # viewer's automatic fullscreen request. Header controls are then covered.
@@ -95,18 +107,24 @@ def check_setup(browser, artifacts):
     desktop = dict(config=dict(width=1280, height=720, scale=1), updating=False, error=None)
     stats = dict(state='live', width=1280, height=720, fps=30.0, viewers=1,
                  source='Test share', error='Capture warning')
-    claims, requests, errors = [], [], []
+    claims, requests, errors, heartbeats, restores, sized = [], [], [], [], [], []
     context = browser.new_context(viewport={'width': 320, 'height': 640})
 
     def respond(route):
         path = route.request.url.split('/')[-1].split('?')[0]
         requests.append(path)
+        if path == 'size':
+            sized.append(json.loads(route.request.post_data)['size'])  # None restores the host size.
         if route.request.url.endswith('/'):
             route.fulfill(content_type='text/html', body=html)
         elif path == 'stats':
             route.fulfill(json=stats)
         elif path == 'claim':
             claims.append(route)  # Explicitly hold the lease response.
+        elif path == 'heartbeat' and heartbeats:
+            route.fulfill(status=heartbeats.pop(0))
+        elif path == 'size' and restores and json.loads(route.request.post_data)['size'] is None:
+            route.fulfill(status=restores.pop(0))  # Only a host-size restore.
         elif path in ('heartbeat', 'size', 'release'):
             route.fulfill(json=desktop)
         elif path == 'stream':
@@ -180,6 +198,20 @@ def check_setup(browser, artifacts):
     assert page.evaluate('fullscreenCalls') == 0
     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
     page.screenshot(path=str(artifacts / 'first-visit-desktop-mobile.png'), full_page=True)
+    # 412: this page's own lease lapsed and nobody else took the display. The
+    # page claims it again and restarts media without the in-use overlay.
+    watch_overlay(page)
+    start = len(requests)
+    heartbeats.append(412)
+    eventually(lambda: page.wait_for_timeout(50) or bool(claims))
+    after = requests[start:]
+    assert 'heartbeat' in after and after.index('heartbeat') < after.index('claim'), after
+    assert page.evaluate('!ownsDesktop && !desktopBlocked && !overlaySeen')
+    claimed = len(requests)
+    claims.pop(0).fulfill(json=desktop)
+    page.wait_for_function("ownsDesktop && playback === 'jpeg'")
+    eventually(lambda: page.wait_for_timeout(50) or 'stream' in requests[claimed:])
+    assert not page.evaluate('overlaySeen || desktopBlocked')
     # A heartbeat conflict must immediately remove an already-visible setup.
     page.evaluate('showDesktopBlocked()')
     assert page.locator('#viewer-setup').is_hidden()
@@ -194,6 +226,35 @@ def check_setup(browser, artifacts):
     page.wait_for_function('ended')
     assert page.locator('#viewer-setup').is_hidden()
     assert not claims
+
+    # 412 on a size request: drop the lapsed lease quietly, claim it again, then
+    # retry the owed size. Turning matching off (a restore) is the case that
+    # the claim path alone would not resend.
+    stats['state'] = 'live'
+    page.goto('http://viewer.test/desktop-size/')
+    eventually(lambda: page.wait_for_timeout(50) or bool(claims))
+    claims.pop(0).fulfill(json=desktop)
+    page.locator('#setup-match').click()
+    page.wait_for_function("matchEnabled && lastSizeRequest !== null && !resizing")
+    watch_overlay(page)
+    restores.append(412)
+    page.locator('#match-device').click()
+    eventually(lambda: page.wait_for_timeout(50) or bool(claims))
+    assert not restores
+    assert page.evaluate('!matchEnabled && !ownsDesktop && !desktopBlocked && !overlaySeen')
+    claimed = len(requests)
+    claims.pop(0).fulfill(json=desktop)
+    page.wait_for_function("ownsDesktop && lastSizeRequest === 'null'")
+    assert 'size' in requests[claimed:]
+    assert not page.evaluate('overlaySeen || desktopBlocked')
+    # Turning matching off owes the host a restore. A resize inside the 800 ms
+    # debounce reschedules it; it must not cancel it.
+    page.locator('#match-device').click()
+    page.wait_for_function("matchEnabled && lastSizeRequest?.startsWith('{') && !resizing && !resizeOwed")
+    before = len(sized)
+    page.evaluate("() => { matchDevice.click(); dispatchEvent(new Event('resize')); }")
+    eventually(lambda: page.wait_for_timeout(50) or None in sized[before:])
+    page.wait_for_function("!matchEnabled && lastSizeRequest === 'null' && !resizeOwed")
 
     # Storage may be denied in embedded/private contexts; dismissal still works
     # for this page, and the no-API fullscreen fallback is unchanged.
@@ -212,7 +273,7 @@ def check_setup(browser, artifacts):
     assert page.locator('#viewer-setup').is_hidden()
     assert not errors, errors
     context.close()
-    print('PASS viewer setup: lease gating, blocked/ended, regular sharing, mobile, keyboard, per-tab/path refresh, fullscreen fallbacks, unavailable storage, visible errors')
+    print('PASS viewer setup: lease gating, blocked/ended, lapsed-lease reclaim (heartbeat and size), restore survives a resize, regular sharing, mobile, keyboard, per-tab/path refresh, fullscreen fallbacks, unavailable storage, visible errors')
 
 
 def check_browser(fixture, browser, artifacts):
@@ -316,12 +377,31 @@ def check_browser(fixture, browser, artifacts):
     second.wait_for_function("video.videoHeight === Math.floor(stage.getBoundingClientRect().height * 2 / 2) * 2")
     second.locator('#exit').click()
     second.wait_for_function("video.videoHeight === Math.floor(stage.getBoundingClientRect().height * 2 / 2) * 2")
+
+    # An outage longer than the lease grace but shorter than the viewer's
+    # unreachable limit. The host answers 412 for the page's own lapsed lease,
+    # not "another device"; the page claims it again and resumes H.264.
+    second.wait_for_function("ownsDesktop && playback === 'webrtc' && peerId !== null")
+    watch_overlay(second)
+    previous_peer = second.evaluate('peerId')
+    replies = []
+    second.on('response', lambda response: replies.append((response.url.rsplit('/', 1)[-1], response.status))
+              if '/desktop/' in response.url else None)
+    second.route('**/*', lambda route: route.abort())
+    eventually(lambda: second.wait_for_timeout(100) or not fixture.stats()['desktop']['occupied'], timeout=25)
+    second.unroute('**/*')
+    second.wait_for_function(f"ownsDesktop && playback === 'webrtc' && peerId !== null && peerId !== {json.dumps(previous_peer)}",
+                             timeout=25000)
+    assert ('heartbeat', 412) in replies, replies
+    assert replies[replies.index(('heartbeat', 412)) + 1] == ('claim', 200), replies
+    assert not second.evaluate('overlaySeen || desktopBlocked || unreachable')
+    assert fixture.stats()['desktop']['occupied']
     second_context.close()
     first_context.close()
     assert not errors, errors
     physical = fixture.compositor.outputs['DP-1']
     assert (physical['width'], physical['height'], physical['x'], physical['y'], physical['scale']) == (1920, 1080, 0, 0, 1)
-    print('PASS extended viewer: exclusive ownership, duplicate tabs, blocked media, refresh, transport switching, pause/resume, resize, rollback, host-size restore, disconnect grace, HiDPI, portrait, fullscreen, cleanup')
+    print('PASS extended viewer: exclusive ownership, duplicate tabs, blocked media, refresh, transport switching, pause/resume, resize, rollback, host-size restore, disconnect grace, HiDPI, portrait, fullscreen, lapsed-lease reclaim after an outage, cleanup')
 
 
 def main():
