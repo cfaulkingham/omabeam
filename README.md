@@ -23,9 +23,22 @@ device. Browser viewers do not need an app.
 
 ## Install
 
-Run the installer inside Omarchy / Hyprland with Lua configuration. It needs
-`wl-copy`, `rsync`, `jq`, Python 3, and the Omarchy shell commands. Viewers need
-a browser and access to the host on the local network.
+Run this in a terminal as your normal desktop user on Omarchy:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cfaulkingham/omabeam/main/install-release.sh | bash
+```
+
+The [installer](install-release.sh) installs the prebuilt `omabeam-bin` package
+and its dependencies, then enables the bar plugin and desktop integration.
+It includes the hardware encoder and experimental Google Cast helper. No Rust
+or Cast SDK build is needed. It prompts for sudo and package confirmation;
+network access is configured by the usual plugin installer. Run the same command
+again to update. Existing Git-managed plugin installs must be removed with
+Omarchy's plugin commands before switching to this package.
+
+Supports x86_64 and experimental ARM64 on an existing compatible Omarchy
+installation. Viewers need a browser and access to the host on the local network.
 
 ### From source
 

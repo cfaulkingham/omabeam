@@ -6,6 +6,12 @@ on:
 permissions:
   contents: read
 jobs:
+  release-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n install-release.sh
+      - run: python3 tests/bootstrap.py
   omarchy-ui:
     runs-on: ubuntu-latest
     steps:
