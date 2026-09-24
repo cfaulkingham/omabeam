@@ -1,0 +1,38 @@
+pkgbase = omabeam-bin
+	pkgdesc = Window, screen, area and Google Cast sharing for Omarchy
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/cfaulkingham/omabeam
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	depends = omarchy>=4
+	depends = hyprland
+	depends = bash
+	depends = glibc
+	depends = gcc-libs
+	depends = ffmpeg
+	depends = libavcodec.so
+	depends = libavutil.so
+	depends = fontconfig
+	depends = freetype2
+	depends = wayland
+	depends = libxkbcommon
+	depends = libxkbcommon-x11
+	depends = libxcb
+	depends = openssl
+	depends = vulkan-icd-loader
+	depends = wl-clipboard
+	depends = rsync
+	depends = jq
+	depends = python
+	provides = omabeam=0.1.0
+	conflicts = omabeam
+	options = !strip
+	options = !debug
+	source_x86_64 = https://github.com/cfaulkingham/omabeam/releases/download/v0.1.0/omabeam-0.1.0-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = 150dd28628ea7856a486dcb211289ca523cd0bd35e4bd216804288b48113a155
+	source_aarch64 = https://github.com/cfaulkingham/omabeam/releases/download/v0.1.0/omabeam-0.1.0-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = a7ec44ed3c3daf262d004f62b61fa66adf478fbdd1e017fbe03d6e3659cf0b21
+
+pkgname = omabeam-bin

@@ -102,9 +102,14 @@ Executables use system libraries; check the matching
 
 ## AUR binary package
 
-The generated package is named **`omabeam-bin`** and includes Cast. Its
-template is `packaging/aur/PKGBUILD.in`; do not submit that unrendered template
-to AUR. After downloading both bundles and their checksums into `dist/`:
+The package is named **`omabeam-bin`** and includes Cast. The concrete
+`packaging/aur/PKGBUILD` and `.SRCINFO` track the published release and can be
+used directly with `makepkg -si`. Their source URLs point to public GitHub
+release assets.
+
+For a new release, regenerate them from `packaging/aur/PKGBUILD.in`; do not
+submit that unrendered template to AUR. After downloading both bundles and
+their checksums into `dist/`:
 
 ```bash
 python3 scripts/release-assets.py
@@ -120,6 +125,10 @@ the generated `PKGBUILD` and `.SRCINFO` to AUR. The workflow generates the
 recipe but does not publish an AUR entry. AUR publishing uses a separate
 repository and account. Pre-release versions produce test bundles without an
 AUR recipe.
+
+After publishing and checking downloads from a clean directory, copy the
+generated `PKGBUILD` and `.SRCINFO` into `packaging/aur/` and commit them so
+repository users receive the same version and checksums as the release.
 
 `makepkg` records the encoder's required FFmpeg library ABI versions from the
 bundled executable. Rebuild and update `omabeam-bin` when those ABIs change;
