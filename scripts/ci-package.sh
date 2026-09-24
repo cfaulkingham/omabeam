@@ -31,8 +31,8 @@ target/release-qa/bin/pip install 'Pillow>=10,<13' 'playwright>=1.50,<2'
 target/release-qa/bin/python tests/smoke.py --binary "$binary" --browser --browser-executable /usr/bin/chromium
 target/release-qa/bin/python tests/webrtc.py --binary "$binary" --browser-executable /usr/bin/chromium
 
-cargo install cargo-bundle-licenses --locked
-cargo bundle-licenses --format yaml --output target/THIRDPARTY.yml
+cargo install cargo-bundle-licenses --locked --root target/release-tools
+target/release-tools/bin/cargo-bundle-licenses bundle-licenses --format yaml --output target/THIRDPARTY.yml
 python scripts/package-plugin.py --binary "$binary" --encoder-helper "$encoder" \
   --cast-helper "$cast" --cast-licenses target/cast/notices \
   --target "$target" --licenses target/THIRDPARTY.yml

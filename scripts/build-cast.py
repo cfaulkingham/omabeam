@@ -225,6 +225,8 @@ def main():
     options = parser.parse_args()
     if platform.system() not in ("Darwin", "Linux"):
         parser.error("The native Cast helper currently builds on Linux and macOS")
+    if platform.system() == "Linux" and platform.machine() != "x86_64":
+        parser.error("The pinned Linux build tools require x86_64; build ARM64 there with --target-cpu arm64")
     if options.jobs < 1:
         parser.error("--jobs must be positive")
     if options.target_cpu and (platform.system() != "Linux" or platform.machine() != "x86_64"):

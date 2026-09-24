@@ -133,6 +133,9 @@ bundle installation, verify and extract the new bundle and rerun its
 `./install.sh`. The installer refuses to overwrite a Git-managed installation
 from another directory; update that checkout instead.
 
+For `omabeam-bin` installations, update the package and rerun
+`bash /usr/share/omabeam/plugin/install.sh` to refresh the user plugin.
+
 ## Share your screen
 
 1. Open OmaBeam from the bar or **Super + Shift + T**.
@@ -317,6 +320,9 @@ Skip `--remove-desktop` if you used only `--backend-only` or copied a bundle
 without running the full installer. If removing the rules by hand, delete the
 blocks marked `-- omabeam (install.sh)` from `hyprland.lua` and `bindings.lua`,
 then reload Hyprland. Removing the plugin alone does not stop a detached share.
+
+If you installed `omabeam-bin`, also remove the system package with
+`sudo pacman -R omabeam-bin` after removing the user plugin.
 
 Screenshots, `~/.config/omabeam/` (saved settings and the LocalSend identity),
 firewall rules, and any portal-picker configuration remain. `XDG_CONFIG_HOME`
