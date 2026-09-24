@@ -5,5 +5,8 @@ OMABEAM_PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -x "$OMABEAM_PLUGIN_DIR/native/bin/omabeam" ]]; then
   exec "$OMABEAM_PLUGIN_DIR/native/bin/omabeam" "$@"
 fi
+if [[ -x /usr/lib/omabeam/omabeam ]]; then
+  exec /usr/lib/omabeam/omabeam "$@"
+fi
 echo 'OmaBeam needs its native app. Run ./install.sh --backend-only in the plugin folder, then check status again.' >&2
 exit 127

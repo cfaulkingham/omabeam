@@ -42,6 +42,7 @@ jobs:
       - run: python tests/extended_desktop.py --binary target/debug/omabeam
       - run: python tests/hardware_encoding.py --binary target/debug/omabeam
       - run: python tests/packaging.py
+      - run: python tests/release.py
       - run: python -m pip install 'Pillow>=10,<13' 'playwright>=1.50,<2'
       - run: python -m playwright install --with-deps chromium chrome
       - run: python tests/smoke.py --binary target/debug/omabeam --browser
