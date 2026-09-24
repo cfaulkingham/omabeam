@@ -18,6 +18,7 @@ HYPRLAND_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/hyprland.lua"
 BINDINGS_LUA="${XDG_CONFIG_HOME:-$HOME/.config}/hypr/bindings.lua"
 SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 BIN="$PLUGIN_DIR/omarchy-plugin/omabeam"
+NATIVE="$ROOT/omarchy-plugin/native/bin/omabeam"
 BIND_KEYS="SUPER + SHIFT + T"
 USAGE="Usage: ./install.sh [--backend-only|--remove-desktop|--check-ports] [--with-cast] [--subnet CIDR|--open-firewall CIDR]"
 
@@ -28,6 +29,7 @@ REMOVE_DESKTOP=false
 CHECK_PORTS=false
 OPEN_FIREWALL=false
 WITH_CAST=false
+HYPR_MANUAL=false
 MODE=install
 FIREWALL_ARGS=()
 while [[ $# -gt 0 ]]; do
@@ -98,7 +100,12 @@ plugin_on_bar() {
 
 edit_hypr() {
   local action=$1
-  python3 - "$HYPRLAND_LUA" "$BINDINGS_LUA" "$BIN" "$action" "$BIND_KEYS" <<'PY'
+  # The plugin launcher may not exist yet (a full install edits Hyprland
+  # before staging plugin files), so IPC prefers the just-built native binary
+  # and falls back to the installed launcher only when that binary is absent.
+  local ipc_bin=$BIN
+  [[ -x $NATIVE ]] && ipc_bin=$NATIVE
+  python3 - "$HYPRLAND_LUA" "$BINDINGS_LUA" "$BIN" "$ipc_bin" "$action" "$BIND_KEYS" <<'PY'
 import json
 import os
 import re
@@ -106,8 +113,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 
-hypr_path, bind_path, binary, action, bind_keys = sys.argv[1:6]
+hypr_path, bind_path, bind_binary, ipc_binary, action, bind_keys = sys.argv[1:7]
 MAX = 1_048_576
 WINDOW = """-- omabeam (install.sh)
 o.window("omabeam", {
@@ -121,7 +129,7 @@ o.window("omabeam", {
 """
 BIND = (
     "-- omabeam (install.sh)\n"
-    f'o.bind({json.dumps(bind_keys)}, "OmaBeam", {{ launch = {json.dumps(binary)} }})\n'
+    f'o.bind({json.dumps(bind_keys)}, "OmaBeam", {{ launch = {json.dumps(bind_binary)} }})\n'
 )
 WINDOW_RE = re.compile(
     r"-- omabeam \(install.sh\)\n"
@@ -192,8 +200,48 @@ def atomic_write(path, text):
                 pass
 
 
-hypr = read_file(hypr_path)
-bind = read_file(bind_path)
+def unmanaged(path):
+    """True if OmaBeam must not edit this path: a symlink, or otherwise not
+    a plain regular file. Stow/chezmoi dotfiles commonly symlink these."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+
+
+guarded = [(hypr_path, "hyprland.lua", WINDOW), (bind_path, "bindings.lua", BIND)]
+blocked = [item for item in guarded if unmanaged(item[0])]
+if blocked:
+    # Either file being linked/managed means neither gets edited, so both
+    # files' manual instructions are needed -- not just the one that tripped
+    # the check -- or the other file silently ends up with no block at all.
+    blocked_paths = ", ".join(path for path, _, _ in blocked)
+    if action == "remove":
+        sys.stderr.write(
+            "install.sh: OmaBeam does not edit linked or managed configuration files "
+            f"({blocked_paths}); neither file was changed.\n"
+            f'Delete the blocks marked "-- omabeam (install.sh)" from {hypr_path} (hyprland.lua) '
+            f"and {bind_path} (bindings.lua) by hand.\n"
+        )
+        raise SystemExit(1)
+    print(
+        "install.sh: OmaBeam does not edit linked or managed configuration files "
+        f"({blocked_paths}); neither file was changed."
+    )
+    print(f"Add this block to {hypr_path} (hyprland.lua) by hand:")
+    print(WINDOW)
+    print(f"Add this block to {bind_path} (bindings.lua) by hand:")
+    print(BIND)
+    # A distinct status (not 0) tells install.sh the edit was skipped, not
+    # applied, so its closing banner does not claim the key bind is active.
+    raise SystemExit(3)
+
+try:
+    hypr = read_file(hypr_path)
+    bind = read_file(bind_path)
+except OSError as error:
+    raise SystemExit(f"install.sh: {error}")
 original = (hypr, bind)
 
 if action == "remove":
@@ -224,42 +272,92 @@ else:
 if (hypr, bind) == original:
     raise SystemExit(0)
 
-try:
-    atomic_write(hypr_path, hypr)
-    atomic_write(bind_path, bind)
-except BaseException:
-    atomic_write(hypr_path, original[0])
-    atomic_write(bind_path, original[1])
-    raise
+
+def normalize(error):
+    return re.sub(r"\d+", "#", error)
+
+
+def partition_errors(baseline, current):
+    """Split current errors into ones already in the baseline multiset --
+    matched by normalized text, so an error whose line number only shifted
+    still counts as the same one -- and genuinely new ones."""
+    available = Counter(normalize(error) for error in baseline)
+    new, remaining = [], []
+    for error in current:
+        key = normalize(error)
+        if available[key] > 0:
+            available[key] -= 1
+            remaining.append(error)
+        else:
+            new.append(error)
+    return new, remaining
+
+
+def query_configerrors(binary):
+    result = subprocess.run([binary, "--hypr", "configerrors"], capture_output=True, text=True)
+    try:
+        payload = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    return [item for item in payload if isinstance(item, str) and item]
+
+
+def hypr_status(binary):
+    if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+        return "missing"
+    version = subprocess.run([binary, "--hypr", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return "ready" if version.returncode == 0 else "unreachable"
+
 
 def restore():
     atomic_write(hypr_path, original[0])
     atomic_write(bind_path, original[1])
 
-if not os.path.isfile(binary) or not os.access(binary, os.X_OK):
+
+# Read the baseline before writing anything, so errors Hyprland already had
+# do not get blamed on this edit.
+status = hypr_status(ipc_binary)
+baseline = query_configerrors(ipc_binary) if status == "ready" else None
+if baseline is None:
+    baseline = []
+
+try:
+    atomic_write(hypr_path, hypr)
+    atomic_write(bind_path, bind)
+except BaseException:
+    restore()
+    raise
+
+if status == "missing":
     print("==> skipping reload (OmaBeam is not installed)")
     raise SystemExit(0)
-version = subprocess.run([binary, "--hypr", "version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-if version.returncode != 0:
+if status == "unreachable":
     print("==> skipping reload (the current Hyprland session is not reachable)")
     raise SystemExit(0)
+
 print("==> reloading Hyprland")
-reload = subprocess.run([binary, "--hypr", "reload"], capture_output=True, text=True)
+reload = subprocess.run([ipc_binary, "--hypr", "reload"], capture_output=True, text=True)
 if reload.returncode != 0:
     restore()
     raise SystemExit("install.sh: hyprctl reload failed; previous configuration restored")
-errors = subprocess.run([binary, "--hypr", "configerrors"], capture_output=True, text=True)
-try:
-    payload = json.loads(errors.stdout or "[]")
-    bad = [item for item in payload if isinstance(item, str) and item]
-except json.JSONDecodeError:
+
+current = query_configerrors(ipc_binary)
+if current is None:
     restore()
     raise SystemExit("install.sh: could not read Hyprland configerrors; previous configuration restored")
-if bad:
+
+new_errors, remaining_errors = partition_errors(baseline, current)
+if new_errors:
     restore()
-    sys.stderr.write("install.sh: Hyprland configuration errors; previous configuration restored:\n")
-    sys.stderr.write("\n".join(bad) + "\n")
+    sys.stderr.write("install.sh: Hyprland reported new configuration errors; previous configuration restored:\n")
+    sys.stderr.write("\n".join(new_errors) + "\n")
     raise SystemExit(1)
+if remaining_errors:
+    print("Hyprland already reported these configuration errors before OmaBeam changed anything:")
+    for error in remaining_errors:
+        print(f"  {error}")
 if action == "remove":
     print("  removed OmaBeam Hyprland blocks")
 PY
@@ -305,7 +403,6 @@ if ! $BACKEND_ONLY; then
   fi
 fi
 
-NATIVE="$ROOT/omarchy-plugin/native/bin/omabeam"
 if [[ -f $ROOT/Cargo.toml ]]; then
   need cargo
   echo "==> building the native app"
@@ -346,11 +443,30 @@ fi
   exit 1
 }
 echo "Check GPU encoding with: $NATIVE --check-encoders"
+ENCODER_NATIVE="$ROOT/omarchy-plugin/native/bin/omabeam-encoder"
+if [[ -x $ENCODER_NATIVE ]] && command -v ldd >/dev/null 2>&1; then
+  # ldd exits non-zero for a non-dynamic executable (e.g. a test double); the
+  # `|| true` keeps that from tripping `set -e` through the pipefail'd pipe.
+  missing=$(ldd "$ENCODER_NATIVE" 2>/dev/null | awk '/not found/ { printf "%s%s", (n++ ? " " : ""), $1 }') || true
+  if [[ -n $missing ]]; then
+    echo "WARNING: The hardware encoder helper cannot load on this system (missing: $missing)."
+    echo "H.264 will use software encoding. Rebuild from source (./install.sh --backend-only in a source checkout) or install a bundle built for this system's FFmpeg."
+  fi
+fi
 if $BACKEND_ONLY; then
   echo "OmaBeam native app ready. Open the bar panel and check status again."
   check_ports
   exit 0
 fi
+
+echo "==> Hyprland window rule and bind $BIND_KEYS"
+hypr_rc=0
+edit_hypr apply || hypr_rc=$?
+case $hypr_rc in
+  0) ;;
+  3) HYPR_MANUAL=true ;;
+  *) exit "$hypr_rc" ;;
+esac
 
 echo "==> installing Omarchy bar plugin $PLUGIN_ID"
 STAGING="$(mktemp -d)"
@@ -381,14 +497,16 @@ fi
 echo "==> restarting Omarchy shell so $PLUGIN_ID reloads"
 omarchy restart shell
 
-echo "==> Hyprland window rule and bind $BIND_KEYS"
-edit_hypr apply
-
 echo
 echo "OmaBeam installed."
 echo "  binary:  $BIN"
 echo "  plugin:  $PLUGIN_DIR"
-echo "  launch:  $BIND_KEYS  or  $BIN"
+if $HYPR_MANUAL; then
+  echo "  launch:  $BIN"
+  echo "  Hyprland window rule and key bind were not added automatically; add them by hand (see above)."
+else
+  echo "  launch:  $BIND_KEYS  or  $BIN"
+fi
 echo
 echo "Optional: set custom_picker_binary = $BIN in ~/.config/hypr/xdph.conf"
 check_ports
