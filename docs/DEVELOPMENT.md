@@ -1,5 +1,17 @@
 # Developing OmaBeam
 
+For installation and everyday use, start with the [README](../README.md).
+
+- [Build and run](#build-and-run)
+- [Installer behavior and firewall checks](#installer-behavior)
+- [Source layout](#source-layout)
+- [Capture and session behavior](#capture-and-session-behavior)
+- [Stream defaults and saved settings](#stream-defaults-and-saved-settings)
+- [Stream diagnostics](#stream-diagnostics) and [encoder checks](#encoder-checks)
+- [Automated checks](#automated-checks) and [Linux desktop testing](#test-on-a-linux-desktop)
+- [Extended desktop design](EXTENDED-DESKTOP.md)
+- [Release packaging and publishing](../RELEASING.md)
+
 Native Google Cast video mirroring is implemented on the development branch.
 See [build commands and qualification status](NATIVE-CAST-STATUS.md) and the
 [design and release gates](NATIVE-CAST.md). The status document records
@@ -34,6 +46,79 @@ cargo run --locked -- --demo-picker
 
 `--demo` sends generated frames over localhost through the real encoder and
 HTTP/WebRTC server. `--demo-picker` uses synthetic sources with sharing disabled.
+Extended desktop additionally requires Hyprland's Lua monitor configuration
+and a working headless output backend; it is unavailable in portal-picker and
+screenshot modes.
+
+## Installer behavior
+
+User-facing installation, update, and removal instructions live in the
+[README](../README.md#install). Omarchy's plugin installer clones and validates
+Git repositories; it does not run build hooks or download release assets.
+Source installations therefore need an explicit native build. Compiled bundles
+include the native app.
+
+The plugin ID is `io.github.cfaulkingham.omabeam`. The default installation
+root is `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/io.github.cfaulkingham.omabeam/`.
+Its `omarchy-plugin/omabeam` launcher runs the adjacent `native/bin/omabeam`;
+the installer does not add a command to `PATH`. `--backend-only` builds there
+without editing desktop configuration or restarting the shell. The full
+installer also enables the bar plugin and adds marked Hyprland window rules
+and a shortcut.
+
+`--with-cast` additionally builds the pinned Open Screen helper and installs
+its notices under `licenses/cast`. It needs Python 3, Git, pkg-config, and the
+C/C++ build dependencies, and downloads several gigabytes to
+`${XDG_CACHE_HOME:-$HOME/.cache}/omabeam/cast`. Browser shares do not need the
+Cast helper.
+
+### Firewall checks
+
+Full and `--backend-only` installs check the default sharing ports: TCP 9847
+for the viewer page and JPEG, and UDP 9848 for H.264/WebRTC. If UFW is active
+and those ports are blocked for the detected LAN, the installer prompts for
+sudo and adds only the missing allows. It prepends them before conflicting
+user rules and verifies access afterward. A declined password or unverifiable
+firewall does not fail an otherwise successful install.
+
+Check again without building, installing, or changing rules:
+
+```bash
+./install.sh --check-ports
+./install.sh --check-ports --subnet 192.168.2.0/24
+```
+
+The check infers IPv4 subnets on default-route interfaces using `ip`, or uses
+the explicit `--subnet` CIDR. Check-only mode can request sudo authentication
+in a terminal but does not write rules. To allow the two ports from a
+specific viewer network, and fail if they cannot be verified:
+
+```bash
+./install.sh --check-ports --open-firewall 192.168.2.0/24
+```
+
+Replace the example with your viewer subnet. `--open-firewall CIDR` also works
+with a full or backend-only install. These rules persist across restart and
+plugin removal. The installer never enables a disabled firewall or changes
+its default policy. Invalid or unrestricted `/0` CIDRs are rejected before
+installation starts.
+
+Explicit check/open requests exit nonzero when access is blocked or unverified.
+If an update partly succeeds, added rules remain and the warning explains that
+setup is incomplete. Rerunning skips access that is already allowed.
+
+This checks UFW incoming user rules, not listening sockets or end-to-end packet
+delivery. The app need not be running. Unsupported firewall managers, missing
+permissions, and ambiguous rules produce warnings; custom nftables/iptables
+rules, Wi-Fi client isolation, or another device's firewall may still prevent
+viewing. After the check, start a share and test its link from another device.
+Custom `--port` or `--webrtc-port` values need their own rules. Blocked UDP can
+cause H.264 playback timeouts while the HTTP page and JPEG fallback still work.
+
+Native Cast uses different traffic: mDNS discovery on UDP 5353, an outgoing TLS
+connection to the receiver's advertised TCP port, and negotiated UDP media and
+feedback. `--check-ports` only diagnoses browser ports; opening 9847/9848 does
+not diagnose Cast. See the [Cast network checks](NATIVE-CAST-STATUS.md#network-checks).
 
 ## Source layout
 
@@ -284,6 +369,10 @@ The viewer hides the local pointer after two idle seconds, including the
 fullscreen controls on an extra display. Owning an extended display requests
 fullscreen immediately; browsers that require a gesture retry when the picture
 is tapped. Match-this-device stays available in the fullscreen overlay.
+A first visit offers fullscreen and, for an extended desktop, Match this
+device; Keep watching dismisses the offer. The choice is remembered per tab.
+The viewer reads the host's Omarchy palette when opened; a theme change needs
+a page reload. Capture slows to about one frame per second when nobody watches.
 
 Client sizing is opt-in and debounced. It uses the viewer stage's CSS dimensions
 and the nearest supported desktop density (1× or 2×), rounds to even pixels,
@@ -310,6 +399,37 @@ target/debug/omabeam --native-pixels --quality 90
 target/debug/omabeam --live output DP-1 --bind 127.0.0.1 --port 9847
 target/debug/omabeam --live region DP-1 20 30 400 300 --fps 15
 ```
+
+### Stream defaults and saved settings
+
+Ordinary shares default to 15 FPS, H.264/WebRTC with JPEG fallback, JPEG
+quality 55, logical pixels without a width cap, cursor off, and a 4 Mbit/s
+H.264 target. The default listener is `0.0.0.0`, with TCP 9847 for HTTP and UDP
+9848 for WebRTC. The bitrate scales with frame rate up to 16 Mbit/s at 60 FPS;
+an explicit bitrate is kept as-is.
+
+The picker saves stream settings in
+`${XDG_CONFIG_HOME:-$HOME/.config}/omabeam/settings.json`. Window, screen, and
+area shares reuse them. Value-setting flags such as `--fps`, `--quality`,
+`--width`, and `--jpeg` override saved settings for one run; no flag turns off
+a remembered cursor, native pixels, or width cap.
+
+| Preset | FPS | JPEG quality | Pixel detail | Maximum width |
+| --- | --- | --- | --- | --- |
+| Balanced | 15 | 55 | Logical | No limit |
+| Crisp text | 15 | 90 | Native | No limit |
+| Smooth motion | 60 | 55 | Logical | 1280 |
+
+Entering extended-desktop mode selects native pixels, the host cursor, and no
+width cap; leaving it restores the earlier pixel, cursor, and width settings.
+Extended desktop defaults to 60 FPS, but an explicitly selected frame rate or
+quality preset takes precedence. Match this device temporarily overrides pixel
+detail and width limits to encode the display at native resolution. Disabling
+matching restores the host's chosen display and encoding settings.
+
+H.264 uses 4:2:0 color, which can soften fine colored text. Preview and browser
+snapshots remain JPEG, and PNG screenshots keep capture resolution. Unsupported
+H.264 sizes fall back to JPEG without silently reducing the chosen resolution.
 
 ### Stream diagnostics
 
@@ -508,6 +628,31 @@ target to their required minimum. These are not
 synchronized capture-to-display latency measurements. HTTP signaling remains
 unencrypted, so DTLS-SRTP does not authenticate the link against an active
 network attacker; use this on a trusted LAN.
+`--webrtc-port` changes the UDP port, with `0` selecting an available port.
+A TCP-only SSH tunnel uses JPEG fallback.
+
+### Encoder checks
+
+Test encoder detection with generated frames, without capturing the desktop:
+
+```bash
+target/debug/omabeam --check-encoders
+target/debug/omabeam --check-encoders --encoder hardware
+target/debug/omabeam --check-encoders 2560x1440 3440x1440
+```
+
+For an installed plugin, substitute its `omarchy-plugin/omabeam` launcher.
+The check uses a fresh encoder at 640×360, 1920×1080, and 3840×2160 by default,
+or at the `WxH` sizes supplied. The JSON `sizes` array reports each result.
+Top-level fields show the first size that did not use the GPU, so `hardware`
+is true only if every size did. `--encoder hardware` fails the check if any
+size fails; `--encoder software` skips hardware detection.
+
+The adjacent `omabeam-encoder` helper needs system FFmpeg libraries, matching
+GPU drivers, and device permissions. The main app still runs with software
+encoding if the helper or its libraries are missing. See the
+[hardware verification commands](#automated-checks) for browser checks and
+helper-failure coverage.
 
 ### Nearby sending
 
@@ -683,4 +828,4 @@ compositor, not OmaBeam's damage handling, holds the capture. If CI moves to
 such a Sway, pin `ubuntu-24.04` or add periodic damage in
 `tests/linux-capture.sh`.
 
-See [Installation and releases](../RELEASING.md) for release validation.
+See [Release validation](../RELEASING.md#validate-and-publish) for packaging and publishing checks.
