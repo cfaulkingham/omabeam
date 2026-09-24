@@ -72,9 +72,12 @@ impl Output {
         ) {
             std::mem::swap(&mut width, &mut height);
         }
+        // Without xdg-output, round: truncating loses a logical pixel when
+        // the mode is not a multiple of the scale.
+        let scale = f64::from(self.scale.max(1));
         let (width, height) = self.logical_size.unwrap_or((
-            width / self.scale.max(1) as u32,
-            height / self.scale.max(1) as u32,
+            (f64::from(width) / scale).round() as u32,
+            (f64::from(height) / scale).round() as u32,
         ));
         Rect {
             x: self.position.0,
@@ -467,6 +470,10 @@ pub(crate) struct Buffer {
     file: File,
     pixels: Vec<u8>,
     pub busy: bool,
+    /// A capture has filled the buffer, so it holds the last frame.
+    pub captured: bool,
+    #[cfg(test)]
+    pub bytes_read: usize,
 }
 impl Buffer {
     pub fn new(shm: &wl_shm::WlShm, spec: BufferSpec, qh: &QueueHandle<State>) -> Result<Self> {
@@ -494,10 +501,35 @@ impl Buffer {
             file,
             pixels: vec![0; size],
             busy: false,
+            captured: false,
+            #[cfg(test)]
+            bytes_read: 0,
         })
     }
     pub fn read(&mut self) -> Result<&[u8]> {
         self.file.read_exact_at(&mut self.pixels, 0)?;
+        #[cfg(test)]
+        {
+            self.bytes_read += self.pixels.len();
+        }
+        Ok(&self.pixels)
+    }
+    /// `read` limited to buffer rows `rows`, padding included; other rows
+    /// keep what an earlier read left.
+    pub fn read_rows(&mut self, rows: &[std::ops::Range<u32>]) -> Result<&[u8]> {
+        let stride = self.spec.stride as usize;
+        for band in rows {
+            if band.start > band.end || band.end > self.spec.height {
+                bail!("rows {band:?} are outside the capture buffer");
+            }
+            let bytes = band.start as usize * stride..band.end as usize * stride;
+            let offset = bytes.start as u64;
+            self.file.read_exact_at(&mut self.pixels[bytes], offset)?;
+            #[cfg(test)]
+            {
+                self.bytes_read += band.len() * stride;
+            }
+        }
         Ok(&self.pixels)
     }
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
@@ -505,6 +537,18 @@ impl Buffer {
             bail!("incorrect Wayland buffer size");
         }
         self.file.write_all_at(bytes, 0)?;
+        Ok(())
+    }
+    /// Rewrites whole rows starting at `row`, so a redraw can skip the rest.
+    pub fn write_rows(&self, row: u32, bytes: &[u8]) -> Result<()> {
+        let size = self.spec.byte_len()? as u64;
+        let stride = u64::from(self.spec.stride);
+        let offset = u64::from(row) * stride;
+        let len = bytes.len() as u64;
+        if !len.is_multiple_of(stride) || offset + len > size {
+            bail!("incorrect Wayland buffer rows");
+        }
+        self.file.write_all_at(bytes, offset)?;
         Ok(())
     }
 }
