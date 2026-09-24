@@ -135,8 +135,8 @@ def check_setup(browser, artifacts):
     context.route('http://viewer.test/**', respond)
     page = context.new_page()
     page.on('pageerror', lambda error: errors.append(str(error)))
-    # Simulate a browser rejecting fullscreen. Automatic fullscreen must not
-    # run while setup is visible, even if activation survives a refresh.
+    # Simulate a browser rejecting fullscreen. Regular shares never request it.
+    # An owned extended display requests it immediately; denial stays windowed.
     page.add_init_script("""
         window.fullscreenCalls = 0;
         Element.prototype.requestFullscreen = function() {
@@ -145,57 +145,45 @@ def check_setup(browser, artifacts):
         };
     """)
     page.goto('http://viewer.test/regular/')
-    page.locator('#viewer-setup').wait_for()
     page.wait_for_function("playback === 'jpeg'")
-    assert page.locator('#setup-match').is_hidden()
+    assert page.locator('#viewer-setup').count() == 0
+    assert page.get_by_role('button', name='Keep watching', exact=True).count() == 0
+    assert page.get_by_role('button', name='Fullscreen', exact=True).count() == 1
     assert page.locator('#match-device').is_hidden()
     assert page.locator('#error').inner_text() == 'Capture warning'
     assert page.locator('#error').is_visible()
     assert 'claim' not in requests and 'size' not in requests
+    assert page.evaluate('fullscreenCalls') == 0
     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
-    for selector in ['#setup-fullscreen', '#setup-dismiss', '#error']:
+    for selector in ['#fullscreen', '#pause', '#error']:
         box = page.locator(selector).bounding_box()
         assert box['x'] >= 0 and box['x'] + box['width'] <= 320, box
     page.screenshot(path=str(artifacts / 'first-visit-mobile.png'), full_page=True)
-    # Dismiss with a keyboard; focus must not be left in hidden content.
-    page.locator('#setup-dismiss').focus()
+    # Toolbar fullscreen is the only fullscreen control. A rejected Fullscreen
+    # API still uses the expanded-stage fallback, including from the keyboard.
+    page.locator('#fullscreen').focus()
     page.keyboard.press('Enter')
-    assert page.locator('#viewer-setup').is_hidden()
-    assert page.locator('#fullscreen').evaluate('(element) => element === document.activeElement')
-    assert page.evaluate('fullscreenCalls') == 0
-    page.reload()
-    page.wait_for_function('latestStats !== null')
-    assert page.locator('#viewer-setup').is_hidden()
-    assert page.evaluate('fullscreenCalls') == 0  # Regular sharing never auto-fullscreens.
-    other = context.new_page()
-    other.goto('http://viewer.test/regular/')
-    other.locator('#viewer-setup').wait_for()  # Separate tab, same pathname.
-    other.close()
-    page.goto('http://viewer.test/another/')
-    page.locator('#viewer-setup').wait_for()  # Same tab, different session pathname.
-    page.locator('#setup-fullscreen').click()
     page.wait_for_function("stage.classList.contains('expanded')")
-    assert page.locator('#viewer-setup').is_hidden()
     assert page.evaluate('fullscreenCalls') == 1
     leave_fullscreen(page)
     page.reload()
     page.wait_for_function('latestStats !== null')
-    assert page.locator('#viewer-setup').is_hidden()
+    assert page.evaluate('fullscreenCalls') == 0  # Regular sharing never auto-fullscreens.
 
     stats['desktop'] = desktop
     page.goto('http://viewer.test/desktop/')
     eventually(lambda: page.wait_for_timeout(50) or bool(claims))
-    assert page.locator('#viewer-setup').is_hidden()
-    assert page.locator('#setup-match').is_hidden()
+    assert page.locator('#match-device').is_disabled()
     assert page.evaluate('fullscreenCalls') == 0
     claims.pop(0).fulfill(status=409)
     page.locator('#stage.blocked').wait_for()
-    assert page.locator('#viewer-setup').is_hidden()
+    assert page.evaluate('fullscreenCalls') == 0
     eventually(lambda: page.wait_for_timeout(50) or bool(claims))
     claims.pop(0).fulfill(json=desktop)
-    page.locator('#viewer-setup').wait_for()
-    assert page.locator('#setup-match').is_visible()
-    assert page.evaluate('fullscreenCalls') == 0
+    page.wait_for_function('ownsDesktop && playback === "jpeg"')
+    assert page.locator('#match-device').is_enabled()
+    assert page.evaluate('fullscreenCalls') == 1
+    assert not page.evaluate("document.fullscreenElement || stage.classList.contains('expanded')")
     assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
     page.screenshot(path=str(artifacts / 'first-visit-desktop-mobile.png'), full_page=True)
     # 412: this page's own lease lapsed and nobody else took the display. The
@@ -212,19 +200,19 @@ def check_setup(browser, artifacts):
     page.wait_for_function("ownsDesktop && playback === 'jpeg'")
     eventually(lambda: page.wait_for_timeout(50) or 'stream' in requests[claimed:])
     assert not page.evaluate('overlaySeen || desktopBlocked')
-    # A heartbeat conflict must immediately remove an already-visible setup.
+    # A heartbeat conflict blocks the page immediately.
     page.evaluate('showDesktopBlocked()')
-    assert page.locator('#viewer-setup').is_hidden()
-    # End while waiting for reacquisition; no onboarding should reappear.
+    assert 'blocked' in (page.locator('#stage').get_attribute('class') or '')
+    assert page.locator('#match-device').is_disabled()
+    # End while waiting for reacquisition.
     stats['state'] = 'ended'
     for claim in claims:
         claim.fulfill(status=409)
     claims.clear()
     page.wait_for_function('ended')
-    assert page.locator('#viewer-setup').is_hidden()
+    assert page.locator('#match-device').is_disabled()
     page.goto('http://viewer.test/already-ended/')
     page.wait_for_function('ended')
-    assert page.locator('#viewer-setup').is_hidden()
     assert not claims
 
     # 412 on a size request: drop the lapsed lease quietly, claim it again, then
@@ -234,7 +222,7 @@ def check_setup(browser, artifacts):
     page.goto('http://viewer.test/desktop-size/')
     eventually(lambda: page.wait_for_timeout(50) or bool(claims))
     claims.pop(0).fulfill(json=desktop)
-    page.locator('#setup-match').click()
+    page.locator('#match-device').click()
     page.wait_for_function("matchEnabled && lastSizeRequest !== null && !resizing")
     watch_overlay(page)
     restores.append(412)
@@ -256,8 +244,8 @@ def check_setup(browser, artifacts):
     eventually(lambda: page.wait_for_timeout(50) or None in sized[before:])
     page.wait_for_function("!matchEnabled && lastSizeRequest === 'null' && !resizeOwed")
 
-    # Storage may be denied in embedded/private contexts; dismissal still works
-    # for this page, and the no-API fullscreen fallback is unchanged.
+    # Storage may be denied in embedded/private contexts. The page still loads,
+    # and the no-API fullscreen fallback is unchanged.
     stats.pop('desktop')
     stats['state'] = 'live'
     page.add_init_script("""
@@ -265,15 +253,13 @@ def check_setup(browser, artifacts):
         Element.prototype.requestFullscreen = undefined;
     """)
     page.goto('http://viewer.test/no-storage/')
-    page.locator('#viewer-setup').wait_for()
-    page.locator('#setup-fullscreen').click()
+    page.wait_for_function("playback === 'jpeg'")
+    page.locator('#fullscreen').click()
     page.wait_for_function("stage.classList.contains('expanded')")
     leave_fullscreen(page)
-    page.evaluate('renderSetup()')
-    assert page.locator('#viewer-setup').is_hidden()
     assert not errors, errors
     context.close()
-    print('PASS viewer setup: lease gating, blocked/ended, lapsed-lease reclaim (heartbeat and size), restore survives a resize, regular sharing, mobile, keyboard, per-tab/path refresh, fullscreen fallbacks, unavailable storage, visible errors')
+    print('PASS viewer setup: lease gating, blocked/ended, lapsed-lease reclaim (heartbeat and size), restore survives a resize, regular sharing, mobile, keyboard, fullscreen fallbacks, unavailable storage, visible errors')
 
 
 def check_browser(fixture, browser, artifacts):
@@ -284,17 +270,16 @@ def check_browser(fixture, browser, artifacts):
     first.on('pageerror', lambda error: errors.append(str(error)))
     first.goto(fixture.url, wait_until='domcontentloaded')
     first.wait_for_function("playback === 'webrtc' && video.videoWidth === 1280", timeout=20000)
-    assert first.locator('#viewer-setup').is_visible()
-    assert first.locator('#setup-match').is_visible()
-    assert not first.evaluate("document.fullscreenElement || stage.classList.contains('expanded')")
+    assert first.locator('#match-device').is_enabled()
+    assert first.locator('#viewer-setup').count() == 0
+    first.mouse.move(20, 20)  # Reveal fullscreen chrome if the browser granted it on connect.
     first.screenshot(path=str(artifacts / 'first-visit-desktop.png'))
     second = second_context.new_page()
     second.on('pageerror', lambda error: errors.append(str(error)))
     second.goto(fixture.url, wait_until='domcontentloaded')
     second.get_by_role('heading', name='This display is already connected to another device.').wait_for()
     assert second.evaluate("pc === null && !img.hasAttribute('src')")
-    assert second.locator('#viewer-setup').is_hidden()
-    assert second.locator('#setup-match').is_hidden()
+    assert second.locator('#match-device').is_disabled()
     for path in ['frame.jpg', 'stream', 'webrtc/offer', 'frame.jpg?viewer=' + '0' * 32]:
         assert fixture.get(path)[0] == 409, path
     assert fixture.stats()['webrtc']['peers'] == 1
@@ -307,8 +292,7 @@ def check_browser(fixture, browser, artifacts):
     cloned.get_by_role('heading', name='This display is already connected to another device.').wait_for()
     cloned.close()
 
-    first.locator('#setup-match').click()
-    assert first.locator('#viewer-setup').is_hidden()
+    first.locator('#match-device').click()
     assert first.locator('#match-device').get_attribute('aria-pressed') == 'true'
     assert first.locator('#match-device').evaluate('(element) => element === document.activeElement')
     first.wait_for_function("latestStats.desktop.matched && !latestStats.desktop.updating && video.videoWidth === 1000")
@@ -319,7 +303,6 @@ def check_browser(fixture, browser, artifacts):
     first.reload(wait_until='domcontentloaded')
     first.wait_for_function("ownsDesktop && playback === 'webrtc' && video.videoWidth === 1180", timeout=20000)
     leave_fullscreen(first)
-    assert first.locator('#viewer-setup').is_hidden()
     assert second.locator('#stage').get_attribute('class').find('blocked') >= 0
 
     # JPEG uses the same ownership and tracks both dimensions when resizing.

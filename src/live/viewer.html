@@ -77,14 +77,6 @@ body.idle #stage:fullscreen #chrome, body.idle #stage.expanded #chrome { display
 #stage.ended #disconnected, #stage.blocked #disconnected, #stage.unreachable #disconnected { display: flex; }
 #stage.blocked #disconnected-copy, #stage.unreachable #disconnected-copy { letter-spacing: 0.02em; text-transform: none; }
 #desktop-note { overflow-wrap: anywhere; }
-#viewer-setup { flex-shrink: 0; padding: 16px 20px; border-bottom: 1px solid var(--outline); background: color-mix(in srgb, var(--accent) 6%, var(--background)); }
-#viewer-setup h2 { margin: 0 0 6px; font-size: 16px; }
-#viewer-setup p { margin: 0 0 12px; color: var(--muted); line-height: 1.5; }
-.setup-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.setup-actions button { min-height: 44px; }
-/* Setup and errors remain in the normal document flow, not behind a modal. */
-body:has(#viewer-setup:not([hidden])) { min-height: 100dvh; height: auto; }
-body:has(#viewer-setup:not([hidden])) #stage { flex: 1 0 30dvh; }
 button[aria-pressed="true"] { border-color: var(--accent); }
 footer { flex-shrink: 0; padding: 12px 20px; font-size: 12px; display: flex; align-items: center; flex-wrap: wrap; gap: 10px 16px; border-top: 1px solid var(--outline); color: var(--muted); }
 #source, #error { overflow-wrap: anywhere; }
@@ -126,15 +118,6 @@ body[data-state="live"] #status, body[data-state="ended"] #status { color: var(-
   </div>
   <nav aria-label="Viewer controls"><button id="match-device" aria-pressed="false" hidden>Match this device</button><button id="transport" hidden>Video: Auto</button><button id="pause">Pause</button><button id="fit">Fit: contain</button><a id="snapshot" href="frame.jpg" download="omabeam.jpg">Snapshot</a><button id="fullscreen">Fullscreen</button></nav>
 </header>
-<section id="viewer-setup" aria-labelledby="setup-title" hidden>
-  <h2 id="setup-title">Make yourself comfortable</h2>
-  <p>Watching starts automatically. Fullscreen gives the picture more room.<span id="setup-desktop" hidden> Match this device resizes the extended desktop to your viewing area. Use the host’s keyboard and mouse to control it.</span> You can change these options later in the viewer controls.</p>
-  <div class="setup-actions">
-    <button id="setup-fullscreen">Fullscreen</button>
-    <button id="setup-match" hidden>Match this device</button>
-    <button id="setup-dismiss">Keep watching</button>
-  </div>
-</section>
 <main id="stage" class="contain"><img id="view" alt=""><video id="video" autoplay muted playsinline hidden></video><div id="disconnected"><svg class="oma-logo" viewBox="0 0 1200 1200" fill="currentColor" aria-hidden="true"><path clip-rule="evenodd" fill-rule="evenodd" d="m1200 1200h-480v-80h400v-1040h-479.996v160h-400v720h720v-720h-80v-80h159.996v880h-400v160h-640v-1200h1200zm-1120-80h480v-80h-400l.004-400h-80.004zm0-560h80.004v-400h400v-80h-480.004z"/></svg><svg class="oma-wordmark" viewBox="0 0 1215 285" fill="currentColor" aria-hidden="true"><path clip-rule="evenodd" fill-rule="evenodd" d="m720 120h-15v15h-14.998v14.999l-60.002.001v15.002l90-.002v.002h.002l-.002 89.998h-15v15h-13v15h-17v-89.998h-45v90l-45-.002v-89.998h-14.998v-30h14.998v-15.002h-14.998v-30.001h14.998v-75h15v-14.997h15v-15.002h105.002zm-90-.001h45v-74.997h-45z"/><path clip-rule="evenodd" fill-rule="evenodd" d="m105 30.002h15v14.997h15v180.001h-15v15h-15v15.002h-75v-15.002h-15v-15h-15v-180.001h15v-14.997h15v-15.002h75zm-60 194.998h45v-179.998h-45z"/><path d="m300 15h60v15h15v14.999h15v180.001h-15v15h-15v15h-15l-.004-209.998h-44.994v-.002h-.002v210.002h-45v-210h-44.998v179.997h-.002v30.003h-15v-15.002h-15v-15h-14.998v-180.001h14.998v-14.999h15v-15h60v-15h45z"/><path clip-rule="evenodd" fill-rule="evenodd" d="m555 225h-15v15h-15v15h-15v-105.001l-44.998.001v105.002h-45.002v-105.002h-15v-30.001h15v-75h15.002v-14.997h15v-15.002h105zm-89.998-105.001h44.998v-74.997h-44.998z"/><path d="m885 75h-15v15h-15v15h-15v-59.998h-45v179.998h45v-59.998h15v14.997h15v15.001h15v30h-15v15h-15v15.002l-105-.002v-210.001h14.998v-14.997h15.002v-15.002h105z"/><path d="m960 119.999h45v-104.999h15v15h15v14.999h15v75.001h15v15h-15v90h-15v15h-15v15h-15v-105h-45v105.002l-45-.002v-105h-30v-15h15v-15.001h15v-75h15v-14.997h15v-15.002h15z"/><path d="m1125 119.999h45v-104.999h15v15h15v15h15v180h-15v15h-15v15.002l-75-.002v-15h-15v-15h-15v-45.001h15v-14.997-.002h30v60h45v-75h-90v-105.001h15v-14.997h15v-15.002h15z"/></svg><h2 id="disconnected-copy">OmaBeam disconnected</h2></div><div id="chrome"><button id="exit">Exit fullscreen</button></div></main>
 <footer>
   <span id="status" role="status">Connecting…</span><span id="metrics"></span><span id="source"></span><span id="transport-note"></span><span id="desktop-note"></span><span id="error" role="alert"></span>
@@ -212,35 +195,6 @@ const matchDevice = document.getElementById('match-device');
 const desktopNote = document.getElementById('desktop-note');
 const identityKey = 'omabeam-client:' + location.pathname;
 const matchKey = 'omabeam-match:' + location.pathname;
-const setupKey = 'omabeam-setup:' + location.pathname;
-const viewerSetup = document.getElementById('viewer-setup');
-const setupMatch = document.getElementById('setup-match');
-let setupDismissed = false;
-try { setupDismissed = sessionStorage.getItem(setupKey) === 'dismissed'; } catch {}
-function renderSetup() {
-  const desktop = !!latestStats?.desktop;
-  viewerSetup.hidden = setupDismissed || !latestStats || ended || latestStats.state === 'ended' ||
-    paused || unreachable || desktopBlocked || (desktop && !ownsDesktop);
-  if (!viewerSetup.hidden) document.body.classList.remove('idle');
-  document.getElementById('setup-desktop').hidden = !desktop;
-  setupMatch.hidden = !desktop || !ownsDesktop || matchEnabled;
-}
-function dismissSetup() {
-  if (setupDismissed) return;
-  const hadFocus = viewerSetup.contains(document.activeElement);
-  setupDismissed = true;
-  try { sessionStorage.setItem(setupKey, 'dismissed'); } catch { /* Dismiss for this page even without storage. */ }
-  renderSetup();
-  if (hadFocus) document.getElementById('fullscreen').focus({preventScroll: true});
-}
-document.getElementById('setup-dismiss').onclick = dismissSetup;
-document.getElementById('setup-fullscreen').onclick = () => fullscreen();
-setupMatch.onclick = () => {
-  if (!ownsDesktop || paused || ended || matchEnabled) return;
-  dismissSetup();
-  matchDevice.click();
-  matchDevice.focus({preventScroll: true});
-};
 function randomId() {
   return [...crypto.getRandomValues(new Uint8Array(16))].map(n => n.toString(16).padStart(2, '0')).join('');
 }
@@ -274,7 +228,6 @@ function leaseLapsed(connection, generation) {
 }
 function showDesktopBlocked() {
   ownsDesktop = false; desktopBlocked = true; leaseGeneration++; resizeOwed = false;
-  renderSetup();
   stopPlayback(); clearTimeout(retry); retry = null;
   stage.classList.add('blocked');
   disconnectedCopy.textContent = displayInUse;
@@ -286,7 +239,6 @@ function showDesktopBlocked() {
 function releaseDesktop() {
   const previous = connectionIdentity;
   ownsDesktop = false; connectionIdentity = randomId(); lastSizeRequest = null;
-  renderSetup();
   if (latestStats?.desktop) fetch('desktop/release', {method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({connection: previous}), keepalive: true}).catch(() => {});
 }
@@ -311,7 +263,6 @@ async function claimDesktop() {
   try { return await claiming; } finally { claiming = null; }
 }
 function renderDesktop(desktop) {
-  renderSetup();
   matchDevice.hidden = !desktop;
   if (!desktop) return;
   matchDevice.disabled = !ownsDesktop || paused || ended;
@@ -372,7 +323,6 @@ async function resizeDesktop() {
   }
 }
 matchDevice.onclick = () => {
-  dismissSetup();
   matchEnabled = !matchEnabled; lastSizeRequest = null; resizeOwed = true;
   try { sessionStorage.setItem(matchKey, String(matchEnabled)); } catch {}
   renderDesktop(latestStats.desktop);
@@ -390,7 +340,7 @@ let idleTimer = null;
 function markActive() {
   document.body.classList.remove('idle');
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(() => { if (viewerSetup.hidden) document.body.classList.add('idle'); }, 2000);
+  idleTimer = setTimeout(() => document.body.classList.add('idle'), 2000);
 }
 for (const type of ['pointermove', 'pointerdown', 'keydown']) addEventListener(type, markActive, {passive: true});
 markActive();
@@ -400,9 +350,8 @@ function placeDesktopControls() {
   else document.querySelector('nav').prepend(matchDevice);
 }
 function tryDesktopFullscreen() {
-  // A retained user activation can make this succeed even on refresh. Never
-  // cover first-visit setup before the viewer has chosen how to watch.
-  if (!setupDismissed || !ownsDesktop || paused || ended || document.fullscreenElement === stage) return;
+  // Refresh can retain user activation, so this may succeed without a new gesture.
+  if (!ownsDesktop || paused || ended || document.fullscreenElement === stage) return;
   stage.requestFullscreen?.().catch(() => {});
 }
 function enterDesktopFullscreen() {
@@ -605,7 +554,6 @@ document.getElementById('fit').onclick = e => {
   e.target.textContent = 'Fit: ' + fitLabels[fit];
 };
 async function fullscreen() {
-  dismissSetup();
   try { if (stage.requestFullscreen) await stage.requestFullscreen(); else stage.classList.add('expanded'); }
   catch { stage.classList.add('expanded'); }
   placeDesktopControls();

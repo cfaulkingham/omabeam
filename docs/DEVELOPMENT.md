@@ -369,8 +369,6 @@ The viewer hides the local pointer after two idle seconds, including the
 fullscreen controls on an extra display. Owning an extended display requests
 fullscreen immediately; browsers that require a gesture retry when the picture
 is tapped. Match-this-device stays available in the fullscreen overlay.
-A first visit offers fullscreen and, for an extended desktop, Match this
-device; Keep watching dismisses the offer. The choice is remembered per tab.
 The viewer reads the host's Omarchy palette when opened; a theme change needs
 a page reload. Capture slows to about one frame per second when nobody watches.
 

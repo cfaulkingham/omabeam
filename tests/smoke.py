@@ -114,10 +114,8 @@ def browser_check(server, screenshot, executable=None):
             page.goto(server.url, wait_until='domcontentloaded')
             page.wait_for_function('document.getElementById("view").naturalWidth > 0')
             eventually(lambda: server.stats()['viewers'] == 1)
-            page.locator('#viewer-setup').wait_for()
-            assert page.locator('#setup-match').is_hidden()
-            page.get_by_role('button', name='Keep watching', exact=True).click()
-            assert page.locator('#viewer-setup').is_hidden()
+            assert page.locator('#match-device').is_hidden()
+            assert page.get_by_role('button', name='Keep watching', exact=True).count() == 0
             page.get_by_text('Stream diagnostics', exact=True).click()
             page.wait_for_function('document.getElementById("diag-pixels").textContent === "Native pixels"')
             page.wait_for_function('document.querySelector("#client-rows tr td").textContent.startsWith("Viewer ")')
