@@ -99,7 +99,14 @@ omabeam --stop
 ```
 
 The receiver ID comes from discovery. Startup resolves that same ID again;
-it never substitutes a different device with the same display name. The default
+it never substitutes a different device with the same display name. Before
+that discovery (about five seconds), startup validates the settings, takes the
+session lock, and recovers a leftover extended display. `omabeam --stop`
+therefore also ends a Cast that is still discovering: it exits 0 with
+"Stopped before the share started." before connecting, and a share started
+meanwhile fails at once with "already running or starting". `live.json`
+records connection and readiness changes at once; counters such as
+`accepted_frames` update at most once a second. The default
 canvas is 1280×720, `--width 1920` selects 1920×1080, and sources are fitted with
 black bars while preserving aspect ratio. Cast currently caps frame rate at 30.
 `--cast-demo RECEIVER_ID` uses generated frames and the standard Google trust

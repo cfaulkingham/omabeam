@@ -21,7 +21,8 @@ omarchy plugin enable io.github.cfaulkingham.omabeam --section right
 
 The build installs `omarchy-plugin/native/bin/omabeam` in the checkout.
 `--backend-only` leaves desktop configuration and the shell process alone.
-The full `./install.sh` also adds a floating-window rule and shortcut.
+The full `./install.sh` also adds floating-window rules for the picker and the
+nearby-send window, and a shortcut.
 
 After `omarchy plugin update io.github.cfaulkingham.omabeam`, rerun that
 checkout's `./install.sh --backend-only` to rebuild the app.
@@ -166,9 +167,12 @@ omarchy plugin validate .
 qmllint -I "$OMARCHY_PATH/shell" omarchy-plugin/BarWidget.qml omarchy-plugin/Panel.qml
 ```
 
-Verify bar click, Escape, summon/hide, disable/re-enable, shell restart, and
-removal. Test capture, the viewer, clipboard, portal picker, and nearby-device
-sharing on real Hyprland.
+Verify bar click, Escape, summon/hide, disable/re-enable, shell restart (an
+open picker or send window stays open), and removal. Test capture, the viewer,
+clipboard, portal picker, and nearby-device sharing on real Hyprland, including
+a PIN-protected receiver and the official LocalSend apps. Sending to those apps
+has not been verified yet; see
+[Nearby sending](docs/DEVELOPMENT.md#nearby-sending).
 
 Publish the source in a public GitHub repository with the root manifest,
 README, and MIT license. Attach the verified bundle and checksum to a release,
@@ -186,6 +190,7 @@ The plugin-local binary is removed with the plugin. If you used the full
 installer, run `./install.sh --remove-desktop` first (or delete the blocks
 marked `-- omabeam (install.sh)` from `hyprland.lua` and `bindings.lua`).
 Stop the share before removing the plugin; a detached live process can outlive
-the checkout. Screenshots and any firewall or portal settings you configured
+the checkout. Screenshots, `~/.config/omabeam/` (picker settings and the
+LocalSend identity), and any firewall or portal settings you configured
 separately are left in place. Session files live in `$XDG_RUNTIME_DIR/omabeam/`
 and vanish at logout.
