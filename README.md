@@ -61,8 +61,10 @@ This builds the app without adding window rules or a keyboard shortcut.
 
 ### From a compiled bundle
 
-If you have a compiled Linux release bundle, verify its `.sha256`, extract it,
-enter the `io.github.cfaulkingham.omabeam` directory, and run:
+Download the archive for your architecture and its `.sha256` file from
+[GitHub Releases](https://github.com/cfaulkingham/omabeam/releases/latest).
+Verify the checksum, extract the archive, enter the
+`io.github.cfaulkingham.omabeam` directory, and run:
 
 ```bash
 ./install.sh
@@ -77,10 +79,17 @@ directory into `${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/`, then run
 
 ### Arch / AUR packaging
 
-Stable release workflows generate an `omabeam-bin` AUR recipe alongside the
-bundles; this does not mean it has been published to AUR. After installing that
-package with `makepkg -si` or an AUR helper once available, run as your desktop
-user:
+The ready-to-use [PKGBUILD](packaging/aur/PKGBUILD) downloads the matching
+prebuilt archive from GitHub Releases and verifies its checksum. To install
+`omabeam-bin` on Omarchy without compiling Rust or the Cast SDK:
+
+```bash
+git clone https://github.com/cfaulkingham/omabeam.git
+cd omabeam/packaging/aur
+makepkg -si
+```
+
+Then enable the plugin as your desktop user:
 
 ```bash
 bash /usr/share/omabeam/plugin/install.sh
@@ -88,8 +97,9 @@ bash /usr/share/omabeam/plugin/install.sh
 
 Run it again after package upgrades to refresh the bar plugin. Pacman manages
 the app, encoder and Cast binaries; this installer configures the user plugin,
-desktop integration and network access. See [AUR packaging](RELEASING.md#aur-binary-package)
-for building and publishing the package.
+desktop integration and network access. The package has not yet been submitted
+to AUR. See [AUR packaging](RELEASING.md#aur-binary-package) for building and
+publishing the package.
 
 ### Network access
 
