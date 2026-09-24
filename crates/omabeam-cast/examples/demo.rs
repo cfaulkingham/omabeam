@@ -120,17 +120,18 @@ fn main() -> Result<()> {
                     Some("error") => bail!("Cast failed: {event}"),
                     Some("feedback") => {
                         released = event["released"].as_u64().unwrap_or(0);
-                        let rate =
-                            event["bitrate"].as_u64().unwrap_or(config.bitrate.into()) as u32;
-                        if rate != config.bitrate {
-                            config.bitrate = rate;
-                            encoder = create(rate)?;
-                            force = true;
-                        }
                     }
                     Some("frame") if event["sequence"].as_u64() == Some(sequence) => {
-                        force |= event["keyframe"].as_bool().unwrap_or(true);
-                        accepted += u64::from(event["accepted"].as_bool().unwrap_or(false));
+                        let retry = event["retry"].as_bool().unwrap_or(false);
+                        let admitted = event["accepted"].as_bool().unwrap_or(false);
+                        if admitted {
+                            force |= event["keyframe"].as_bool().unwrap_or(false);
+                            accepted += 1;
+                            break;
+                        } else if retry {
+                            continue;
+                        }
+                        force = true;
                         break;
                     }
                     Some("keyframe") => force = true,

@@ -13,6 +13,7 @@ use openh264::{
     },
     formats::{RgbSliceU8, RgbaSliceU8, YUVBuffer},
 };
+use openh264_sys2::{ENCODER_OPTION_BITRATE, SBitrateInfo, SPATIAL_LAYER_ALL};
 use std::time::Instant;
 
 pub(super) struct RawFrame {
@@ -21,7 +22,14 @@ pub(super) struct RawFrame {
     pub captured_at: Instant,
 }
 
-fn create(config: &LiveConfig) -> Result<Encoder> {
+fn create(config: &LiveConfig, periodic_idr: bool) -> Result<Encoder> {
+    // Two seconds at the configured rate. Cast turns this off: a desktop IDR
+    // consumes the bitrate budget and the following frames go soft.
+    let period = if periodic_idr {
+        config.fps.saturating_mul(2).max(1)
+    } else {
+        0
+    };
     Ok(Encoder::with_api_config(
         OpenH264API::from_source(),
         EncoderConfig::new()
@@ -33,7 +41,8 @@ fn create(config: &LiveConfig) -> Result<Encoder> {
             .profile(Profile::Baseline)
             .complexity(Complexity::Low)
             .num_threads(2)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(config.fps * 2)),
+            .scene_change_detect(periodic_idr)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(period)),
     )?)
 }
 
@@ -42,35 +51,47 @@ pub(super) struct AdaptiveEncoder {
     software: Encoder,
     hardware: Option<hardware::Hardware>,
     attempted: bool,
+    software_started: bool,
+    periodic_idr: bool,
     pub name: String,
     pub note: Option<String>,
 }
 impl AdaptiveEncoder {
-    /// Reset the prediction chain when applying a new congestion-control
-    /// target. Reopening also covers hardware backends without runtime rate
-    /// controls; callers rate-limit these changes and force a fresh IDR.
+    /// Apply a congestion target without reopening the encoder. A new process
+    /// or OpenH264 instance would insert an IDR and break the frames already
+    /// in flight. FFmpeg's NVENC reconfigure also forces an IDR, so an open
+    /// hardware session keeps the rate it was created with; the stored config
+    /// is what a later software fallback starts from.
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
         if bitrate == self.config.h264_bitrate {
             return Ok(());
         }
-        let mut config = self.config.clone();
-        config.h264_bitrate = bitrate;
-        let mut next = Self::new(&config)?;
-        if self.attempted && self.hardware.is_none() && config.encoder == EncoderMode::Auto {
-            // A congestion update must not repeatedly probe a failed driver.
-            // Keep the same per-session software fallback policy as WebRTC.
-            next.attempted = true;
-            next.note = self.note.clone();
+        self.config.h264_bitrate = bitrate;
+        if self.software_started {
+            set_openh264_bitrate(&mut self.software, bitrate)?;
+        } else {
+            self.software = create(&self.config, self.periodic_idr)?;
         }
-        *self = next;
+        Ok(())
+    }
+    /// Emit an IDR only for the first frame and for an explicit recovery
+    /// request. The browser keeps a two-second interval so a missed request
+    /// still repairs itself.
+    pub fn idr_only_when_requested(&mut self) -> Result<()> {
+        self.periodic_idr = false;
+        if !self.software_started {
+            self.software = create(&self.config, false)?;
+        }
         Ok(())
     }
     pub fn new(config: &LiveConfig) -> Result<Self> {
         Ok(Self {
             config: config.clone(),
-            software: create(config)?,
+            software: create(config, true)?,
             hardware: None,
             attempted: config.encoder == EncoderMode::Software,
+            software_started: false,
+            periodic_idr: true,
             name: "OpenH264 software".into(),
             note: None,
         })
@@ -93,12 +114,18 @@ impl AdaptiveEncoder {
             if !self.attempted {
                 self.attempted = true;
                 let (w, h) = yuv.dimensions();
+                let fps = self.config.fps.min(60).max(1);
                 self.hardware = Some(hardware::Hardware::new(&omabeam_encoder::Config {
                     version: omabeam_encoder::VERSION,
                     width: w as u32,
                     height: h as u32,
-                    fps: self.config.fps.min(60),
+                    fps,
                     bitrate: self.config.h264_bitrate,
+                    gop_frames: if self.periodic_idr {
+                        0
+                    } else {
+                        fps.saturating_mul(60)
+                    },
                 })?);
             }
             match &mut self.hardware {
@@ -137,8 +164,26 @@ impl AdaptiveEncoder {
         let bitstream = self
             .software
             .encode_at(yuv, Timestamp::from_millis((pts.max(0) / 1000) as u64))?;
+        self.software_started = true;
         Ok((bitstream.to_vec(), bitstream.frame_type() == FrameType::IDR))
     }
+}
+
+fn set_openh264_bitrate(encoder: &mut Encoder, bitrate: u32) -> Result<()> {
+    let mut info = SBitrateInfo {
+        iLayer: SPATIAL_LAYER_ALL,
+        iBitrate: i32::try_from(bitrate).unwrap_or(i32::MAX),
+    };
+    // SAFETY: the encoder has already encoded, and this option only replaces
+    // the rate-control target. It does not reset the reference pictures.
+    let code = unsafe {
+        encoder.raw_api().set_option(
+            ENCODER_OPTION_BITRATE,
+            (&mut info as *mut SBitrateInfo).cast(),
+        )
+    };
+    ensure!(code == 0, "OpenH264 rejected bitrate {bitrate} ({code})");
+    Ok(())
 }
 
 pub fn probe(config: &LiveConfig) -> Result<serde_json::Value> {
@@ -386,7 +431,7 @@ mod tests {
             encoder: EncoderMode::Software,
             ..Default::default()
         };
-        let mut encoder = create(&config).unwrap();
+        let mut encoder = create(&config, true).unwrap();
         for index in 0..24 {
             let raw = RawFrame {
                 frame: omabeam_capture::demo_frame(index * 11),
@@ -407,7 +452,7 @@ mod tests {
             webrtc: true,
             ..Default::default()
         };
-        let mut encoder = create(&config).unwrap();
+        let mut encoder = create(&config, true).unwrap();
         let mut decoder = Decoder::new().unwrap();
         for (index, (w, h)) in [(641, 361), (641, 361), (480, 270), (17, 17)]
             .into_iter()
@@ -473,7 +518,7 @@ mod hardware_tests {
             captured_at: Instant::now(),
         })
         .unwrap();
-        let mut software = create(&config).unwrap();
+        let mut software = create(&config, true).unwrap();
         software.force_intra_frame();
         let packet = software.encode(&pixels).unwrap().to_vec();
         std::fs::write(directory.path().join("frame.h264"), packet).unwrap();
@@ -513,12 +558,83 @@ for index in range(2):
                     height: 64,
                     fps: 15,
                     bitrate: config.h264_bitrate,
+                    gop_frames: 0,
                 },
             )
             .unwrap(),
         );
         encoder.attempted = true;
         (directory, pixels, encoder)
+    }
+
+    #[test]
+    fn cast_keeps_deltas_past_the_two_second_keyframe_clock() {
+        let config = LiveConfig {
+            fps: 30,
+            h264_bitrate: 2_000_000,
+            webrtc: true,
+            encoder: EncoderMode::Software,
+            ..Default::default()
+        };
+        let mut cast = AdaptiveEncoder::new(&config).unwrap();
+        cast.idr_only_when_requested().unwrap();
+        let mut browser = AdaptiveEncoder::new(&config).unwrap();
+        let mut cast_idrs = Vec::new();
+        let mut browser_idrs = Vec::new();
+        for index in 0..70u32 {
+            let frame = RawFrame {
+                frame: omabeam_capture::demo_frame(index),
+                config: config.clone(),
+                captured_at: Instant::now(),
+            };
+            let pixels = yuv(&frame).unwrap();
+            let force = index == 0;
+            let pts = i64::from(index) * 33_000;
+            if cast.encode(&pixels, pts, force).unwrap().1 {
+                cast_idrs.push(index);
+            }
+            if browser.encode(&pixels, pts, force).unwrap().1 {
+                browser_idrs.push(index);
+            }
+        }
+        assert_eq!(cast_idrs, vec![0], "cast inserted {cast_idrs:?}");
+        assert!(
+            browser_idrs.iter().any(|index| *index > 0),
+            "browser no longer refreshes on its own: {browser_idrs:?}"
+        );
+    }
+
+    #[test]
+    fn bitrate_update_keeps_the_open_software_prediction_chain() {
+        let config = LiveConfig {
+            fps: 30,
+            h264_bitrate: 4_000_000,
+            webrtc: true,
+            encoder: EncoderMode::Software,
+            ..Default::default()
+        };
+        let raw = RawFrame {
+            frame: omabeam_capture::demo_frame(1),
+            config: config.clone(),
+            captured_at: Instant::now(),
+        };
+        let pixels = yuv(&raw).unwrap();
+        let mut encoder = AdaptiveEncoder::new(&config).unwrap();
+        let mut decoder = openh264::decoder::Decoder::new().unwrap();
+        let (idr, idr_flag) = encoder.encode(&pixels, 0, true).unwrap();
+        assert!(idr_flag && omabeam_encoder::inspect_h264(&idr).unwrap());
+        decoder.decode(&idr).unwrap().unwrap();
+        let (delta, delta_flag) = encoder.encode(&pixels, 100_000, false).unwrap();
+        assert!(!delta_flag && !omabeam_encoder::inspect_h264(&delta).unwrap());
+        decoder.decode(&delta).unwrap().unwrap();
+        encoder.set_bitrate(1_000_000).unwrap();
+        let (next, next_flag) = encoder.encode(&pixels, 200_000, false).unwrap();
+        assert!(
+            !next_flag && !omabeam_encoder::inspect_h264(&next).unwrap(),
+            "a bitrate update must not insert an IDR"
+        );
+        assert!(decoder.decode(&next).unwrap().is_some());
+        assert_eq!(encoder.name, "OpenH264 software");
     }
 
     #[test]

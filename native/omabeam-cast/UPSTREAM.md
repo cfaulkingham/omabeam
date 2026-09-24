@@ -26,8 +26,12 @@ the unrelated Chromium Rust compiler download. OmaBeam itself still uses Rust.
 
 The build script makes only build-integration changes in the cached checkout:
 it adds this executable to the discovery/platform/certificate visibility lists,
-registers the overlay target, and marks two parser-version fields
-`[[maybe_unused]]` when the optional Rust parsers are disabled. The upstream
+registers the overlay target, marks two parser-version fields
+`[[maybe_unused]]` when the optional Rust parsers are disabled, and sets
+`SessionConfig::max_in_flight_media_duration` to 150 ms in
+`SenderSession::CreateSender`. That override is re-applied after every sync.
+The default window is `clamp(2 * RTT, 66 ms, playout / 3)`, so on ethernet it
+never grows past 66 ms and a late receiver checkpoint stalls the sender. The upstream
 certificate and transport implementations are retained. Production linking does
 not enable or link FFmpeg, SDL, Opus, or VPX; `--upstream` enables those libraries
 only for the reference development executables.

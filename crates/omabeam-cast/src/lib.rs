@@ -97,8 +97,9 @@ pub fn read_event(reader: &mut impl Read) -> Result<Value> {
     Ok(event)
 }
 
-/// A single Annex-B access unit. Producers must restart with an IDR if any
-/// encoded frame is discarded, and apply feedback before encoding the next.
+/// A single Annex-B access unit. Producers must restart with an IDR if the
+/// helper discards a frame. A retry result means this access unit is still
+/// held until the receiver's window opens, and must not be replaced by a delta.
 pub fn write_frame(
     writer: &mut impl Write,
     sequence: u64,

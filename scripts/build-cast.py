@@ -181,6 +181,36 @@ def collect_notices(source, output, gn, spec):
     print(f"Cast notices: {destination}")
 
 
+def pin_sender_inflight(source: Path) -> None:
+    """Let the sender hold four 30 fps frames instead of the 66 ms ethernet floor.
+
+    SenderImpl uses max_in_flight_media_duration when it is set. Otherwise the
+    window is clamp(2*RTT, 66ms, playout/3), which stays at 66 ms on a fast LAN.
+    SenderSession::CreateSender never sets the override. Re-applied after sync
+    because gclient restores the upstream file.
+    """
+    path = source / "cast/streaming/public/sender_session.cc"
+    text = path.read_text()
+    marker = "config.max_in_flight_media_duration = std::chrono::milliseconds(150);"
+    if marker in text:
+        return
+    anchor = (
+        "  OSP_DCHECK(config.IsValid());\n"
+        "  return std::make_unique<SenderImpl>(*config_.environment, packet_router_,\n"
+        "                                      std::move(config), type);"
+    )
+    if text.count(anchor) != 1:
+        raise RuntimeError("Open Screen SenderSession::CreateSender anchor changed")
+    path.write_text(text.replace(anchor,
+        "  // OmaBeam: four frames at 30 fps. The default window clamps to 66 ms\n"
+        "  // on a low-RTT link, which stalls a receiver that checkpoints late.\n"
+        "  config.max_in_flight_media_duration = std::chrono::milliseconds(150);\n"
+        "  OSP_DCHECK(config.IsValid());\n"
+        "  return std::make_unique<SenderImpl>(*config_.environment, packet_router_,\n"
+        "                                      std::move(config), type);",
+        1))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cache", type=Path, default=ROOT / "target/native-cast")
@@ -217,6 +247,7 @@ def main():
     revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     if revision != spec["openscreen"]["revision"]:
         parser.error("Cached Open Screen revision differs from upstream.json; run with --sync")
+    pin_sender_inflight(source)
     gn = source / "buildtools" / ("mac" if platform.system() == "Darwin" else "linux64") / "gn"
     ninja = source / "third_party/ninja/ninja"
     if not gn.is_file() or not ninja.is_file():

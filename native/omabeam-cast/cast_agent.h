@@ -52,6 +52,8 @@ class CastAgent final : public SenderSocketFactory::Client,
   void RequestStop();
   void Submit(const Json::Value& header, const std::vector<uint8_t>& bytes);
   void Tick();
+  void PumpHeld();
+  void ReportFrame(uint64_t sequence, bool accepted, bool retry, bool keyframe);
   void Fail(std::string code, std::string message);
 
  private:
@@ -118,6 +120,18 @@ class CastAgent final : public SenderSocketFactory::Client,
   int min_bitrate_ = 300000;
   int max_bitrate_ = 4000000;
   int target_bitrate_ = 0;
+  // One encoded access unit waiting for the receiver's in-flight window.
+  // Dropping it would force an IDR, so it stays here until it is admitted,
+  // picture loss invalidates it, or it is too old to present.
+  bool held_ = false;
+  bool pumping_ = false;
+  bool held_notified_ = false;
+  bool held_keyframe_ = false;
+  uint64_t held_sequence_ = 0;
+  uint64_t held_pts_ = 0;
+  uint64_t held_age_us_ = 0;
+  Clock::time_point held_at_{};
+  std::vector<uint8_t> held_bytes_;
   void OnPacketsRetransmitted(int count) override;
 };
 }  // namespace openscreen::cast

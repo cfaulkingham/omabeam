@@ -15,6 +15,11 @@ pub struct Config {
     pub height: u32,
     pub fps: u32,
     pub bitrate: u32,
+    /// Frames between IDRs. Zero keeps the historical two-second interval.
+    /// A positive value is an explicit interval; Cast uses one minute so a
+    /// keyframe is not spent on a clock.
+    #[serde(default)]
+    pub gop_frames: u32,
 }
 impl Config {
     pub fn frame_len(&self) -> Result<usize> {
@@ -33,6 +38,14 @@ impl Config {
             "invalid H.264 rate"
         );
         Ok(self.width as usize * self.height as usize * 3 / 2)
+    }
+
+    pub fn gop_frames(&self) -> u32 {
+        if self.gop_frames == 0 {
+            self.fps.saturating_mul(2).max(1)
+        } else {
+            self.gop_frames.max(1)
+        }
     }
 }
 
@@ -121,6 +134,21 @@ pub fn inspect_h264(bytes: &[u8]) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn zero_gop_is_two_seconds_and_an_explicit_interval_is_kept() {
+        let mut config = Config {
+            version: VERSION,
+            width: 16,
+            height: 16,
+            fps: 30,
+            bitrate: 100_000,
+            gop_frames: 0,
+        };
+        assert_eq!(config.gop_frames(), 60);
+        config.gop_frames = 1_800;
+        assert_eq!(config.gop_frames(), 1_800);
+    }
+
     #[test]
     fn rejects_unbounded_headers_and_incompatible_bitstreams() {
         assert!(read_json::<Reply>(&mut u32::MAX.to_le_bytes().as_slice()).is_err());

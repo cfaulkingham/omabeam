@@ -22,10 +22,16 @@ pub struct CastStats {
     pub connection: String,
     pub encoder: String,
     pub target_bitrate: u32,
+    /// Bitrate agreed at negotiation. Loss can dip below it; a quiet interval
+    /// climbs back. The bandwidth estimate must not replace this ceiling.
+    #[serde(default)]
+    pub negotiated_bitrate: u32,
     pub accepted_frames: u64,
     /// Transport ACK/cancellation count; it does not prove TV presentation.
     pub released_frames: u64,
     pub dropped_frames: u64,
+    #[serde(default)]
+    pub retransmitted_packets: u64,
     pub rtt_us: u64,
     #[serde(default)]
     pub control_heartbeats: u64,
@@ -242,6 +248,7 @@ impl ResumeSession<'_> {
                             cast.accepted_frames = 0;
                             cast.released_frames = 0;
                             cast.dropped_frames = 0;
+                            cast.retransmitted_packets = 0;
                             return Ok(Some(helper));
                         }
                         Ok(Some(event)) if event["event"] == "error" => {
@@ -467,6 +474,9 @@ fn run(
         let mut converter = YuvConverter::default();
         config.h264_bitrate = cast.target_bitrate;
         let mut encoder = AdaptiveEncoder::new(&config)?;
+        // A two-second IDR spends the whole bitrate budget and the next
+        // frames are blocky. Recovery still forces an IDR on picture loss.
+        encoder.idr_only_when_requested()?;
         let origin = Instant::now();
         let mut last_frame = origin;
         let mut last_status = origin;
@@ -475,7 +485,6 @@ fn run(
         let mut waiting = None;
         let mut force = true;
         let mut rate = cast.target_bitrate;
-        let mut rate_changed = origin;
         let mut reconnect = false;
         loop {
             if signals.stopped() {
@@ -500,8 +509,22 @@ fn run(
                     Some("keyframe") => force = true,
                     Some("feedback") => force |= event["keyframe"].as_bool().unwrap_or(false),
                     Some("frame") if event["sequence"].as_u64() == Some(sequence) => {
-                        waiting = None;
-                        force |= event["keyframe"].as_bool().unwrap_or(true);
+                        match frame_admit(&event) {
+                            FrameAdmit::Accepted { needs_keyframe } => {
+                                waiting = None;
+                                force |= needs_keyframe;
+                            }
+                            FrameAdmit::Deferred => {
+                                // The helper still holds this access unit and
+                                // will admit it when the receiver catches up.
+                                waiting = Some(Instant::now());
+                                force = false;
+                            }
+                            FrameAdmit::Discarded => {
+                                waiting = None;
+                                force = true;
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -549,13 +572,9 @@ fn run(
                     }
             {
                 let target = cast.target_bitrate;
-                if target != rate
-                    && (target < rate * 3 / 4 || rate_changed.elapsed() >= Duration::from_secs(2))
-                {
+                if target != rate {
                     encoder.set_bitrate(target)?;
                     rate = target;
-                    rate_changed = Instant::now();
-                    force = true;
                 }
                 let at = Instant::now();
                 // Unchanged desktops still need IDR recovery and keepalive.
@@ -633,6 +652,56 @@ fn run(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameAdmit {
+    Accepted {
+        needs_keyframe: bool,
+    },
+    /// The receiver's in-flight window is full. The same access unit stays
+    /// queued in the helper, so the next encode must not be a new frame.
+    Deferred,
+    /// The helper dropped the access unit. The next encoded frame must be an IDR.
+    Discarded,
+}
+
+fn frame_admit(event: &Value) -> FrameAdmit {
+    let accepted = event["accepted"].as_bool().unwrap_or(false);
+    let retry = event["retry"].as_bool().unwrap_or(false);
+    let needs_keyframe = event["keyframe"].as_bool().unwrap_or(!accepted && !retry);
+    if accepted {
+        FrameAdmit::Accepted { needs_keyframe }
+    } else if retry && !needs_keyframe {
+        FrameAdmit::Deferred
+    } else {
+        FrameAdmit::Discarded
+    }
+}
+
+/// Hold the negotiated rate until packets are retransmitted or a frame is
+/// actually discarded. A quiet interval climbs back by 150 kbit/s. The
+/// bandwidth estimate is not an input: it under-reads a sender that is not
+/// filling the link.
+fn next_cast_bitrate(target: u32, negotiated: u32, loss: bool) -> u32 {
+    const MIN_BITRATE: u32 = 300_000;
+    const RECOVERY_STEP: u32 = 150_000;
+    let ceiling = if negotiated == 0 {
+        target.max(MIN_BITRATE)
+    } else {
+        negotiated.max(MIN_BITRATE)
+    };
+    let target = target.clamp(MIN_BITRATE, ceiling);
+    if loss {
+        return target
+            .saturating_mul(3)
+            .saturating_div(4)
+            .clamp(MIN_BITRATE, ceiling);
+    }
+    if target < ceiling {
+        return target.saturating_add(RECOVERY_STEP).min(ceiling);
+    }
+    target
+}
+
 fn apply_event(event: &Value, stats: &mut CastStats) -> Result<()> {
     match event["event"].as_str() {
         Some("error") => bail!(
@@ -646,18 +715,96 @@ fn apply_event(event: &Value, stats: &mut CastStats) -> Result<()> {
             stats.target_bitrate = event["bitrate"]
                 .as_u64()
                 .context("Missing negotiated bitrate")? as u32;
+            stats.negotiated_bitrate = stats.target_bitrate;
+            stats.dropped_frames = 0;
+            stats.retransmitted_packets = 0;
         }
         Some("feedback") => {
-            stats.target_bitrate = event["bitrate"]
-                .as_u64()
-                .unwrap_or(stats.target_bitrate.into()) as u32;
+            let dropped = event["dropped"].as_u64().unwrap_or(0);
+            let retransmitted = event["retransmitted_packets"].as_u64().unwrap_or(0);
+            let loss =
+                dropped > stats.dropped_frames || retransmitted > stats.retransmitted_packets;
+            stats.dropped_frames = dropped;
+            stats.retransmitted_packets = retransmitted;
             stats.accepted_frames = event["accepted"].as_u64().unwrap_or(0);
             stats.released_frames = event["released"].as_u64().unwrap_or(0);
-            stats.dropped_frames = event["dropped"].as_u64().unwrap_or(0);
             stats.rtt_us = event["rtt_us"].as_u64().unwrap_or(0);
             stats.control_heartbeats = event["control_heartbeats"].as_u64().unwrap_or(0);
+            stats.target_bitrate =
+                next_cast_bitrate(stats.target_bitrate, stats.negotiated_bitrate, loss);
         }
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stats(bitrate: u32) -> CastStats {
+        CastStats {
+            target_bitrate: bitrate,
+            negotiated_bitrate: bitrate,
+            ..CastStats::default()
+        }
+    }
+
+    fn feedback(bitrate: u32, dropped: u64, retransmitted: u64) -> Value {
+        serde_json::json!({
+            "event": "feedback",
+            "bitrate": bitrate,
+            "accepted": 10,
+            "released": 10,
+            "dropped": dropped,
+            "retransmitted_packets": retransmitted,
+            "rtt_us": 12_000,
+            "control_heartbeats": 1
+        })
+    }
+
+    #[test]
+    fn feedback_without_loss_keeps_the_negotiated_bitrate() {
+        let mut cast = stats(4_000_000);
+        apply_event(&feedback(300_000, 0, 0), &mut cast).unwrap();
+        assert_eq!(cast.target_bitrate, 4_000_000);
+    }
+
+    #[test]
+    fn loss_cuts_a_quarter_and_a_quiet_interval_climbs_back() {
+        let mut cast = stats(4_000_000);
+        apply_event(&feedback(4_000_000, 0, 3), &mut cast).unwrap();
+        assert_eq!(cast.target_bitrate, 3_000_000);
+        apply_event(&feedback(4_000_000, 2, 3), &mut cast).unwrap();
+        assert_eq!(cast.target_bitrate, 2_250_000);
+        apply_event(&feedback(300_000, 2, 3), &mut cast).unwrap();
+        assert_eq!(cast.target_bitrate, 2_400_000);
+        let mut floor = stats(400_000);
+        apply_event(&feedback(400_000, 1, 0), &mut floor).unwrap();
+        assert_eq!(floor.target_bitrate, 300_000);
+    }
+
+    #[test]
+    fn deferred_frame_stays_in_the_prediction_chain() {
+        assert_eq!(
+            frame_admit(&serde_json::json!({
+                "event": "frame", "accepted": false, "retry": true, "keyframe": false
+            })),
+            FrameAdmit::Deferred
+        );
+        assert_eq!(
+            frame_admit(&serde_json::json!({
+                "event": "frame", "accepted": false, "keyframe": true
+            })),
+            FrameAdmit::Discarded
+        );
+        assert_eq!(
+            frame_admit(&serde_json::json!({
+                "event": "frame", "accepted": true, "keyframe": false
+            })),
+            FrameAdmit::Accepted {
+                needs_keyframe: false
+            }
+        );
+    }
 }

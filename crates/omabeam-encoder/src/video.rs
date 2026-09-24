@@ -90,7 +90,7 @@ impl Hardware {
         encoder.set_time_base((1, 1_000_000));
         encoder.set_frame_rate(Some((config.fps as i32, 1)));
         encoder.set_bit_rate(config.bitrate as usize);
-        encoder.set_gop(config.fps * 2);
+        encoder.set_gop(config.gop_frames());
         encoder.set_max_b_frames(0);
         encoder.set_flags(codec::Flags::LOW_DELAY);
         encoder.set_format(Pixel::NV12);
@@ -107,6 +107,7 @@ impl Hardware {
                 options.set("zerolatency", "1");
                 options.set("delay", "0");
                 options.set("forced-idr", "1");
+                options.set("no-scenecut", "1");
                 options.set("gpu", "-1");
             }
             Candidate::VideoToolbox => {

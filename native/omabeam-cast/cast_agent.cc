@@ -446,6 +446,87 @@ void CastAgent::Fail(std::string code, std::string message) {
   }
 }
 
+void CastAgent::ReportFrame(uint64_t sequence, bool accepted, bool retry, bool keyframe) {
+  Json::Value event;
+  event["event"] = "frame";
+  event["sequence"] = Json::UInt64(sequence);
+  event["accepted"] = accepted;
+  event["retry"] = retry;
+  event["keyframe"] = keyframe;
+  event_(std::move(event));
+}
+
+void CastAgent::PumpHeld() {
+  if (pumping_ || !held_ || shutdown_ || stop_requested_ || !current_negotiation_) return;
+  pumping_ = true;
+  struct Clear {
+    bool& flag;
+    ~Clear() { flag = false; }
+  } clear{pumping_};
+  auto& sender = *current_negotiation_->video_sender;
+  const auto now = Clock::now();
+  if (!media_origin_) {
+    media_origin_ = held_at_ - std::chrono::microseconds(static_cast<int64_t>(held_age_us_ + held_pts_));
+  }
+  const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(now - held_at_).count();
+  const uint64_t age = held_age_us_ + static_cast<uint64_t>(std::max<int64_t>(waited, 0));
+  EncodedFrame frame;
+  frame.frame_id = sender.GetNextFrameId();
+  frame.referenced_frame_id = held_keyframe_ ? frame.frame_id : frame.frame_id - 1;
+  frame.dependency = held_keyframe_ ? EncodedFrame::Dependency::kKeyFrame
+                                    : EncodedFrame::Dependency::kDependent;
+  frame.rtp_timestamp = RtpTimeTicks::FromTimeSinceOrigin(
+      std::chrono::microseconds(held_pts_), sender.config().rtp_timebase);
+  frame.reference_time = *media_origin_ + std::chrono::microseconds(held_pts_);
+  frame.capture_begin_time = frame.reference_time;
+  frame.capture_end_time = frame.reference_time;
+  frame.data = ByteView(held_bytes_.data(), held_bytes_.size());
+  const bool needs_key = (need_keyframe_ || sender.NeedsKeyFrame()) && !held_keyframe_;
+  const bool stale = age >= 500000 || now - frame.reference_time >= std::chrono::milliseconds(500);
+  const bool fits = in_flight_bytes_ + held_bytes_.size() <= 8 * 1024 * 1024 &&
+      sender.GetInFlightMediaDuration(frame.rtp_timestamp) <= sender.GetMaxInFlightMediaDuration();
+  const uint64_t sequence = held_sequence_;
+  if (!needs_key && !stale && fits) {
+    // EnqueueFrame encrypts and copies before it returns.
+    const auto result = sender.EnqueueFrame(frame);
+    if (result == Sender::OK) {
+      in_flight_[frame.frame_id] = held_bytes_.size();
+      in_flight_bytes_ += held_bytes_.size();
+      sequence_ = held_sequence_;
+      last_pts_ = held_pts_;
+      need_keyframe_ = false;
+      held_ = false;
+      held_notified_ = false;
+      held_bytes_.clear();
+      if (++accepted_ == 1) State("streaming");
+      ReportFrame(sequence, true, false, sender.NeedsKeyFrame());
+      return;
+    }
+    if (result != Sender::MAX_DURATION_IN_FLIGHT) {
+      need_keyframe_ = true;
+      held_ = false;
+      held_notified_ = false;
+      held_bytes_.clear();
+      ++dropped_;
+      ReportFrame(sequence, false, false, true);
+      return;
+    }
+  }
+  if (needs_key || stale) {
+    need_keyframe_ = true;
+    held_ = false;
+    held_notified_ = false;
+    held_bytes_.clear();
+    ++dropped_;
+    ReportFrame(sequence, false, false, true);
+    return;
+  }
+  if (!held_notified_) {
+    held_notified_ = true;
+    ReportFrame(sequence, false, true, false);
+  }
+}
+
 void CastAgent::Submit(const Json::Value& header, const std::vector<uint8_t>& bytes) {
   if (shutdown_ || stop_requested_) return;
   if (!current_negotiation_) {
@@ -462,53 +543,43 @@ void CastAgent::Submit(const Json::Value& header, const std::vector<uint8_t>& by
   const uint64_t sequence = header["sequence"].asUInt64();
   const uint64_t age = header["capture_age_us"].asUInt64();
   const bool keyframe = header["keyframe"].asBool();
-  if (pts > 7ULL * 24 * 3600 * 1000000 || age > 10000000 ||
-      sequence <= sequence_ || (sequence_ && pts < last_pts_ + 1000)) {
-    Fail("protocol", "Nonmonotonic or out-of-range video timestamp/sequence");
+  if (pts > 7ULL * 24 * 3600 * 1000000 || age > 10000000) {
+    Fail("protocol", "Out-of-range video timestamp");
+    return;
+  }
+  if (held_ && sequence == held_sequence_) {
+    if (pts != held_pts_) {
+      Fail("protocol", "Retried Cast frame changed its timestamp");
+      return;
+    }
+    held_bytes_.assign(bytes.begin(), bytes.end());
+    held_age_us_ = age;
+    held_at_ = Clock::now();
+    held_keyframe_ = keyframe;
+    PumpHeld();
+    return;
+  }
+  if (sequence <= sequence_ || (sequence_ && pts < last_pts_ + 1000)) {
+    Fail("protocol", "Nonmonotonic video timestamp/sequence");
     return;
   }
   if (sequence != sequence_ + 1) need_keyframe_ = true;
-  sequence_ = sequence;
-  last_pts_ = pts;
-  auto& sender = *current_negotiation_->video_sender;
-  const auto now = Clock::now();
-  if (!media_origin_) media_origin_ = now - std::chrono::microseconds(age + pts);
-  EncodedFrame frame;
-  frame.frame_id = sender.GetNextFrameId();
-  frame.referenced_frame_id = keyframe ? frame.frame_id : frame.frame_id - 1;
-  frame.dependency = keyframe ? EncodedFrame::Dependency::kKeyFrame
-                              : EncodedFrame::Dependency::kDependent;
-  frame.rtp_timestamp = RtpTimeTicks::FromTimeSinceOrigin(
-      std::chrono::microseconds(pts), sender.config().rtp_timebase);
-  frame.reference_time = *media_origin_ + std::chrono::microseconds(pts);
-  frame.capture_begin_time = frame.reference_time;
-  frame.capture_end_time = frame.reference_time;
-  frame.data = ByteView(bytes.data(), bytes.size());
-  bool accepted = false;
-  if (!((need_keyframe_ || sender.NeedsKeyFrame()) && !keyframe) &&
-      age < 500000 && now - frame.reference_time < std::chrono::milliseconds(500) &&
-      in_flight_bytes_ + bytes.size() <= 8 * 1024 * 1024 &&
-      sender.GetInFlightMediaDuration(frame.rtp_timestamp) <= sender.GetMaxInFlightMediaDuration()) {
-    // EnqueueFrame encrypts/copies synchronously; `bytes` need not outlive it.
-    accepted = sender.EnqueueFrame(frame) == Sender::OK;
-  }
-  if (accepted) {
-    in_flight_[frame.frame_id] = bytes.size();
-    in_flight_bytes_ += bytes.size();
-    need_keyframe_ = false;
-    if (++accepted_ == 1) State("streaming");
-  } else {
+  if (held_) {
+    // The host replaced an access unit the helper had not admitted.
+    held_ = false;
+    held_notified_ = false;
+    held_bytes_.clear();
     ++dropped_;
-    // Skipping an encoded H.264 delta breaks the reference chain. Never feed
-    // subsequent deltas until the encoder supplies a new SPS/PPS + IDR.
-    need_keyframe_ = true;
   }
-  Json::Value event;
-  event["event"] = "frame";
-  event["sequence"] = Json::UInt64(sequence);
-  event["accepted"] = accepted;
-  event["keyframe"] = need_keyframe_ || sender.NeedsKeyFrame();
-  event_(std::move(event));
+  held_ = true;
+  held_notified_ = false;
+  held_keyframe_ = keyframe;
+  held_sequence_ = sequence;
+  held_pts_ = pts;
+  held_age_us_ = age;
+  held_at_ = Clock::now();
+  held_bytes_.assign(bytes.begin(), bytes.end());
+  PumpHeld();
 }
 
 void CastAgent::OnFrameCanceled(FrameId id) {
@@ -518,10 +589,19 @@ void CastAgent::OnFrameCanceled(FrameId id) {
     in_flight_.erase(found);
     ++released_;
     last_feedback_ = Clock::now();
+    PumpHeld();
   }
 }
 void CastAgent::OnPictureLost() {
   need_keyframe_ = true;
+  if (held_ && !held_keyframe_) {
+    const auto sequence = held_sequence_;
+    held_ = false;
+    held_notified_ = false;
+    held_bytes_.clear();
+    ++dropped_;
+    ReportFrame(sequence, false, false, true);
+  }
   Json::Value event;
   event["event"] = "keyframe";
   event_(std::move(event));
@@ -556,12 +636,12 @@ void CastAgent::Tick() {
     Fail("receiver_timeout", "Receiver stopped acknowledging video");
     return;
   }
+  // Admit a held frame as soon as the receiver checkpoints. The bitrate stays
+  // at the negotiated target; the host cuts it only after real loss.
+  PumpHeld();
   if (now < next_report_) return;
   next_report_ = now + std::chrono::seconds(1);
   auto& sender = *current_negotiation_->video_sender;
-  const int estimate = current_session_->GetEstimatedNetworkBandwidth();
-  const int available = std::clamp(static_cast<int>(estimate * 0.8), min_bitrate_, max_bitrate_);
-  if (estimate > 0) target_bitrate_ = std::min(available, target_bitrate_ + 150000);
   Json::Value event;
   event["event"] = "feedback";
   event["bitrate"] = target_bitrate_;
