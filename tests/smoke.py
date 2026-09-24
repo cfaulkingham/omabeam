@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -99,10 +100,10 @@ def frame(stream):
     return decode(stream.read(int(headers['content-length'])))
 
 
-def browser_check(server, screenshot):
+def browser_check(server, screenshot, executable=None):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, executable_path=executable)
         page = browser.new_page(viewport={'width': 480, 'height': 380})
         errors = []
         page.on('pageerror', lambda error: errors.append(str(error)))
@@ -148,6 +149,37 @@ def browser_check(server, screenshot):
             assert page.get_by_role('link', name='Snapshot').get_attribute('href') == 'frame.jpg'
             if screenshot:
                 page.screenshot(path=screenshot)
+            # Missed status polls must not stop a working picture. Wait longer
+            # than the old five-failure limit; page waits keep route handlers running.
+            page.route('**/stats', lambda route: route.abort())
+            page.wait_for_timeout(7000)
+            assert page.evaluate('ended') is False
+            assert page.locator('#view').get_attribute('src')
+            assert server.stats()['viewers'] == 1
+            assert 'Waiting for the host' in page.locator('#error').inner_text()
+            page.unroute('**/stats')
+            page.wait_for_function('["Live", "Live · waiting for changes"].includes(document.getElementById("status").textContent)')
+            # The picture kept playing, so also wait for a poll to succeed.
+            page.wait_for_function('!document.getElementById("error").textContent.includes("Waiting for the host")')
+            # A long outage must not present a stale picture as live. Shift the
+            # last success only after a poll has failed, so none still in flight resets it.
+            page.route('**/stats', lambda route: route.abort())
+            page.wait_for_function('failures > 0')
+            page.evaluate('lastPollOk -= 31000')
+            page.get_by_role('heading', name='Can’t reach OmaBeam').wait_for()
+            assert page.locator('#view').get_attribute('src') is None
+            assert page.evaluate('ended') is False
+            page.unroute('**/stats')
+            page.wait_for_function('document.getElementById("view").naturalWidth > 0')
+            page.locator('#disconnected').wait_for(state='hidden')
+            eventually(lambda: server.stats()['viewers'] == 1)
+            # An unknown or removed share ends at once instead of retrying.
+            gone = browser.new_page()
+            gone.route('**/stats', lambda route: route.fulfill(status=404, body='not found'))
+            gone.goto(server.url, wait_until='domcontentloaded')
+            gone.wait_for_function('document.getElementById("status").textContent === "Share ended"')
+            assert gone.locator('#error').inner_text() == 'This share has ended.'
+            gone.close()
             # Simulate the public diagnostics contract after source loss. Frames
             # must disappear even if the TCP stream itself has not errored yet.
             page.route('**/stats', lambda route: route.fulfill(json={**server.stats(), 'state': 'ended', 'error': 'Selected window closed'}))
@@ -163,13 +195,14 @@ def browser_check(server, screenshot):
             assert not errors, errors
         finally:
             browser.close()
-    print('PASS browser: native-pixel diagnostics, viewer cleanup, live image, pause/resume, fit modes, fullscreen, source-loss feedback')
+    print('PASS browser: native-pixel diagnostics, viewer cleanup, live image, pause/resume, fit modes, fullscreen, missed polls, unreachable host, ended share, source-loss feedback')
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--binary', default='target/debug/omabeam')
     parser.add_argument('--browser', action='store_true')
+    parser.add_argument('--browser-executable', default=os.environ.get('OMABEAM_TEST_CHROMIUM') or shutil.which('google-chrome') or shutil.which('chromium'))
     parser.add_argument('--screenshot')
     parser.add_argument('--capture-output', help='Test an output in an existing Wayland session')
     parser.add_argument('--capture-scale', type=int, help='Assert this integer output scale in capture tests')
@@ -252,7 +285,7 @@ def main():
     print('PASS invalid arguments rejected before starting capture')
     if opts.browser:
         with Server(opts.binary, ['--jpeg', '--fps', '10', '--native-pixels']) as server:
-            browser_check(server, opts.screenshot)
+            browser_check(server, opts.screenshot, opts.browser_executable)
 
 
 if __name__ == '__main__':

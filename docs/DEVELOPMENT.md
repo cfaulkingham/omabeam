@@ -269,8 +269,17 @@ Each peer's retransmission cache is capped at 512 packets. A send queue over
 2 MiB or 250 ms disconnects the peer instead of accumulating video latency.
 An encoded frame over 2 MiB disables H.264 for the share. Viewer negotiation
 has a ten-second first-playback deadline, then falls back to JPEG; stalled
-decoding also falls back. Pause, page exit, source loss, and stale async
-answers release peer resources.
+decoding also falls back. A failure before the first frame plays is sticky:
+the page stays on JPEG until the viewer selects Auto again. H.264 is tried
+again on the next reconnect after a stream that played and then dropped, a
+network failure during the offer exchange, a 409 offer response (a lapsed
+display lease that the page claims again), or any failure while status polls
+are failing (the host is unreachable, so the failure says nothing about
+H.264). Failed status polls back off (1, 2, 4, then 5 seconds) without
+stopping media. After 30 seconds without a successful poll, the viewer stops
+media, releases its display lease, shows that it cannot reach OmaBeam, and
+keeps polling; the next successful poll reconnects. Pause, page exit, source
+loss, and stale async answers release peer resources.
 
 The `webrtc` stats object reports the selected encoder, fallback reason, timings, dimensions,
 encoded FPS/frames/keyframes, dropped frames, connected/pending peers,

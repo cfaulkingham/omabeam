@@ -206,7 +206,9 @@ the steps below. Hardware-accelerated H.264 is available for every live share.
 
 Window capture follows the selected window even when another window overlaps
 it. If the compositor cannot capture it separately, select an area explicitly.
-A lost source ends the share and clears the viewer image.
+A lost source ends the share and clears the viewer image. Brief network
+interruptions do not stop the picture. If the host cannot be reached for about
+30 seconds, the viewer says so and keeps retrying.
 
 Defaults: 15 FPS (60 FPS for extended desktop), H.264 / WebRTC with JPEG fallback, JPEG quality 55, native
 logical width, cursor off, 4 Mbit/s at 15 FPS (16 Mbit/s at 60 FPS), and local network (TCP **9847** and UDP **9848** on
@@ -240,9 +242,12 @@ H.264 targets 4 Mbit/s at 15 FPS and scales with frame rate up to 16 Mbit/s
 as-is. NVIDIA NVENC uses VBR with a 2× burst cap so quality can recover after
 fast motion without adding encode delay.
 Advanced lets you adjust the target bitrate. The browser automatically falls back to JPEG
-if H.264 negotiation or playback fails, and stays on JPEG. Click **Video: Auto**
-to select JPEG manually, or **Video: JPEG** to try Auto again. Pause releases
-the connection. `--jpeg` selects JPEG/MJPEG from the command line.
+if H.264 negotiation or playback fails, and stays on JPEG. A stream that was
+playing and then dropped, or that failed while the host was unreachable,
+continues on JPEG and tries H.264 again on the next reconnect. Click
+**Video: Auto** to select JPEG manually, or **Video: JPEG** to
+try Auto again. Pause releases the connection. `--jpeg` selects JPEG/MJPEG from
+the command line.
 
 H.264 uses 4:2:0 color, which can soften fine colored text. Preview and browser
 snapshots remain JPEG; PNG screenshots are unchanged. Odd image dimensions

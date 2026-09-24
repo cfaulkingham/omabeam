@@ -208,16 +208,74 @@ def signaling(server, browser):
 
 
 def fallback(server, browser):
-    for init, abort in [("window.RTCPeerConnection = undefined", False), ('', True)]:
+    for init, offer in [
+        ("window.RTCPeerConnection = undefined", None),
+        ('', lambda route: route.abort()),
+        # The page's display lease lapsed, for example during an outage.
+        ('', lambda route: route.fulfill(status=409, body='This display is already connected to another device.')),
+    ]:
         page = browser.new_page()
         if init: page.add_init_script(init)
-        if abort: page.route('**/webrtc/offer', lambda route: route.abort())
+        if offer: page.route('**/webrtc/offer', offer)
         page.goto(server.url, wait_until='domcontentloaded')
         page.wait_for_function("playback === 'jpeg' && img.naturalWidth > 0")
         assert page.locator('#transport-note').inner_text().startswith('JPEG fallback')
+        if offer:
+            # An offer that never reached the host, or one refused until the
+            # lease is claimed again, may succeed on the next reconnect.
+            assert page.evaluate('preferRtc') is True
+            assert page.locator('#transport').inner_text() == 'Video: Auto'
         page.close()
     eventually(lambda: server.stats()['viewers'] == 0)
-    print('PASS WebRTC fallback: missing browser API and failed signaling still display JPEG')
+    print('PASS WebRTC fallback: missing browser API, failed signaling, and a lapsed display lease still display JPEG')
+
+
+def sticky_fallback(server, browser):
+    page = browser.new_page()
+    errors, offers = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('request', lambda request: offers.append(request.url) if 'webrtc/offer' in request.url else None)
+    page.route('**/webrtc/offer', lambda route: route.fulfill(status=503, body='no'))
+    page.goto(server.url, wait_until='domcontentloaded')
+    page.wait_for_function("playback === 'jpeg' && img.naturalWidth > 0")
+    assert page.evaluate('preferRtc === false')
+    assert page.locator('#transport').inner_text() == 'Video: JPEG'
+    assert page.locator('#transport-note').inner_text().startswith('JPEG fallback')
+    # A JPEG reconnect must not retry H.264 that never played.
+    count = len(offers)
+    page.evaluate("img.dispatchEvent(new Event('error'))")
+    page.wait_for_function("playback === 'jpeg' && img.naturalWidth > 0")
+    page.wait_for_timeout(2000)
+    assert len(offers) == count, offers
+    assert page.locator('#transport-note').inner_text().startswith('JPEG fallback')
+    page.unroute('**/webrtc/offer')
+    page.locator('#transport').click()
+    playing(page)
+    page.close()
+    assert not errors, errors
+    print('PASS WebRTC sticky fallback: failed negotiation stays on JPEG across reconnects until Auto is selected')
+
+
+def outage_fallback(server, browser):
+    page = browser.new_page()
+    errors = []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.goto(server.url, wait_until='domcontentloaded')
+    playing(page)
+    # While status polls fail the host is unreachable, so a failed negotiation
+    # says nothing about H.264 and must not make JPEG sticky.
+    page.route('**/stats', lambda route: route.abort())
+    page.wait_for_function('failures > 0')
+    page.route('**/webrtc/offer', lambda route: route.fulfill(status=503, body='no'))
+    page.evaluate('connectRtc()')
+    page.wait_for_function("playback === 'jpeg'")
+    assert page.evaluate('preferRtc') is True
+    assert page.locator('#transport').inner_text() == 'Video: Auto'
+    page.unroute('**/webrtc/offer')
+    page.unroute('**/stats')
+    page.close()
+    assert not errors, errors
+    print('PASS WebRTC outage fallback: an H.264 failure while status polls fail stays retryable')
 
 
 def static_capture(server, browser, output, sway_socket):
@@ -291,6 +349,8 @@ def main():
                     print(f'PASS selected encoder: {selected}')
                     signaling(server, browser)
                     fallback(server, browser)
+                    sticky_fallback(server, browser)
+                    outage_fallback(server, browser)
                     dimension_checks(args.binary, browser)
             finally:
                 browser.close()
