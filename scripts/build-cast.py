@@ -92,7 +92,24 @@ def library_includes(package, include_root):
         if link.exists():
             raise RuntimeError(f"Unexpected dependency header cache entry: {link}")
         link.symlink_to(source, target_is_directory=True)
-    return [str(destination)]
+    includes = [str(destination)]
+    if package == "sdl2":
+        # Debian/Ubuntu's public SDL_config.h includes a second header from
+        # /usr/include/<multiarch>/SDL2. Expose that SDL-only directory too;
+        # adding the whole host multiarch directory would shadow sysroot libc.
+        multiarch = subprocess.check_output(["cc", "-print-multiarch"], text=True).strip()
+        source = directory / multiarch / "SDL2" if multiarch else None
+        if source is not None and source.is_dir() and source != directory / "SDL2":
+            extra = include_root / "sdl2-multiarch"
+            extra.mkdir(parents=True, exist_ok=True)
+            link = extra / "SDL2"
+            if link.is_symlink():
+                link.unlink()
+            if link.exists():
+                raise RuntimeError(f"Unexpected dependency header cache entry: {link}")
+            link.symlink_to(source, target_is_directory=True)
+            includes.append(str(extra))
+    return includes
 
 
 def gn_arguments(upstream, include_root, target_cpu=None):

@@ -11,12 +11,16 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from packaging import ROOT, PACKAGER, PLUGIN_ID, executable, install_env, source_copy
 
 SPEC = importlib.util.spec_from_file_location("release_assets", ROOT / "scripts/release-assets.py")
 RELEASE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(RELEASE)
+CAST_SPEC = importlib.util.spec_from_file_location("cast_build", ROOT / "scripts/build-cast.py")
+CAST = importlib.util.module_from_spec(CAST_SPEC)
+CAST_SPEC.loader.exec_module(CAST)
 
 
 class Release(unittest.TestCase):
@@ -62,6 +66,22 @@ class Release(unittest.TestCase):
         cargo.write_text(cargo.read_text().replace(f'version = "{version}"', 'version = "9.9.9"', 1))
         with self.assertRaisesRegex(ValueError, "versions must match"):
             RELEASE.release_version(self.source)
+
+    def test_cast_reference_headers_include_ubuntu_multiarch_sdl_only(self):
+        headers = self.base / "include"
+        (headers / "SDL2").mkdir(parents=True)
+        (headers / "SDL2/SDL_config.h").write_text('#include <SDL2/_real_SDL_config.h>\n')
+        multiarch = headers / "x86_64-linux-gnu"
+        (multiarch / "SDL2").mkdir(parents=True)
+        (multiarch / "SDL2/_real_SDL_config.h").write_text("// target configuration\n")
+        (multiarch / "stdio.h").write_text("// must not shadow the pinned sysroot\n")
+        with patch.object(CAST.platform, "system", return_value="Linux"), \
+             patch.object(CAST, "library_dirs", return_value=str(headers)), \
+             patch.object(CAST.subprocess, "check_output", return_value="x86_64-linux-gnu\n"):
+            for _ in range(2):
+                includes = [Path(p) for p in CAST.library_includes("sdl2", self.base / "isolated")]
+                self.assertTrue(any((p / "SDL2/_real_SDL_config.h").is_file() for p in includes))
+                self.assertFalse(any((p / "stdio.h").exists() for p in includes))
 
     def test_aur_requires_both_architectures_checksums_and_cast(self):
         x86 = self.bundle("x86_64")
