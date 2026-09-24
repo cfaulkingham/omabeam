@@ -61,9 +61,11 @@ QtObject {
   property var stdout: null
   property var stderr: null
   property string output: ""
+  // Records every signal() call so tests can verify teardown behavior.
+  property var signals: []
   signal started()
   signal exited(int code, int exitStatus)
-  function signal(number) { running = false }
+  function signal(number) { signals.push(number); running = false }
   function write(data) {}
   function finish(code, exitStatus, payload) {
     this.output = payload
@@ -73,6 +75,16 @@ QtObject {
 }''',
             "SplitParser": 'import QtQuick\nQtObject { property string splitMarker: ""; signal read(string chunk) }',
             "StdioCollector": 'import QtQuick\nQtObject { property bool waitForEnd: true; property string text: ""; signal streamFinished() }',
+            "FileView": '''import QtQuick
+QtObject {
+  property string path: ""
+  property bool watchChanges: false
+  property bool preload: true
+  property bool printErrors: true
+  signal loaded()
+  signal loadFailed(string error)
+  signal fileChanged()
+}''',
         },
         "qs/Commons": {
             "Color": '''pragma Singleton
@@ -212,7 +224,11 @@ def controller_tests(app, imports):
     panel = component.create()
     assert panel, "\n".join(e.toString() for e in component.errors())
     commands = {name: panel.findChild(QObject, name + "Command") for name in ("status", "copy", "stop", "picker", "send", "qr")}
+    poll_timer = panel.findChild(QObject, "pollTimer")
+    watch_debounce_timer = panel.findChild(QObject, "watchDebounceTimer")
+    runtime_watch = panel.findChild(QObject, "runtimeWatch")
     check(engine, panel, 'subject.omabeamBin.endsWith("/omarchy-plugin/omabeam") && subject.omabeamBin.indexOf("file:") < 0')
+    check(engine, runtime_watch, 'subject.path === "" && subject.watchChanges === true && subject.printErrors === false')
 
     def call(code):
         return run(engine, panel, code)
@@ -227,9 +243,77 @@ def controller_tests(app, imports):
 
     finish("status", code=127)
     expect('subject.ready && subject.statusError.indexOf("--backend-only") >= 0')
+    # The runtime directory does not exist before the first --status call
+    # (native code creates it as a side effect of that call); the watch is
+    # armed right after, success or not, and never re-armed after that.
+    check(engine, runtime_watch, 'subject.path === "/test-home/omabeam"')
+
+    # A failed first --status call (a Command-level failure such as a
+    # timeout, not just a nonzero exit) must arm the watch too: arming
+    # never retries, so this is the only chance a fresh panel gets.
+    other_component = QQmlComponent(engine, QUrl.fromLocalFile(str(ROOT / "omarchy-plugin/Panel.qml")))
+    other_panel = other_component.create()
+    assert other_panel, "\n".join(e.toString() for e in other_component.errors())
+    other_status = other_panel.findChild(QObject, "statusCommand")
+    other_watch = other_panel.findChild(QObject, "runtimeWatch")
+    check(engine, other_watch, 'subject.path === ""')
+    run(engine, other_status, 'subject.fail("boom");')
+    app.processEvents()
+    check(engine, other_watch, 'subject.path === "/test-home/omabeam"')
+    other_panel.deleteLater()
+    app.processEvents()
+
     call('subject.refresh();')
     finish("status", code=1)
     expect('subject.ready && !subject.sessionOn && subject.session.state === "idle"')
+
+    # Idle polling backs off to the 30s safety net now that a directory
+    # watch handles the common case; open/live cadences are unchanged.
+    check(engine, poll_timer, 'subject.interval === 30000')
+    call('subject.open();')  # open() also calls refresh() itself
+    check(engine, poll_timer, 'subject.interval === 1000')
+    finish("status", code=1)
+    call('subject.close();')
+    check(engine, poll_timer, 'subject.interval === 30000')
+
+    # A SUSTAINED burst of directory-change events while idle (e.g. another
+    # bar instance's share rewriting live.json roughly every 250ms, each
+    # rename surfacing as 2+ events) must not suppress the refresh for as
+    # long as it lasts: the timer starts on the first event and later
+    # events do not restart it, so it still fires ~300ms after the FIRST
+    # one. 100ms spacing for 2s (well past the old restart()-forever bug's
+    # failure point) stays well under the 300ms window between events.
+    check(engine, watch_debounce_timer, 'subject.interval === 300 && subject.repeat === false')
+    check(engine, commands["status"], '!subject.pending')
+    for _ in range(4):
+        run(engine, runtime_watch, 'subject.fileChanged(); subject.fileChanged();')
+        QTest.qWait(100)
+    check(engine, commands["status"], 'subject.pending')  # fired within ~400ms of the FIRST event
+    for _ in range(16):
+        run(engine, runtime_watch, 'subject.fileChanged(); subject.fileChanged();')
+        QTest.qWait(100)
+    check(engine, commands["status"], 'subject.pending')  # still just the one in-flight request
+    run(engine, watch_debounce_timer, 'subject.stop();')  # clean slate for the next phase below
+    finish("status", code=1)
+
+    # While sharing, or while the panel is open, watch events are ignored
+    # outright: the 2s/1s poll already covers those states, so reacting
+    # here would only add extra --status spawns on top of it.
+    call('subject.refresh();')
+    finish("status", LIVE)
+    check(engine, commands["status"], '!subject.pending')
+    run(engine, runtime_watch, 'subject.fileChanged();')
+    QTest.qWait(350)
+    check(engine, commands["status"], '!subject.pending')  # ignored: sessionOn
+    call('subject.refresh();')
+    finish("status", code=1)
+    call('subject.open();')  # open() calls refresh() itself; drain it first
+    finish("status", code=1)
+    run(engine, runtime_watch, 'subject.fileChanged();')
+    QTest.qWait(350)
+    check(engine, commands["status"], '!subject.pending')  # ignored: opened, even while idle
+    call('subject.close();')
+    print("PASS: directory watch arms after the first status call (success or failure), idle cadence backs off, a sustained burst still debounces to one refresh while idle, and is ignored while sharing or open")
     call('subject.open(); subject.launchPicker();')
     expect('subject.opened')  # Do not hide a failed launch.
     run(engine, commands["picker"], 'subject.running = false;')
@@ -335,6 +419,47 @@ def controller_tests(app, imports):
     call('subject.refresh();')
     finish("status", code=1, status=1)
     expect('subject.sessionOn && subject.statusError !== ""')
+
+    # Destroying the panel must not signal a timeoutMs: 0 launch (the picker,
+    # the send window) but still stops a bounded command left running.
+    # teardown() is exercised directly rather than via real object
+    # destruction, which races Qt's own deferred deletion in a test.
+    run(engine, commands["send"], 'subject.running = true;')
+    run(engine, commands["picker"], 'subject.running = true;')
+    run(engine, commands["stop"], 'subject.running = true;')
+    run(engine, commands["send"], 'subject.teardown();')
+    run(engine, commands["picker"], 'subject.teardown();')
+    run(engine, commands["stop"], 'subject.teardown();')
+    check(engine, commands["send"], 'subject.signals.length === 0')
+    check(engine, commands["picker"], 'subject.signals.length === 0')
+    check(engine, commands["stop"], 'subject.signals.length === 2 && subject.signals[0] === 15 && subject.signals[1] === 9')
+    run(engine, commands["send"], 'subject.running = false;')
+    run(engine, commands["picker"], 'subject.running = false;')
+    run(engine, commands["stop"], 'subject.running = false;')
+
+    # A stop timeout is not proof the share stopped: no error appears until
+    # the status read it triggers confirms the outcome either way. The tail
+    # is bounded to the most recent bytes, and appears sanitized in feedback.
+    call('subject.refresh();')
+    finish("status", LIVE)
+    call('subject.stopLive();')
+    run(engine, commands["stop"], "subject.stderr.read('a'.repeat(400));")
+    run(engine, commands["stop"], "subject.stderr.read('b'.repeat(600));")
+    check(engine, commands["stop"], 'subject.stderrTail.length === 512 && subject.stderrTail.indexOf("a") < 0 && subject.stderrTail.indexOf("b") >= 0')
+    run(engine, commands["stop"], 'subject.fail("The command took too long to respond.");')
+    expect('subject.sessionOn && subject.stopPending && subject.feedback === ""')
+    finish("status", code=1)
+    expect('!subject.sessionOn && !subject.stopPending && subject.feedback === "Sharing stopped." && !subject.feedbackError')
+
+    call('subject.refresh();')
+    finish("status", LIVE)
+    call('subject.stopLive();')
+    run(engine, commands["stop"], "subject.stderr.read('permission denied: <no-tty>');")
+    finish("stop", code=1)
+    expect('subject.feedbackError && subject.feedback.indexOf("permission denied: no-tty") >= 0 && subject.feedback.indexOf("<") < 0')
+    call('subject.refresh();')
+    finish("status", LIVE)
+    print("PASS: destruction spares long-lived launches, stop timeout defers to status, stderr tail is bounded and sanitized")
 
     widget_component = QQmlComponent(engine, QUrl.fromLocalFile(str(ROOT / "omarchy-plugin/BarWidget.qml")))
     widget = widget_component.create()
