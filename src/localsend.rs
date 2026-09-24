@@ -267,14 +267,8 @@ pub async fn send_text(
     Ok(())
 }
 
-pub fn resolve_link(arg: Option<&str>, live: Option<&crate::live::LiveStatus>) -> Result<String> {
-    if let Some(url) = arg.map(str::trim).filter(|url| !url.is_empty()) {
-        ensure_share_url(url)?;
-        return Ok(url.to_string());
-    }
-    let status = live.context(
-        "No live share is running. Start sharing first, or pass the URL to --send-link.",
-    )?;
+pub fn resolve_link(live: Option<&crate::live::LiveStatus>) -> Result<String> {
+    let status = live.context("No live share is running. Start sharing first.")?;
     ensure!(
         status.stats.state != "ended",
         "The share has ended. Start a new share before sending its link."
@@ -495,24 +489,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_link_prefers_an_explicit_url_and_live_status() {
+    fn resolve_link_returns_live_status_url_or_error() {
         let url = "http://192.168.1.24:9847/s/0123456789abcdef0123456789abcdef/";
-        assert_eq!(resolve_link(Some(url), None).unwrap(), url);
-        assert_eq!(resolve_link(None, Some(&live(url, "live"))).unwrap(), url);
+        assert_eq!(resolve_link(Some(&live(url, "live"))).unwrap(), url);
+        let err = resolve_link(None).unwrap_err().to_string();
+        assert!(err.contains("No live share") && err.contains("Start sharing first"));
         assert!(
-            resolve_link(None, None)
-                .unwrap_err()
-                .to_string()
-                .contains("No live share")
-        );
-        assert!(
-            resolve_link(None, Some(&live(url, "ended")))
+            resolve_link(Some(&live(url, "ended")))
                 .unwrap_err()
                 .to_string()
                 .contains("ended")
         );
         assert!(
-            resolve_link(Some("javascript:alert(1)"), None)
+            resolve_link(Some(&live("javascript:alert(1)", "live")))
                 .unwrap_err()
                 .to_string()
                 .contains("browser share link")

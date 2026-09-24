@@ -122,7 +122,7 @@ fn run() -> anyhow::Result<()> {
     }
     if args.first().is_some_and(|arg| arg == "--send-link") {
         anyhow::ensure!(args.len() == 1, "unexpected command argument");
-        let url = omabeam::localsend::resolve_link(None, omabeam::live::current_status().as_ref())?;
+        let url = omabeam::localsend::resolve_link(omabeam::live::current_status().as_ref())?;
         omabeam::app::open_send_link(url);
         return Ok(());
     }
