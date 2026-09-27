@@ -132,6 +132,8 @@ o.window("omabeam", {
   animation = "popin",
   size = { "(monitor_w*3/4)", "(monitor_h*3/4)" },
   max_size = { 980, 560 },
+  tag = "-default-opacity",
+  opacity = "1 1",
 })
 o.window("omabeam-send", {
   float = true,

@@ -36,6 +36,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 tokio-util = { version = "0.7", features = ["rt"] }
 qrcode = { version = "0.14", default-features = false }
 
+[patch.crates-io]
+# Keeps every Wayland seat's pointer and keyboard. The published 0.3.4
+# backend keeps only the last seat, so a virtual seat hides the real one.
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+
 [dev-dependencies]
 bytes = "1"
 image = { version = "0.25", default-features = false }

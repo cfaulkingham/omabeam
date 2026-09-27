@@ -3,6 +3,7 @@ use super::*;
 impl Render for OmaBeam {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.update_previews(cx);
+        self.promote_preview(window, cx);
         let compact = window.viewport_size().width < px(720.);
         let source_changed = cx.listener(|this, index: &usize, _, cx| {
             if this.busy {
@@ -678,7 +679,7 @@ impl OmaBeam {
     }
 
     fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let frame = self.preview_frame.as_ref();
+        let frame = self.preview_shown.as_ref();
         let title = match self.page {
             Page::Tiles | Page::Windows => self.selected_client().map(client_label),
             Page::Outputs => self.selected_monitor().map(Monitor::label),

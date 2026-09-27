@@ -41,6 +41,14 @@ pub(super) struct PreviewFrame {
 }
 
 impl PreviewFrame {
+    fn clone_shown(&self) -> Self {
+        Self {
+            image: self.image.clone(),
+            width: self.width,
+            height: self.height,
+        }
+    }
+
     fn encode(frame: CapturedFrame, key: &PreviewKey) -> anyhow::Result<Self> {
         let (format, bytes, width, height) = if key.screenshot {
             (
@@ -405,8 +413,8 @@ impl super::OmaBeam {
         let key = self.desired_preview_key();
         let mut changed = false;
         if key != self.preview_key {
-            if let Some(frame) = self.preview_frame.take() {
-                frame.image.remove_asset(cx);
+            if key.is_none() {
+                self.clear_shown_preview(cx);
             }
             self.preview_key = key.clone();
             self.preview_error = None;
@@ -428,12 +436,9 @@ impl super::OmaBeam {
             if result.key == key {
                 match result.frame {
                     Ok(Some(frame)) => {
-                        if let Some(old) = self.preview_frame.take() {
-                            if old.image.id() != frame.image.id() {
-                                old.image.remove_asset(cx);
-                            }
+                        if let Some(old) = self.preview_frame.replace(frame) {
+                            self.release_preview_asset(old, cx);
                         }
-                        self.preview_frame = Some(frame);
                         self.preview_error = None;
                     }
                     Ok(None) => {}
@@ -536,10 +541,55 @@ impl super::OmaBeam {
     /// Replace the preview frame with `error`; the view shows the error and
     /// "Retry preview" only when no frame is shown.
     fn show_preview_error(&mut self, error: String, cx: &mut gpui_kit::Context<Self>) {
+        self.clear_shown_preview(cx);
+        self.preview_error = Some(error);
+    }
+
+    /// Drop the encoded frame and the image on screen.
+    fn clear_shown_preview(&mut self, cx: &mut gpui_kit::Context<Self>) {
         if let Some(old) = self.preview_frame.take() {
             old.image.remove_asset(cx);
         }
-        self.preview_error = Some(error);
+        if let Some(old) = self.preview_shown.take() {
+            old.image.remove_asset(cx);
+        }
+    }
+
+    /// Release `frame` unless it is the image currently painted.
+    fn release_preview_asset(&mut self, frame: PreviewFrame, cx: &mut gpui_kit::Context<Self>) {
+        let shown = self
+            .preview_shown
+            .as_ref()
+            .is_some_and(|shown| shown.image.id() == frame.image.id());
+        if !shown {
+            frame.image.remove_asset(cx);
+        }
+    }
+
+    /// Keep painting the previous preview until GPUI finishes decoding the new
+    /// JPEG. Swapping the element immediately flashes the empty pane.
+    pub(super) fn promote_preview(
+        &mut self,
+        window: &mut gpui_kit::Window,
+        cx: &mut gpui_kit::Context<Self>,
+    ) {
+        let Some(frame) = &self.preview_frame else {
+            return;
+        };
+        let image = frame.image.clone();
+        if image.clone().use_render_image(window, cx).is_none() {
+            return;
+        }
+        if self
+            .preview_shown
+            .as_ref()
+            .is_some_and(|shown| shown.image.id() == image.id())
+        {
+            return;
+        }
+        if let Some(old) = self.preview_shown.replace(frame.clone_shown()) {
+            old.image.remove_asset(cx);
+        }
     }
 
     /// The next listed window whose thumbnail is due; see `pick_thumbnail`.

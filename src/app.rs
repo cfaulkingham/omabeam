@@ -222,6 +222,8 @@ pub struct OmaBeam {
     thumbnail_worker: ThumbnailWorker,
     preview_key: Option<PreviewKey>,
     preview_frame: Option<PreviewFrame>,
+    /// Last preview GPUI has decoded. Stays up while the next JPEG loads.
+    preview_shown: Option<PreviewFrame>,
     preview_error: Option<String>,
     preview_updated: Instant,
     thumbnail_index: usize,
@@ -448,6 +450,7 @@ impl OmaBeam {
             thumbnail_worker: preview::thumbnail_worker(options.demo),
             preview_key: None,
             preview_frame: None,
+            preview_shown: None,
             preview_error,
             preview_updated: Instant::now() - Duration::from_secs(1),
             thumbnail_index: 0,
