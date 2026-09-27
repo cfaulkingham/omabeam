@@ -1,6 +1,6 @@
 # Generated from verified release archives by scripts/release-assets.py.
 pkgname=omabeam-bin
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='Window, screen, area and Google Cast sharing for Omarchy'
 arch=('x86_64' 'aarch64')
@@ -16,8 +16,8 @@ conflicts=('omabeam')
 options=('!strip' '!debug')
 source_x86_64=("$url/releases/download/v$pkgver/omabeam-$pkgver-x86_64-unknown-linux-gnu.tar.gz")
 source_aarch64=("$url/releases/download/v$pkgver/omabeam-$pkgver-aarch64-unknown-linux-gnu.tar.gz")
-sha256sums_x86_64=('33059b8d26d3d23f53200b8f23e4a6f79d5fe29f87c4c79294415bcd260f1b5f')
-sha256sums_aarch64=('4a2352786ef11d9913cdd80074a1d6111bc8a675691add702e6c3ca9118d06a8')
+sha256sums_x86_64=('cc93765e21a5bbcea2706bdaab15ceebf7d6088e9a96deb5b531db7b9e67efda')
+sha256sums_aarch64=('fe0115c7212e6426972d482e3421b717ed5ab9febe5f2f52fba2cdaf207694ad')
 
 package() {
   cd "$srcdir/io.github.cfaulkingham.omabeam"

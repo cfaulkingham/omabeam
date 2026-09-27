@@ -1,6 +1,6 @@
 pkgbase = omabeam-bin
 	pkgdesc = Window, screen, area and Google Cast sharing for Omarchy
-	pkgver = 0.2.0
+	pkgver = 0.2.1
 	pkgrel = 1
 	url = https://github.com/cfaulkingham/omabeam
 	arch = x86_64
@@ -26,13 +26,13 @@ pkgbase = omabeam-bin
 	depends = rsync
 	depends = jq
 	depends = python
-	provides = omabeam=0.2.0
+	provides = omabeam=0.2.1
 	conflicts = omabeam
 	options = !strip
 	options = !debug
-	source_x86_64 = https://github.com/cfaulkingham/omabeam/releases/download/v0.2.0/omabeam-0.2.0-x86_64-unknown-linux-gnu.tar.gz
-	sha256sums_x86_64 = 33059b8d26d3d23f53200b8f23e4a6f79d5fe29f87c4c79294415bcd260f1b5f
-	source_aarch64 = https://github.com/cfaulkingham/omabeam/releases/download/v0.2.0/omabeam-0.2.0-aarch64-unknown-linux-gnu.tar.gz
-	sha256sums_aarch64 = 4a2352786ef11d9913cdd80074a1d6111bc8a675691add702e6c3ca9118d06a8
+	source_x86_64 = https://github.com/cfaulkingham/omabeam/releases/download/v0.2.1/omabeam-0.2.1-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = cc93765e21a5bbcea2706bdaab15ceebf7d6088e9a96deb5b531db7b9e67efda
+	source_aarch64 = https://github.com/cfaulkingham/omabeam/releases/download/v0.2.1/omabeam-0.2.1-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = fe0115c7212e6426972d482e3421b717ed5ab9febe5f2f52fba2cdaf207694ad
 
 pkgname = omabeam-bin
