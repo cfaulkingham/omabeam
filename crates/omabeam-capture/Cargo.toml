@@ -13,8 +13,18 @@ tempfile = "3"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+gbm = { version = "0.18", optional = true }
+drm-fourcc = { version = "2", optional = true }
+omabeam-encoder = { path = "../omabeam-encoder", default-features = false, optional = true }
 
 [dev-dependencies]
 wayland-server = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
 wayland-protocols-wlr = { version = "0.3", features = ["server"] }
+
+[features]
+# Portable-SIMD pixel kernels. Requires a nightly toolchain.
+simd = []
+# GBM dmabuf capture for the zero-copy GPU encode path (Linux only: links
+# libgbm). Without it every frame decodes to CPU pixels as before.
+dmabuf = ["dep:gbm", "dep:drm-fourcc", "dep:omabeam-encoder"]

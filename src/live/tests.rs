@@ -91,6 +91,7 @@ fn extended_media_cannot_bypass_the_display_claim() {
         omabeam_capture::demo_frame(0),
         &LiveConfig::default(),
         Duration::ZERO,
+        None,
     )
     .unwrap();
     let client = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -189,9 +190,12 @@ fn matching_uses_native_pixels_and_restores_host_encoding_limits() {
             image: frame.image.clone(),
             logical_width: frame.logical_width,
             logical_height: frame.logical_height,
+
+            gpu: None,
         },
         &config,
         Duration::ZERO,
+        None,
     )
     .unwrap();
     assert_eq!((frames.stats().width, frames.stats().height), (640, 360));
@@ -213,7 +217,7 @@ fn matching_uses_native_pixels_and_restores_host_encoding_limits() {
     control
         .apply_resize(control.take_resize().unwrap(), |_| Ok(()))
         .unwrap();
-    publish_frame(&frames, frame, &config, Duration::ZERO).unwrap();
+    publish_frame(&frames, frame, &config, Duration::ZERO, None).unwrap();
     assert_eq!((frames.stats().width, frames.stats().height), (160, 90));
     assert_eq!(
         frames.inner.lock().unwrap().raw.as_ref().unwrap().config,
@@ -248,6 +252,8 @@ fn extended_desktop_browser_fixture() {
             }),
             logical_width: config.width / config.scale,
             logical_height: config.height / config.scale,
+
+            gpu: None,
         }
     }
     let config = LiveConfig {
@@ -264,7 +270,7 @@ fn extended_desktop_browser_fixture() {
     let mut session = LiveSession::start_frames(
         "Extended desktop fixture".into(),
         config,
-        pixels(&original, 0),
+        (pixels(&original, 0), None),
         Duration::ZERO,
         Some(control),
         move |_| {
@@ -272,10 +278,10 @@ fn extended_desktop_browser_fixture() {
             if let Some(resize) = next_control.take_resize() {
                 return next_control.apply_resize(resize, |config| {
                     next_display.lock().unwrap().resize(config)?;
-                    Ok(Some(pixels(config, counter)))
+                    Ok(Some((pixels(config, counter), None)))
                 });
             }
-            Ok(Some(pixels(&next_control.stats().config, counter)))
+            Ok(Some((pixels(&next_control.stats().config, counter), None)))
         },
     )
     .unwrap();
@@ -601,10 +607,10 @@ fn publish_uses_native_pixels_and_reports_capture_encode_measurements() {
         webrtc: false,
         ..LiveConfig::default()
     };
-    publish_frame(&frames, hidpi(), &config, Duration::from_millis(12)).unwrap();
+    publish_frame(&frames, hidpi(), &config, Duration::from_millis(12), None).unwrap();
     assert_eq!((frames.stats().width, frames.stats().height), (320, 180));
     config.pixel_mode = omabeam_capture::PixelMode::Native;
-    publish_frame(&frames, hidpi(), &config, Duration::from_millis(18)).unwrap();
+    publish_frame(&frames, hidpi(), &config, Duration::from_millis(18), None).unwrap();
     let stats = frames.stats();
     assert_eq!((stats.width, stats.height), (640, 360));
     let d = stats.diagnostics;
@@ -616,7 +622,7 @@ fn publish_uses_native_pixels_and_reports_capture_encode_measurements() {
     assert!(d.encode_ms.p50.unwrap() > 0.0);
     assert_eq!(d.jpeg_bytes, frames.inner.lock().unwrap().jpeg.len());
     config.max_width = Some(480);
-    publish_frame(&frames, hidpi(), &config, Duration::ZERO).unwrap();
+    publish_frame(&frames, hidpi(), &config, Duration::ZERO, None).unwrap();
     assert_eq!((frames.stats().width, frames.stats().height), (480, 270));
 }
 
@@ -628,6 +634,7 @@ fn per_viewer_diagnostics_do_not_expand_the_bounded_session_file() {
         omabeam_capture::demo_frame(0),
         &LiveConfig::default(),
         Duration::ZERO,
+        None,
     )
     .unwrap();
     let viewers: Vec<_> = (0..64).map(|_| state::Viewer::new(&frames)).collect();
@@ -1030,6 +1037,7 @@ fn rtc_only_capture_encodes_jpeg_on_demand_and_clears_pixels_on_source_loss() {
         omabeam_capture::demo_frame(1),
         &config,
         Duration::ZERO,
+        None,
     )
     .unwrap();
     assert!(frames.inner.lock().unwrap().jpeg.is_empty());

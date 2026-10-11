@@ -2957,6 +2957,7 @@ fn opaque_sessions_deliver_premultiplied_color_over_black() {
             let options = CaptureOptions {
                 cursor: false,
                 alpha,
+                gpu: false,
             };
             let target = CaptureTarget::Output("LEFT".into());
             let runtime = fixture.runtime(false);

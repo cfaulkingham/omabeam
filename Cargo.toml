@@ -14,6 +14,12 @@ default-members = [".", "crates/omabeam-encoder"]
 exclude = ["vendor/localsend"]
 resolver = "3"
 
+[features]
+# Zero-copy GPU capture and encode (Linux only): dmabuf capture plus
+# DRM_PRIME import in the encoder helper. Without it every frame decodes
+# to CPU pixels as before.
+gpu = ["omabeam-capture/dmabuf", "rustix/net"]
+
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

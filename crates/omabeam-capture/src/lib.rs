@@ -1,8 +1,12 @@
+#![cfg_attr(feature = "simd", feature(portable_simd))]
+
 //! Native Wayland capture and selection. Each session owns its connection and
 //! event queue and can run on a background thread independently of the GUI.
 
 mod capture;
 mod connection;
+#[cfg(feature = "dmabuf")]
+mod dmabuf;
 mod pixels;
 mod selector;
 
@@ -10,6 +14,10 @@ mod selector;
 mod protocol_tests;
 
 pub use capture::{CaptureOptions, CaptureSession, StillCapturer};
+#[cfg(feature = "dmabuf")]
+pub use dmabuf::{GpuFrame, demo_gpu_frame, demo_linear_gpu_frame, gpu_available};
+#[cfg(not(feature = "dmabuf"))]
+pub use dmabuf_stub::{GpuFrame, gpu_available};
 pub use pixels::{AlphaMode, CapturedFrame, PixelMode};
 pub use selector::pick_region;
 
@@ -74,5 +82,34 @@ pub fn demo_frame(frame: u32) -> CapturedFrame {
         image,
         logical_width: 640,
         logical_height: 360,
+        gpu: None,
+    }
+}
+
+#[cfg(not(feature = "dmabuf"))]
+mod dmabuf_stub {
+    //! Stand-in so `CapturedFrame.gpu` exists in every build. The private
+    //! field keeps it unconstructible: these methods are unreachable.
+    #[derive(Debug, Clone)]
+    pub struct GpuFrame {
+        _never: (),
+    }
+
+    impl GpuFrame {
+        pub fn pixel_dimensions(&self) -> (u32, u32) {
+            unreachable!("GPU capture is not compiled in")
+        }
+
+        pub(crate) fn readback(&self) -> anyhow::Result<(Vec<u8>, crate::pixels::BufferSpec)> {
+            unreachable!("GPU capture is not compiled in")
+        }
+
+        pub fn gpu_capture_stopped(&self) -> Option<String> {
+            unreachable!("GPU capture is not compiled in")
+        }
+    }
+
+    pub fn gpu_available() -> bool {
+        false
     }
 }

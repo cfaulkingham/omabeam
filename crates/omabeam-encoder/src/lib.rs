@@ -1,6 +1,9 @@
 //! Versioned, bounded pipe protocol. This library has no FFmpeg references;
 //! only the separate helper executable links to the system media libraries.
+pub mod dmabuf;
+
 use anyhow::{Result, ensure};
+pub use dmabuf::GpuRing;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::io::{self, ErrorKind, IoSliceMut, Read, Write};
 
@@ -20,6 +23,11 @@ pub struct Config {
     /// keyframe is not spent on a clock.
     #[serde(default)]
     pub gop_frames: u32,
+    /// Zero-copy capture ring. When set, the helper imports the app's dmabufs
+    /// and frames arrive as buffer ids instead of I420 pixels. The stream
+    /// size stays in `width`/`height`; the capture size is in the ring.
+    #[serde(default)]
+    pub gpu: Option<GpuRing>,
 }
 impl Config {
     pub fn frame_len(&self) -> Result<usize> {
@@ -215,6 +223,7 @@ mod tests {
             fps: 30,
             bitrate: 100_000,
             gop_frames: 0,
+            gpu: None,
         };
         assert_eq!(config.gop_frames(), 60);
         config.gop_frames = 1_800;

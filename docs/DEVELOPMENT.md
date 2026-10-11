@@ -225,8 +225,10 @@ uses the captured pixel dimensions; `--width` caps either mode without
 upscaling its pixel grid. Preview and live encoding use the same mode and width
 limit. PNG screenshots keep capture resolution. Capture uses CPU-accessible
 shared memory. Hardware encoding uploads these frames to the GPU; capture,
-resizing, and RGB-to-YUV conversion still use the CPU. HDR color management
-and DMA-BUF-only sources are unsupported.
+resizing, and RGB-to-YUV conversion still use the CPU. Builds with
+`--features gpu` capture WebRTC shares into DMA-BUFs instead when the encoder
+is Auto or Hardware (see [zero-copy encoding](#zero-copy-encoding)). HDR color
+management and DMA-BUF-only sources are unsupported.
 
 All viewer routes require the session's 128-bit URL token, compared in
 constant time. Until a request presents the token, its connection holds one of
@@ -564,8 +566,8 @@ and composite through `stream_rgb`. Live shares and Cast capture opaque frames
 (see [Capture and session behavior](#capture-and-session-behavior)), so frames
 from a source in an alpha format take the direct path as well. FFmpeg makes
 reused frames writable before modifying them, preserving frames still held by
-the encoder. Hardware encoding still uses the bounded I420 pipe protocol and
-GPU upload; this is not a zero-copy GPU capture pipeline.
+the encoder. Default builds send hardware encoding through the bounded I420
+pipe protocol and a GPU upload (see [zero-copy encoding](#zero-copy-encoding)).
 Resolution changes reinitialize OpenH264. I420 requires even dimensions;
 odd right/bottom edges are extended by one pixel. The encoder supports up to
 3840×2160 (or portrait), at least 16 pixels per edge, and at most 60 FPS; errors disable WebRTC for that share and leave JPEG
@@ -628,6 +630,36 @@ unencrypted, so DTLS-SRTP does not authenticate the link against an active
 network attacker; use this on a trusted LAN.
 `--webrtc-port` changes the UDP port, with `0` selecting an available port.
 A TCP-only SSH tunnel uses JPEG fallback.
+
+### Zero-copy encoding
+
+With `--features gpu`, WebRTC shares whose encoder is Auto or Hardware capture
+into a ring of four GBM DMA-BUFs. The app passes each frame's fd to the helper
+over a Unix socket (`SCM_RIGHTS`); the pipe carries only a marker, the
+timestamp, and the buffer id. On NVIDIA the helper imports the buffer through
+DRM → Vulkan, scales and converts it to BGR0 with `scale_vulkan`, copies it into
+a CUDA frame, and encodes with `h264_nvenc`, which converts to BT.601 limited
+range like the CPU path. On other GPUs it maps the buffer into VA-API,
+converts with `scale_vaapi` to NV12, and encodes with `h264_vaapi`; that route
+is untested on real hardware. Per frame, the helper takes a median 2.6 ms at
+1920×1080, 6.1 ms at 3840×2160, and 2.9 ms for 3840×2160 scaled to 1920×1080 on
+NVIDIA (`cargo test --release -p omabeam-encoder -- --ignored --nocapture
+report_zero_copy_timings`).
+
+Capture asks for a linear XRGB8888 buffer first; any GPU can import it.
+NVIDIA's EGL cannot render into linear buffers, so Hyprland fails that frame
+(reason `Unknown`), and capture retries with the first layout the compositor
+lists, allocated on the compositor's render node (block-linear
+`0x300000000606014` on NVIDIA). A tiled layout never crosses GPUs: importing it
+elsewhere is a fatal protocol error. `OMABEAM_DMABUF_ANY_MODIFIER=1` skips the
+linear attempt; `OMABEAM_RENDER_NODE` picks the node for linear buffers.
+
+Anything that needs CPU pixels (Snapshot, MJPEG viewers, a fallback to
+OpenH264) reads the buffer back. NVIDIA's GBM cannot map DMA-BUFs, and a
+helper that cannot import or encode them gives up; either stops DMA-BUF capture
+for the rest of the share, and the Snapshot waits for the next shared-memory
+frame. Leaving or entering zero-copy costs one IDR, since the two paths keep
+separate reference frames. Software mode never captures DMA-BUFs.
 
 ### Encoder checks
 

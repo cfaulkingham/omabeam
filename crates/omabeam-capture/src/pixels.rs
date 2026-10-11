@@ -1,5 +1,5 @@
 use crate::Rect;
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use image::{ImageEncoder, Rgba, RgbaImage, imageops};
 use std::ops::Range;
 use wayland_client::protocol::{wl_output::Transform, wl_shm::Format};
@@ -191,6 +191,8 @@ pub(crate) fn decode_rect(
         image,
         logical_width: clipped.width,
         logical_height: clipped.height,
+
+        gpu: None,
     })
 }
 
@@ -320,10 +322,16 @@ fn row_kernel(format: Format, alpha: AlphaMode) -> Result<RowKernel> {
     use AlphaMode::{Opaque, Straight};
     let kernel: RowKernel = match (format, alpha) {
         (Format::Xrgb8888, _) => |s, d| convert(s, d, xrgb8888),
-        (Format::Argb8888, Straight) => |s, d| convert(s, d, |p| unpremultiply(argb8888(p))),
+        #[cfg(feature = "simd")]
+        (Format::Argb8888, Straight) => |s, d| unpremultiply_row_simd::<true>(s, d),
+        #[cfg(not(feature = "simd"))]
+        (Format::Argb8888, Straight) => |s, d| unpremultiply_row::<true>(s, d),
         (Format::Argb8888, Opaque) => |s, d| convert(s, d, |p| over_black(argb8888(p))),
         (Format::Xbgr8888, _) => |s, d| convert(s, d, xbgr8888),
-        (Format::Abgr8888, Straight) => |s, d| convert(s, d, |p| unpremultiply(abgr8888(p))),
+        #[cfg(feature = "simd")]
+        (Format::Abgr8888, Straight) => |s, d| unpremultiply_row_simd::<false>(s, d),
+        #[cfg(not(feature = "simd"))]
+        (Format::Abgr8888, Straight) => |s, d| unpremultiply_row::<false>(s, d),
         (Format::Abgr8888, Opaque) => |s, d| convert(s, d, |p| over_black(abgr8888(p))),
         (Format::Xrgb2101010, _) => |s, d| convert(s, d, xrgb2101010),
         (Format::Argb2101010, Straight) => |s, d| convert(s, d, |p| unpremultiply(argb2101010(p))),
@@ -450,6 +458,143 @@ fn unpremultiply([r, g, b, a]: [u8; 4]) -> [u8; 4] {
     [straight(r), straight(g), straight(b), a]
 }
 
+/// Row kernel unpremultiplying 16 pixels per chunk for 32-bit formats whose
+/// alpha is the high byte. `SWAP_RB` mirrors the byte order difference
+/// between ARGB8888 and ABGR8888; the math is channel-order agnostic.
+///
+/// Matches `unpremultiply` exactly: `(v * 255 + a / 2) / a` floors to the
+/// same integer in f32, because numerator and divisor are exact below 2^24
+/// and the f32 rounding error (half an ulp, at most 2^-8 at the largest
+/// quotient) stays under the 1/255 spacing between quotients. Alpha 255
+/// satisfies the formula outright (`(255v + 127) / 255` floors back to `v`),
+/// so only alpha 0 is masked, and clamping its divisor to 1 keeps every
+/// quotient finite and below 2^16, so truncating casts floor safely.
+///
+/// Fixed-size chunks, branchless selects, and float division vectorize on
+/// stable Rust for every target; per-pixel integer division cannot. The
+/// `simd` feature swaps this for an explicit `std::simd` kernel on nightly.
+fn unpremultiply_row<const SWAP_RB: bool>(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len(), "row lengths differ");
+    const LANES: usize = 16;
+    let (blocks, tail) = src.as_chunks::<{ LANES * 4 }>();
+    let (out_blocks, out_tail) = dst.as_chunks_mut::<{ LANES * 4 }>();
+    for (s, d) in blocks.iter().zip(out_blocks.iter_mut()) {
+        let mut b0 = [0u32; LANES];
+        let mut b1 = [0u32; LANES];
+        let mut b2 = [0u32; LANES];
+        let mut alpha = [0u32; LANES];
+        for i in 0..LANES {
+            let v = u32::from_ne_bytes(s[i * 4..i * 4 + 4].try_into().unwrap());
+            b0[i] = v & 0xff;
+            b1[i] = (v >> 8) & 0xff;
+            b2[i] = (v >> 16) & 0xff;
+            alpha[i] = v >> 24;
+        }
+        // Fully transparent pixels keep their stored color; dividing by 1
+        // instead keeps their lanes finite for the casts below.
+        let mut den = [1.0f32; LANES];
+        let mut half = [0.0f32; LANES];
+        for i in 0..LANES {
+            if alpha[i] != 0 {
+                den[i] = alpha[i] as f32;
+            }
+            half[i] = (alpha[i] >> 1) as f32;
+        }
+        let straight = |c: &[u32; LANES], out: &mut [u32; LANES]| {
+            for i in 0..LANES {
+                let q = ((c[i] as f32 * 255.0 + half[i]) / den[i]).min(255.0) as u32;
+                // Branchless blend: an `if alpha == 0` select stops LLVM's
+                // loop vectorizer; the mask idiom does not.
+                let keep = (alpha[i] == 0) as u32;
+                out[i] = q ^ ((q ^ c[i]) & keep.wrapping_neg());
+            }
+        };
+        let mut s0 = [0u32; LANES];
+        let mut s1 = [0u32; LANES];
+        let mut s2 = [0u32; LANES];
+        straight(&b0, &mut s0);
+        straight(&b1, &mut s1);
+        straight(&b2, &mut s2);
+        for i in 0..LANES {
+            let v = if SWAP_RB {
+                s2[i] | s1[i] << 8 | s0[i] << 16 | alpha[i] << 24
+            } else {
+                s0[i] | s1[i] << 8 | s2[i] << 16 | alpha[i] << 24
+            };
+            d[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        }
+    }
+    // Rows narrower than a chunk finish with the scalar pixel path.
+    for (s, d) in tail
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out_tail.as_chunks_mut::<4>().0.iter_mut())
+    {
+        let p = if SWAP_RB { argb8888(*s) } else { abgr8888(*s) };
+        *d = unpremultiply(p);
+    }
+}
+
+/// Explicit `std::simd` version of `unpremultiply_row` for nightly builds.
+/// Same math and exactness argument; every lane is provably in 0..=65152
+/// before the unchecked truncating cast, so NaN, infinity, and out-of-range
+/// values cannot reach it.
+#[cfg(feature = "simd")]
+fn unpremultiply_row_simd<const SWAP_RB: bool>(src: &[u8], dst: &mut [u8]) {
+    use std::simd::prelude::*;
+
+    debug_assert_eq!(src.len(), dst.len(), "row lengths differ");
+    const LANES: usize = 16;
+    const BYTES: usize = LANES * 4;
+    let (blocks, tail) = src.as_chunks::<BYTES>();
+    let (out_blocks, out_tail) = dst.as_chunks_mut::<BYTES>();
+    for (s, d) in blocks.iter().zip(out_blocks.iter_mut()) {
+        let lanes: [u32; LANES] =
+            core::array::from_fn(|i| u32::from_ne_bytes(s[i * 4..i * 4 + 4].try_into().unwrap()));
+        let px = Simd::<u32, LANES>::from_array(lanes);
+        let splat = Simd::<u32, LANES>::splat;
+        let b0 = px & splat(0xff);
+        let b1 = (px >> splat(8)) & splat(0xff);
+        let b2 = (px >> splat(16)) & splat(0xff);
+        let alpha = px >> splat(24);
+
+        // Fully transparent pixels keep their stored color; dividing by 1
+        // instead keeps their lanes finite for the unchecked cast below.
+        let transparent = alpha.simd_eq(splat(0));
+        let af = transparent.select(Simd::splat(1.0), alpha.cast::<f32>());
+        let half = (alpha >> splat(1)).cast::<f32>();
+        let straight = |c: Simd<u32, LANES>| {
+            let num = c.cast::<f32>() * Simd::splat(255.0) + half;
+            // Every lane is in 0..=65152 here: the divisor is at least 1 and
+            // the numerator is exact, so truncation cannot hit NaN, infinity,
+            // or an out-of-range value.
+            let q = unsafe { (num / af).to_int_unchecked::<u32>() }.simd_min(splat(255));
+            transparent.select(c, q)
+        };
+        let s0 = straight(b0);
+        let s1 = straight(b1);
+        let s2 = straight(b2);
+
+        let out = if SWAP_RB {
+            s2 | (s1 << splat(8)) | (s0 << splat(16)) | (alpha << splat(24))
+        } else {
+            s0 | (s1 << splat(8)) | (s2 << splat(16)) | (alpha << splat(24))
+        };
+        d.copy_from_slice(out.to_array().map(u32::to_ne_bytes).as_flattened());
+    }
+    // Rows narrower than a block finish with the scalar pixel path.
+    for (s, d) in tail
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out_tail.as_chunks_mut::<4>().0.iter_mut())
+    {
+        let p = if SWAP_RB { argb8888(*s) } else { abgr8888(*s) };
+        *d = unpremultiply(p);
+    }
+}
+
 /// The premultiplied color over black. Clamping to alpha matches compositing
 /// the clamped straight color when invalid color exceeds alpha.
 fn over_black([r, g, b, a]: [u8; 4]) -> [u8; 4] {
@@ -476,14 +621,56 @@ pub enum PixelMode {
 }
 
 /// Pixels at capture resolution, with logical dimensions for scale-1 streaming.
-#[derive(Debug)]
+///
+/// A GPU frame carries its dmabuf instead of decoded pixels: `image` is then
+/// empty and `gpu` describes the buffer. The H.264 path encodes from `gpu`
+/// without touching the CPU; anything needing pixels calls
+/// [`CapturedFrame::ensure_cpu_pixels`] first.
+#[derive(Clone, Debug)]
 pub struct CapturedFrame {
     pub image: RgbaImage,
     pub logical_width: u32,
     pub logical_height: u32,
+    pub gpu: Option<crate::GpuFrame>,
 }
 
 impl CapturedFrame {
+    /// Capture-resolution dimensions, from decoded pixels or the dmabuf.
+    pub fn pixel_dimensions(&self) -> (u32, u32) {
+        if self.image.dimensions() != (0, 0) {
+            self.image.dimensions()
+        } else if let Some(gpu) = &self.gpu {
+            gpu.pixel_dimensions()
+        } else {
+            (0, 0)
+        }
+    }
+
+    pub fn has_cpu_pixels(&self) -> bool {
+        self.image.dimensions() != (0, 0)
+    }
+
+    /// Map the dmabuf and decode it, for JPEG and screenshots. A no-op once
+    /// pixels exist. The H.264 path must not call this.
+    pub fn ensure_cpu_pixels(&mut self) -> Result<()> {
+        if self.has_cpu_pixels() {
+            return Ok(());
+        }
+        let gpu = self
+            .gpu
+            .as_ref()
+            .context("frame has neither pixels nor a dmabuf")?;
+        let (bytes, spec) = gpu.readback()?;
+        decode_into(
+            &bytes,
+            spec,
+            false,
+            Transform::Normal,
+            AlphaMode::Opaque,
+            &mut self.image,
+        )?;
+        Ok(())
+    }
     /// Keeps transparency only for frames decoded with `AlphaMode::Straight`.
     pub fn png(&self) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
@@ -530,7 +717,7 @@ impl CapturedFrame {
     pub fn stream_dimensions(&self, max_width: Option<u32>, mode: PixelMode) -> Result<(u32, u32)> {
         let (base_width, base_height) = match mode {
             PixelMode::Logical => (self.logical_width, self.logical_height),
-            PixelMode::Native => self.image.dimensions(),
+            PixelMode::Native => self.pixel_dimensions(),
         };
         ensure!(base_width > 0 && base_height > 0, "empty stream image");
         ensure!(
@@ -615,6 +802,8 @@ pub(crate) fn crop(image: &RgbaImage, logical: Rect, region: Rect) -> Result<Cap
         image: imageops::crop_imm(image, rect.x, rect.y, rect.width, rect.height).to_image(),
         logical_width: clipped.width,
         logical_height: clipped.height,
+
+        gpu: None,
     })
 }
 
@@ -657,6 +846,8 @@ pub(crate) fn compose(tiles: &[(&RgbaImage, Rect)], region: Rect) -> Result<Capt
         image: canvas,
         logical_width: region.width,
         logical_height: region.height,
+
+        gpu: None,
     })
 }
 
@@ -984,6 +1175,8 @@ mod tests {
                 }),
                 logical_width,
                 logical_height,
+
+                gpu: None,
             };
             for mode in [PixelMode::Logical, PixelMode::Native] {
                 let (base_w, base_h) = match mode {
@@ -1249,6 +1442,8 @@ mod tests {
                         image: straight.clone(),
                         logical_width: spec.width,
                         logical_height: spec.height,
+
+                        gpu: None,
                     },
                     None,
                     PixelMode::Native,
@@ -1511,6 +1706,8 @@ mod tests {
             image: RgbaImage::from_raw(width, height, raw).unwrap(),
             logical_width,
             logical_height,
+
+            gpu: None,
         }
     }
 
@@ -1566,6 +1763,8 @@ mod tests {
             }),
             logical_width: 64,
             logical_height: 32,
+
+            gpu: None,
         };
         for mode in [PixelMode::Logical, PixelMode::Native] {
             let encoded = frame.jpeg_with_mode(90, None, mode).unwrap();
@@ -1592,6 +1791,152 @@ mod tests {
             let mut image = opaque.clone();
             image.put_pixel(x, y, Rgba([9, 9, 9, 254]));
             assert!(!is_opaque(&image), "({x}, {y})");
+        }
+    }
+
+    /// Every channel value against every alpha, in all three color lanes,
+    /// for both 32-bit byte orders the chunked kernels handle.
+    #[test]
+    fn unpremultiply_rows_match_scalar_for_every_channel_and_alpha() {
+        let mut src = Vec::with_capacity(256 * 256 * 4);
+        for i in 0..65536u32 {
+            let v = i as u8;
+            let a = (i >> 8) as u8;
+            src.extend_from_slice(&[v, v, v, a]);
+        }
+        for (swap, scalar) in [
+            (true, argb8888 as fn([u8; 4]) -> [u8; 4]),
+            (false, abgr8888 as fn([u8; 4]) -> [u8; 4]),
+        ] {
+            let mut expected = vec![0u8; src.len()];
+            convert(&src, &mut expected, |p| unpremultiply(scalar(p)));
+            let mut actual = vec![0u8; src.len()];
+            if swap {
+                unpremultiply_row::<true>(&src, &mut actual);
+            } else {
+                unpremultiply_row::<false>(&src, &mut actual);
+            }
+            assert_eq!(actual, expected, "chunked, swap_rb={swap}");
+            #[cfg(feature = "simd")]
+            {
+                let mut actual = vec![0u8; src.len()];
+                if swap {
+                    unpremultiply_row_simd::<true>(&src, &mut actual);
+                } else {
+                    unpremultiply_row_simd::<false>(&src, &mut actual);
+                }
+                assert_eq!(actual, expected, "simd, swap_rb={swap}");
+            }
+        }
+    }
+
+    /// Random pixels at a length with a sub-chunk tail exercise both the
+    /// chunked blocks and the scalar remainder.
+    #[test]
+    fn unpremultiply_rows_match_scalar_with_tail_pixels() {
+        let pixels = 16 * 37 + 11;
+        let src = noise(99, pixels * 4);
+        let mut expected = vec![0u8; src.len()];
+        convert(&src, &mut expected, |p| unpremultiply(argb8888(p)));
+        let mut actual = vec![0u8; src.len()];
+        unpremultiply_row::<true>(&src, &mut actual);
+        assert_eq!(actual, expected, "chunked");
+        #[cfg(feature = "simd")]
+        {
+            let mut actual = vec![0u8; src.len()];
+            unpremultiply_row_simd::<true>(&src, &mut actual);
+            assert_eq!(actual, expected, "simd");
+        }
+    }
+
+    /// 4K ARGB8888 straight-alpha decode: per-pixel scalar, the chunked
+    /// stable kernel, and (with `--features simd` on nightly) the explicit
+    /// `std::simd` kernel. Mixed alpha defeats the scalar early-exit branch;
+    /// mostly-opaque is the realistic screen mix.
+    #[test]
+    #[ignore = "benchmark: cargo test --release -p omabeam-capture -- --ignored --nocapture bench_unpremultiply"]
+    fn bench_unpremultiply_scalar_vs_simd() {
+        let (width, height) = (3840usize, 2160usize);
+        let pixels = width * height;
+
+        let frame = |alpha: &dyn Fn(u64, usize) -> u8| {
+            let mut state = 0x1234_5678_9abc_def0u64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut bytes = Vec::with_capacity(pixels * 4);
+            for i in 0..pixels {
+                let v = next();
+                let (r, g, b) = (v as u8, (v >> 8) as u8, (v >> 16) as u8);
+                bytes.extend_from_slice(&[b, g, r, alpha(next(), i)]);
+            }
+            bytes
+        };
+        // Every alpha equally likely: worst case for the scalar branch.
+        let mixed = frame(&|s, _| (s >> 40) as u8);
+        // Screens are mostly opaque windows with some translucent edges.
+        let realistic = frame(&|s, _| match (s >> 40) % 10 {
+            0 => 0,
+            1 => 1,
+            2 => 127,
+            3 => 254,
+            _ => 255,
+        });
+
+        // Call the scalar pixel path directly: with the feature enabled,
+        // row_kernel would return the SIMD kernel being measured.
+        let scalar = |s: &[u8], d: &mut [u8]| convert(s, d, |p| unpremultiply(argb8888(p)));
+        let time = |label: &str, src: &[u8], runs: usize, run: &mut dyn FnMut(&[u8], &mut [u8])| {
+            let mut dst = vec![0u8; src.len()];
+            run(src, &mut dst);
+            let mut each: Vec<f64> = (0..runs)
+                .map(|_| {
+                    let started = Instant::now();
+                    for row in 0..height {
+                        let at = row * width * 4;
+                        run(&src[at..at + width * 4], &mut dst[at..at + width * 4]);
+                    }
+                    started.elapsed().as_secs_f64()
+                })
+                .collect();
+            each.sort_by(f64::total_cmp);
+            let (min, median) = (each[0], each[runs / 2]);
+            println!(
+                "{label:<40} min {:>7.2} ms  median {:>7.2} ms  {:>6.0} Mpx/s",
+                min * 1e3,
+                median * 1e3,
+                pixels as f64 / median / 1e6
+            );
+            median
+        };
+
+        for (label, src) in [("mixed alpha", &mixed), ("realistic alpha", &realistic)] {
+            let reference = time(
+                &format!("unpremultiply scalar, {label}"),
+                src,
+                9,
+                &mut |s, d| scalar(s, d),
+            );
+            let chunked = time(
+                &format!("unpremultiply chunked, {label}"),
+                src,
+                9,
+                &mut |s, d| unpremultiply_row::<true>(s, d),
+            );
+            println!("{label:<40} chunked speedup {:.1}x", reference / chunked);
+            #[cfg(feature = "simd")]
+            {
+                let simd = time(
+                    &format!("unpremultiply std::simd, {label}"),
+                    src,
+                    9,
+                    &mut |s, d| unpremultiply_row_simd::<true>(s, d),
+                );
+                println!("{label:<40} std::simd speedup {:.1}x", reference / simd);
+            }
         }
     }
 
@@ -1655,6 +2000,8 @@ mod tests {
             image,
             logical_width: width,
             logical_height: height,
+
+            gpu: None,
         };
         let native = PixelMode::Native;
         time("stream_rgb, reference", 15, &mut || {

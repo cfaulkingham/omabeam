@@ -71,7 +71,7 @@ impl Drop for BufferRef {
         unsafe { ffi::av_buffer_unref(&mut self.0) };
     }
 }
-fn checked(code: i32) -> Result<()> {
+pub(crate) fn checked(code: i32) -> Result<()> {
     if code < 0 {
         Err(av::Error::from(code).into())
     } else {
@@ -321,6 +321,7 @@ mod tests {
     /// VA-API on Linux) and checks nothing where none does.
     #[test]
     fn every_backend_format_that_opens_encodes_the_frame_it_was_sent() {
+        let _guard = crate::lock_hw_tests();
         av::init().unwrap();
         let (mut verified, mut skipped) = (Vec::new(), Vec::new());
         // 1366 pads every row of every plane; 320 × 240 pads none.
@@ -332,6 +333,7 @@ mod tests {
                 fps: 30,
                 bitrate: 20_000_000,
                 gop_frames: 0,
+                gpu: None,
             };
             let (w, h) = (width as usize, height as usize);
             // A luma ramp and flat, distinct chroma: a swapped or misaligned

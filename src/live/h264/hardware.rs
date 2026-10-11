@@ -17,6 +17,16 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+#[cfg(feature = "gpu")]
+use {
+    omabeam_capture::GpuFrame,
+    omabeam_encoder::dmabuf::{self, GpuRing},
+    std::{
+        os::unix::net::{UnixListener, UnixStream},
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    },
+};
 
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_TIMEOUT: Duration = Duration::from_millis(750);
@@ -165,6 +175,186 @@ impl Drop for Hardware {
     }
 }
 
+/// A zero-copy session: the helper imports capture's dmabufs and converts
+/// on the GPU, so no pixel bytes cross the pipe. The parent listens on a
+/// private socket the helper dials back; each frame is a small pipe request
+/// (marker + pts + buffer id) plus its fd and descriptor on that socket.
+/// Any failure drops the session and the caller falls back to a readback.
+#[cfg(feature = "gpu")]
+pub(super) struct ZeroCopy {
+    helper: Hardware,
+    socket: UnixStream,
+    socket_path: PathBuf,
+    pub(super) capture: (u32, u32),
+    pub(super) stream: (u32, u32),
+}
+
+#[cfg(feature = "gpu")]
+impl ZeroCopy {
+    pub(super) fn new(config: &Config, ring: &GpuRing) -> Result<Self> {
+        let exe = std::env::current_exe()?;
+        Self::spawn(&exe.with_file_name("omabeam-encoder"), config, ring)
+    }
+    pub(super) fn spawn(path: &Path, config: &Config, ring: &GpuRing) -> Result<Self> {
+        static SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let socket_path = std::env::temp_dir().join(format!(
+            "omabeam-gpu-{}-{}.sock",
+            std::process::id(),
+            SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).context("cannot listen for GPU handoff")?;
+        let mut config = config.clone();
+        let mut announced = ring.clone();
+        announced.socket = socket_path.to_string_lossy().into_owned();
+        config.gpu = Some(announced);
+        let session = (|| -> Result<(Hardware, UnixStream)> {
+            let mut helper = Hardware::spawn(path, &config)?;
+            listener.set_nonblocking(true)?;
+            // The helper dials after reading its config. A helper that cannot
+            // do zero-copy exits instead; watch the child so that failure is
+            // fast rather than a five-second accept timeout.
+            let deadline = Instant::now() + START_TIMEOUT;
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
+                if helper.child.try_wait()?.is_some() {
+                    let detail = helper.log.last_words();
+                    anyhow::bail!(if detail.is_empty() {
+                        "hardware encoder exited before dialing its GPU socket".to_string()
+                    } else {
+                        detail
+                    });
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "hardware encoder did not dial its GPU socket"
+                );
+                let mut fds = [PollFd::new(&listener, PollFlags::IN)];
+                match poll(
+                    &mut fds,
+                    Some(&Timespec::try_from(Duration::from_millis(100))?),
+                ) {
+                    Ok(_) => {}
+                    Err(rustix::io::Errno::INTR) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            socket.set_nonblocking(false)?;
+            Ok((helper, socket))
+        })();
+        let (helper, socket) = match session {
+            Ok(session) => session,
+            Err(error) => {
+                // No session owns the socket file on this path; a failed
+                // spawn must not litter the temp directory.
+                let _ = std::fs::remove_file(&socket_path);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            helper,
+            socket,
+            socket_path,
+            capture: (ring.width, ring.height),
+            stream: (config.width, config.height),
+        })
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.helper.name
+    }
+
+    pub(super) fn encode(
+        &mut self,
+        frame: &GpuFrame,
+        pts: i64,
+        force: bool,
+    ) -> Result<(Vec<u8>, bool)> {
+        match self.exchange(frame, pts, force) {
+            Ok(idr) => Ok((self.helper.packet.clone(), idr)),
+            Err(error) => {
+                let _ = self.helper.child.kill();
+                let _ = self.helper.child.wait();
+                let detail = self.helper.log.last_words();
+                Err(error.context(if detail.is_empty() {
+                    "hardware encoder stopped responding".into()
+                } else {
+                    detail
+                }))
+            }
+        }
+    }
+
+    fn exchange(&mut self, frame: &GpuFrame, pts: i64, force: bool) -> Result<bool> {
+        let descriptor = frame.frame_descriptor();
+        ensure!(
+            (descriptor.width, descriptor.height) == self.capture,
+            "GPU capture size changed"
+        );
+        let deadline = Instant::now()
+            + if self.helper.first {
+                START_TIMEOUT
+            } else {
+                FRAME_TIMEOUT
+            };
+        // The pipe request first, then the fd: the helper reads in that
+        // order, and checks the two channels agree before encoding.
+        let mut request = Vec::new();
+        dmabuf::write_zero_copy_request(
+            &mut request,
+            pts,
+            descriptor.id,
+            force || self.helper.first,
+        )?;
+        write_all(
+            &mut self.helper.input,
+            &mut [IoSlice::new(&request)],
+            deadline,
+        )?;
+        dmabuf::send_frame_fd(&self.socket, frame.handoff_fd(), &descriptor)
+            .context("GPU frame handoff failed")?;
+        let mut size = [0; 4];
+        read_exact(&mut self.helper.output, &mut size, deadline)?;
+        let size = u32::from_le_bytes(size) as usize;
+        ensure!(
+            (1..=MAX_HEADER).contains(&size),
+            "invalid hardware reply size"
+        );
+        self.helper.header.resize(size, 0);
+        read_exact(&mut self.helper.output, &mut self.helper.header, deadline)?;
+        let reply: Reply = serde_json::from_slice(&self.helper.header)?;
+        ensure!(
+            !reply.encoder.is_empty() && reply.encoder.len() <= 160,
+            "invalid hardware encoder name"
+        );
+        ensure!(
+            (1..=MAX_PACKET).contains(&reply.bytes),
+            "invalid hardware packet size"
+        );
+        self.helper.packet.resize(reply.bytes, 0);
+        read_exact(&mut self.helper.output, &mut self.helper.packet, deadline)?;
+        let idr = inspect_h264(&self.helper.packet)?;
+        ensure!(
+            !(force || self.helper.first) || idr,
+            "hardware did not return a requested IDR"
+        );
+        self.helper.first = false;
+        self.helper.name = reply.encoder;
+        Ok(idr)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for ZeroCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.socket_path);
+    }
+}
+
 /// The bounded tail of the helper's stderr. A thread drains it continuously,
 /// so a verbose driver can neither block the helper nor grow this process.
 #[derive(Default)]
@@ -271,11 +461,26 @@ fn read_exact(fd: &mut (impl Read + AsFd), mut bytes: &mut [u8], deadline: Insta
     Ok(())
 }
 
+/// Writes an executable test helper. A separate process writes it: a fork
+/// on another test thread inherits any write fd open here, and exec then
+/// fails with "Text file busy".
+#[cfg(test)]
+pub(super) fn write_script(path: &Path, contents: &str) {
+    let staged = path.with_extension("source");
+    std::fs::write(&staged, contents).unwrap();
+    let installed = Command::new("install")
+        .args(["-m", "700"])
+        .arg(&staged)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(installed.success(), "install {}", path.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::live::{LiveConfig, h264::AdaptiveEncoder};
-    use std::os::unix::fs::PermissionsExt;
 
     /// Python stand-ins for the helper share this protocol prologue.
     const PROLOGUE: &str = r#"#!/usr/bin/env python3
@@ -293,8 +498,7 @@ def reply(packet):
 
     fn helper(directory: &Path, body: &str) -> std::path::PathBuf {
         let path = directory.join("helper");
-        std::fs::write(&path, format!("{PROLOGUE}{body}")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write_script(&path, &format!("{PROLOGUE}{body}"));
         path
     }
 
@@ -306,6 +510,7 @@ def reply(packet):
             fps: 60,
             bitrate: 4_000_000,
             gop_frames: 0,
+            gpu: None,
         }
     }
 

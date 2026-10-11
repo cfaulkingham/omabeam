@@ -298,6 +298,7 @@ fn thumbnail_key(id: String) -> PreviewKey {
 const THUMBNAIL_OPTIONS: CaptureOptions = CaptureOptions {
     cursor: false,
     alpha: AlphaMode::Opaque,
+    gpu: false,
 };
 
 /// Answers thumbnail jobs with frames from `capture`.
@@ -323,6 +324,7 @@ fn capture_options(key: &PreviewKey) -> CaptureOptions {
         } else {
             AlphaMode::Opaque
         },
+        gpu: false,
     }
 }
 

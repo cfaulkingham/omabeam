@@ -34,6 +34,10 @@ pub(crate) use wayland_protocols::ext::{
 pub(crate) use wayland_protocols::wp::cursor_shape::v1::client::{
     wp_cursor_shape_device_v1 as cursor_device, wp_cursor_shape_manager_v1 as cursor_manager,
 };
+#[cfg(feature = "dmabuf")]
+pub(crate) use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1 as dmabuf_params, zwp_linux_dmabuf_v1 as dmabuf,
+};
 pub(crate) use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1 as xdg_outputs, zxdg_output_v1 as xdg_output,
 };
@@ -99,6 +103,16 @@ pub(crate) struct State {
     pub top_source: Option<top_source::ExtForeignToplevelImageCaptureSourceManagerV1>,
     pub copy: Option<copy::ExtImageCopyCaptureManagerV1>,
     pub wlr_copy: Option<wlr_copy::ZwlrScreencopyManagerV1>,
+    #[cfg(feature = "dmabuf")]
+    pub dmabuf: Option<dmabuf::ZwpLinuxDmabufV1>,
+    #[cfg(feature = "dmabuf")]
+    pub gpu: Option<crate::dmabuf::GpuSession>,
+    /// Why zero-copy capture is not active; cleared on the first GPU frame.
+    #[cfg(feature = "dmabuf")]
+    pub gpu_note: Option<String>,
+    /// Set by frame consumers that cannot use dmabufs; outlives every ring.
+    #[cfg(feature = "dmabuf")]
+    pub gpu_stop: crate::dmabuf::GpuStop,
     pub xdg_outputs: Option<xdg_outputs::ZxdgOutputManagerV1>,
     pub layer_shell: Option<layer_shell::ZwlrLayerShellV1>,
     pub cursor_manager: Option<cursor_manager::WpCursorShapeManagerV1>,
@@ -274,6 +288,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     }
                     "zwlr_screencopy_manager_v1" => {
                         bind!(wlr_copy, wlr_copy::ZwlrScreencopyManagerV1, 3)
+                    }
+                    #[cfg(feature = "dmabuf")]
+                    "zwp_linux_dmabuf_v1" => {
+                        bind!(dmabuf, dmabuf::ZwpLinuxDmabufV1, 4)
                     }
                     "zxdg_output_manager_v1" => {
                         bind!(xdg_outputs, xdg_outputs::ZxdgOutputManagerV1, 3);
@@ -589,6 +607,10 @@ delegate_noop!(State: ignore top_source::ExtForeignToplevelImageCaptureSourceMan
 delegate_noop!(State: ignore source::ExtImageCaptureSourceV1);
 delegate_noop!(State: ignore copy::ExtImageCopyCaptureManagerV1);
 delegate_noop!(State: ignore wlr_copy::ZwlrScreencopyManagerV1);
+#[cfg(feature = "dmabuf")]
+delegate_noop!(State: ignore dmabuf::ZwpLinuxDmabufV1);
+#[cfg(feature = "dmabuf")]
+delegate_noop!(State: ignore dmabuf_params::ZwpLinuxBufferParamsV1);
 delegate_noop!(State: ignore xdg_outputs::ZxdgOutputManagerV1);
 delegate_noop!(State: ignore layer_shell::ZwlrLayerShellV1);
 delegate_noop!(State: ignore cursor_manager::WpCursorShapeManagerV1);

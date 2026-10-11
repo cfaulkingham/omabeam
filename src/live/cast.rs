@@ -487,19 +487,26 @@ fn run(
                     None => source.request()?,
                 };
                 Some(
-                    CaptureSession::with_options(request.target()?, stream_options(config.cursor))
-                        .context("Cast capture initialization failed")?,
+                    CaptureSession::with_options(
+                        request.target()?,
+                        stream_options(config.cursor, false),
+                    )
+                    .context("Cast capture initialization failed")?,
                 )
             }
             None => None,
         };
         let frames = Arc::new(FrameState::new(title));
         frames.cast_viewers.store(1, Ordering::SeqCst);
-        let first = match &mut capturer {
-            Some(c) => c.capture()?,
-            None => omabeam_capture::demo_frame(0),
+        let (first, first_gpu_note) = match &mut capturer {
+            Some(c) => {
+                let frame = c.capture()?;
+                let note = c.gpu_note();
+                (frame, note)
+            }
+            None => (omabeam_capture::demo_frame(0), None),
         };
-        publish_frame(&frames, first, &config, Duration::ZERO)?;
+        publish_frame(&frames, first, &config, Duration::ZERO, first_gpu_note)?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut worker = CaptureWorker {
             stop: stop.clone(),
@@ -515,10 +522,12 @@ fn run(
                     let mut index = 0u32;
                     capture_loop(
                         move |timeout| match &mut capturer {
-                            Some(c) => c.next_frame(timeout),
+                            Some(c) => {
+                                Ok(c.next_frame(timeout)?.map(|frame| (frame, c.gpu_note())))
+                            }
                             None => {
                                 index = index.wrapping_add(1);
-                                Ok(Some(omabeam_capture::demo_frame(index)))
+                                Ok(Some((omabeam_capture::demo_frame(index), None)))
                             }
                         },
                         capture_config,

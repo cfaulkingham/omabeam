@@ -208,58 +208,91 @@ impl FrameState {
     /// encoder; snapshots and fallback connections request it on demand.
     pub fn jpeg_frame(&self) -> Result<(Arc<[u8]>, u64, Instant), EncodeFailed> {
         let mut failure_log = self.jpeg_encode.lock().unwrap();
-        let (raw, generation, at) = {
-            let data = self.inner.lock().unwrap();
-            if !data.jpeg.is_empty() || data.ended.is_some() {
-                return Ok((data.jpeg.clone(), data.generation, data.encode_started_at));
-            }
-            // Each viewer would otherwise repeat the failing encode.
-            if data.jpeg_failed == Some(data.generation) {
-                return Err(EncodeFailed {
-                    generation: data.generation,
-                });
-            }
-            (data.raw.clone(), data.generation, data.encode_started_at)
-        };
-        let Some(raw) = raw else {
-            return Ok((Arc::from([]), generation, at));
-        };
-        let started = Instant::now();
-        let encoded = raw
-            .frame
-            .jpeg_with_mode(
-                raw.config.quality,
-                raw.config.max_width,
-                raw.config.pixel_mode,
-            )
-            .map(|(jpeg, _, _)| Arc::<[u8]>::from(jpeg));
-        let mut data = self.inner.lock().unwrap();
-        if data.ended.is_some() {
-            return Ok((Arc::from([]), generation, at));
-        }
-        let jpeg = match encoded {
-            Ok(jpeg) => jpeg,
-            Err(error) => {
-                data.diagnostics.jpeg_failed();
-                if data.generation == generation {
-                    data.jpeg_failed = Some(generation);
+        // A dmabuf that cannot be mapped (NVIDIA) moves capture to shared
+        // memory as its readback fails; the next frame or two carry pixels.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (raw, generation, at) = {
+                let data = self.inner.lock().unwrap();
+                if !data.jpeg.is_empty() || data.ended.is_some() {
+                    return Ok((data.jpeg.clone(), data.generation, data.encode_started_at));
                 }
-                drop(data);
-                if failure_log.allow(Instant::now()) {
-                    eprintln!("live share: could not encode a JPEG frame: {error:#}");
+                // Each viewer would otherwise repeat the failing encode.
+                if data.jpeg_failed == Some(data.generation) {
+                    return Err(EncodeFailed {
+                        generation: data.generation,
+                    });
                 }
-                return Err(EncodeFailed { generation });
+                (data.raw.clone(), data.generation, data.encode_started_at)
+            };
+            let Some(raw) = raw else {
+                return Ok((Arc::from([]), generation, at));
+            };
+            let started = Instant::now();
+            let mut owned = None;
+            let encoded = (|| -> anyhow::Result<Arc<[u8]>> {
+                if raw.frame.gpu.is_some() {
+                    // A dmabuf frame maps its pixels into an owned copy; the
+                    // published frame stays zero-copy for the encoder.
+                    let mut frame = raw.frame.clone();
+                    frame.ensure_cpu_pixels()?;
+                    owned = Some(frame);
+                }
+                let frame = owned.as_ref().unwrap_or(&raw.frame);
+                Ok(Arc::<[u8]>::from(
+                    frame
+                        .jpeg_with_mode(
+                            raw.config.quality,
+                            raw.config.max_width,
+                            raw.config.pixel_mode,
+                        )?
+                        .0,
+                ))
+            })();
+            let mut data = self.inner.lock().unwrap();
+            if data.ended.is_some() {
+                return Ok((Arc::from([]), generation, at));
             }
-        };
-        if data.generation == generation {
-            data.jpeg = jpeg.clone();
-            data.encode_started_at = started;
-            // Capture publication records capture timings separately. Lazy JPEG
-            // timings are recorded here without counting another capture.
-            data.diagnostics
-                .jpeg_encoded(Instant::now(), jpeg.len(), started.elapsed());
+            let jpeg = match encoded {
+                Ok(jpeg) => jpeg,
+                Err(error) => {
+                    let capture_moved = raw
+                        .frame
+                        .gpu
+                        .as_ref()
+                        .is_some_and(|gpu| gpu.gpu_capture_stopped().is_some());
+                    if capture_moved {
+                        while data.generation == generation && data.ended.is_none() {
+                            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                                break;
+                            };
+                            data = self.tick.wait_timeout(data, left).unwrap().0;
+                        }
+                        if data.generation != generation {
+                            continue;
+                        }
+                    }
+                    data.diagnostics.jpeg_failed();
+                    if data.generation == generation {
+                        data.jpeg_failed = Some(generation);
+                    }
+                    drop(data);
+                    if failure_log.allow(Instant::now()) {
+                        eprintln!("live share: could not encode a JPEG frame: {error:#}");
+                    }
+                    return Err(EncodeFailed { generation });
+                }
+            };
+            if data.generation == generation {
+                data.jpeg = jpeg.clone();
+                data.encode_started_at = started;
+                // Capture publication records capture timings separately. Lazy JPEG
+                // timings are recorded here without counting another capture.
+                data.diagnostics
+                    .jpeg_encoded(Instant::now(), jpeg.len(), started.elapsed());
+            }
+            return Ok((jpeg, generation, started));
         }
-        Ok((jpeg, generation, started))
     }
 
     pub fn viewer_diagnostics(&self) -> Vec<ViewerDiagnostics> {

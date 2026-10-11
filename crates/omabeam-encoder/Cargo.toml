@@ -13,7 +13,13 @@ hardware = ["dep:ffmpeg-next"]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "format"], optional = true }
+rustix = { version = "1", features = ["fs", "net"] }
+ffmpeg-next = { version = "9.0", default-features = false, features = ["codec", "filter", "format"], optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+gbm = "0.18"
+drm-fourcc = "2"
 
 [[bin]]
 name = "omabeam-encoder"

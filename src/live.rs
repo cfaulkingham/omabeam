@@ -45,11 +45,26 @@ const ERROR_GRACE: Duration = Duration::from_secs(30);
 
 /// Live and Cast capture. JPEG and H.264 composite over black, so frames
 /// arrive opaque instead of un-premultiplied only to be multiplied again.
-fn stream_options(cursor: bool) -> CaptureOptions {
+fn stream_options(cursor: bool, gpu: bool) -> CaptureOptions {
     CaptureOptions {
         cursor,
         alpha: AlphaMode::Opaque,
+        gpu,
     }
+}
+
+/// Zero-copy capture for live shares: full outputs land in dmabufs when the
+/// build supports it, a render node answers, and a hardware encoder can
+/// read them. A JPEG-only share would map every frame (NVIDIA cannot), so it
+/// stays on shared memory, as do screenshots, previews and Cast.
+#[cfg(feature = "gpu")]
+fn gpu_capture(config: &LiveConfig) -> bool {
+    config.webrtc && config.encoder != EncoderMode::Software && omabeam_capture::gpu_available()
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_capture(_: &LiveConfig) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -58,9 +73,25 @@ mod stream_options_tests {
 
     #[test]
     fn live_and_cast_capture_opaque_frames() {
-        let options = stream_options(true);
+        let options = stream_options(true, true);
         assert_eq!((options.cursor, options.alpha), (true, AlphaMode::Opaque));
-        assert!(!stream_options(false).cursor);
+        assert!(!stream_options(false, false).cursor);
+    }
+
+    #[test]
+    fn only_webrtc_shares_with_a_hardware_encoder_capture_dmabufs() {
+        for (webrtc, encoder) in [
+            (false, EncoderMode::Auto),
+            (true, EncoderMode::Software),
+            (false, EncoderMode::Hardware),
+        ] {
+            let config = LiveConfig {
+                webrtc,
+                encoder,
+                ..LiveConfig::default()
+            };
+            assert!(!gpu_capture(&config), "{webrtc} {encoder:?}");
+        }
     }
 }
 
@@ -234,12 +265,12 @@ pub fn run_demo(config: LiveConfig) -> Result<()> {
     let mut session = LiveSession::start_frames(
         "OmaBeam demo".into(),
         config,
-        first,
+        (first, None),
         started.elapsed(),
         None,
         move |_| {
             counter = counter.wrapping_add(1);
-            Ok(Some(omabeam_capture::demo_frame(counter)))
+            Ok(Some((omabeam_capture::demo_frame(counter), None)))
         },
     )?;
     session.session_lock = Some(lock);
@@ -360,14 +391,16 @@ impl LiveSession {
             Some(display) => CaptureRequest::Output(display.lock().unwrap().name().to_owned()),
             None => source.request()?,
         };
+        let gpu = gpu_capture(&config);
         let mut capturer =
-            CaptureSession::with_options(request.target()?, stream_options(config.cursor))
+            CaptureSession::with_options(request.target()?, stream_options(config.cursor, gpu))
                 .context("live share capture initialization failed")?;
         if stopped() {
             return Ok(None);
         }
         let started = Instant::now();
         let first = capturer.capture()?;
+        let first_gpu_note = capturer.gpu_note();
         if stopped() {
             return Ok(None);
         }
@@ -383,7 +416,7 @@ impl LiveSession {
         let mut session = Self::start_frames(
             source.label(),
             config,
-            first,
+            (first, first_gpu_note),
             started.elapsed(),
             desktop,
             move |timeout| {
@@ -397,18 +430,20 @@ impl LiveSession {
                         // buffers from the old geometry on either capture protocol.
                         capturer = CaptureSession::with_options(
                             request.target()?,
-                            stream_options(cursor),
+                            stream_options(cursor, gpu),
                         )?;
                         let frame = capturer.capture()?;
                         ensure!(
-                            frame.image.dimensions() == (size.width, size.height),
+                            frame.pixel_dimensions() == (size.width, size.height),
                             "capture did not match the requested display size"
                         );
                         Ok(frame)
                     })?;
-                    return Ok(Some(frame));
+                    return Ok(Some((frame, capturer.gpu_note())));
                 }
-                capturer.next_frame(timeout)
+                Ok(capturer
+                    .next_frame(timeout)?
+                    .map(|frame| (frame, capturer.gpu_note())))
             },
         )?;
         session.display = display;
@@ -419,10 +454,10 @@ impl LiveSession {
     fn start_frames(
         title: String,
         config: LiveConfig,
-        first: CapturedFrame,
+        first: (CapturedFrame, Option<String>),
         first_capture_wait: Duration,
         desktop: Option<Arc<desktop::DesktopControl>>,
-        next: impl FnMut(Duration) -> Result<Option<CapturedFrame>> + Send + 'static,
+        next: impl FnMut(Duration) -> Result<Option<(CapturedFrame, Option<String>)>> + Send + 'static,
     ) -> Result<Self> {
         config.validate()?;
         let token = random_token()?;
@@ -444,7 +479,8 @@ impl LiveSession {
         let mut frames = FrameState::new(title.clone());
         frames.desktop = desktop;
         let frames = Arc::new(frames);
-        publish_frame(&frames, first, &config, first_capture_wait)?;
+        let (first, first_gpu_note) = first;
+        publish_frame(&frames, first, &config, first_capture_wait, first_gpu_note)?;
         let stop = Arc::new(AtomicBool::new(false));
         let mut rtc_worker = if config.webrtc {
             Some(webrtc::start(&config, &frames, &stop)?)
@@ -549,9 +585,10 @@ impl Drop for LiveSession {
 
 fn publish_frame(
     frames: &FrameState,
-    frame: CapturedFrame,
+    mut frame: CapturedFrame,
     config: &LiveConfig,
     capture_wait: Duration,
+    gpu_note: Option<String>,
 ) -> Result<()> {
     let mut config = config.clone();
     if frames.desktop.as_ref().is_some_and(|d| d.stats().matched) {
@@ -561,6 +598,9 @@ fn publish_frame(
     let encode_started_at = Instant::now();
     let (width, height) = frame.stream_dimensions(config.max_width, config.pixel_mode)?;
     let jpeg = if !config.webrtc || frames.viewers.load(Ordering::SeqCst) > 0 {
+        // A dmabuf frame maps its pixels only when something actually
+        // needs them; the WebRTC-only path stays zero-copy.
+        frame.ensure_cpu_pixels().context(JpegFailed)?;
         frame
             .jpeg_with_mode(config.quality, config.max_width, config.pixel_mode)
             .context(JpegFailed)?
@@ -568,15 +608,18 @@ fn publish_frame(
     } else {
         Vec::new()
     };
+    let (capture_width, capture_height) = frame.pixel_dimensions();
     let measurement = FrameMeasurement {
         pixel_mode: config.pixel_mode,
-        capture_width: frame.image.width(),
-        capture_height: frame.image.height(),
+        capture_width,
+        capture_height,
         logical_width: frame.logical_width,
         logical_height: frame.logical_height,
         capture_wait,
         encode: encode_started_at.elapsed(),
         encode_started_at,
+        gpu_active: frame.gpu.is_some(),
+        gpu_note,
     };
     let raw = config.webrtc.then(|| {
         Arc::new(h264::RawFrame {
@@ -600,7 +643,7 @@ impl std::fmt::Display for JpegFailed {
 }
 
 fn capture_loop(
-    mut next: impl FnMut(Duration) -> Result<Option<CapturedFrame>>,
+    mut next: impl FnMut(Duration) -> Result<Option<(CapturedFrame, Option<String>)>>,
     config: LiveConfig,
     frames: Arc<FrameState>,
     stop: Arc<AtomicBool>,
@@ -609,12 +652,12 @@ fn capture_loop(
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::SeqCst) {
             let started = Instant::now();
-            if let Some(frame) = next(Duration::from_millis(250))? {
+            if let Some((frame, gpu_note)) = next(Duration::from_millis(250))? {
                 let capture_wait = started.elapsed();
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
-                match publish_frame(&frames, frame, &config, capture_wait) {
+                match publish_frame(&frames, frame, &config, capture_wait, gpu_note) {
                     // Skip the frame and keep sharing; the next one may encode.
                     Err(error) if error.is::<JpegFailed>() => {
                         frames.jpeg_skipped();
@@ -757,6 +800,8 @@ mod capture_tests {
             image: image::RgbaImage::new(65_536, 1),
             logical_width: 65_536,
             logical_height: 1,
+
+            gpu: None,
         };
         let mut queue = VecDeque::from([
             omabeam_capture::demo_frame(1),
@@ -769,7 +814,7 @@ mod capture_tests {
             if frame.is_none() {
                 done.store(true, Ordering::SeqCst);
             }
-            Ok(frame)
+            Ok(frame.map(|frame| (frame, None)))
         };
         capture_loop(next, config, frames.clone(), stop);
         let stats = frames.stats();
@@ -778,5 +823,167 @@ mod capture_tests {
         assert_eq!(stats.frames, 2);
         // /stats counts the skipped frame like a failed lazy encode.
         assert_eq!(stats.diagnostics.encode_errors, 1);
+    }
+
+    #[test]
+    fn the_capture_gpu_note_reaches_stream_diagnostics() {
+        let frames = Arc::new(FrameState::new("demo".into()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let config = LiveConfig {
+            webrtc: false,
+            fps: 60,
+            ..LiveConfig::default()
+        };
+        let mut queue = VecDeque::from([omabeam_capture::demo_frame(1)]);
+        let done = stop.clone();
+        let next = move |_| {
+            let frame = queue.pop_front().map(|frame| {
+                (
+                    frame,
+                    Some("compositor offers no linear XRGB8888 dmabuf layout".to_string()),
+                )
+            });
+            if frame.is_none() {
+                done.store(true, Ordering::SeqCst);
+            }
+            Ok(frame)
+        };
+        capture_loop(next, config, frames.clone(), stop);
+        let stats = frames.stats();
+        assert_eq!(stats.state, "live", "{:?}", stats.error);
+        assert!(!stats.diagnostics.gpu_active);
+        assert_eq!(
+            stats.diagnostics.gpu_note.as_deref(),
+            Some("compositor offers no linear XRGB8888 dmabuf layout")
+        );
+        // Shared-memory frames keep reporting decoded pixels, not zeros.
+        assert_eq!(
+            (
+                stats.diagnostics.capture_width,
+                stats.diagnostics.capture_height
+            ),
+            (640, 360)
+        );
+    }
+
+    /// A dmabuf frame publishes its JPEG from a readback and reports the
+    /// dmabuf's dimensions, not the empty pixel buffer's.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_dmabuf_frame_publishes_jpeg_from_a_readback() {
+        let gpu = match omabeam_capture::demo_linear_gpu_frame() {
+            Some(frame) => frame,
+            None => {
+                eprintln!("skipped: no linear GBM allocation for dmabuf readback");
+                return;
+            }
+        };
+        let frames = FrameState::new("demo".into());
+        frames.viewers.store(1, Ordering::SeqCst);
+        let config = LiveConfig {
+            webrtc: false,
+            fps: 60,
+            ..LiveConfig::default()
+        };
+        let mut captured = omabeam_capture::demo_frame(0);
+        let _ = std::mem::take(&mut captured.image);
+        captured.logical_width = 640;
+        captured.logical_height = 360;
+        captured.gpu = Some(gpu);
+        publish_frame(&frames, captured, &config, Duration::ZERO, None).unwrap();
+        let stats = frames.stats();
+        assert_eq!(stats.state, "live", "{:?}", stats.error);
+        assert!(stats.diagnostics.gpu_active);
+        assert_eq!(
+            (
+                stats.diagnostics.capture_width,
+                stats.diagnostics.capture_height
+            ),
+            (640, 360)
+        );
+        assert!(stats.diagnostics.jpeg_bytes > 0);
+    }
+
+    /// A WebRTC-only share still answers on-demand JPEG snapshots from a
+    /// dmabuf frame, without disturbing the published zero-copy frame.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn lazy_jpeg_reads_back_a_dmabuf_frame() {
+        let gpu = match omabeam_capture::demo_linear_gpu_frame() {
+            Some(frame) => frame,
+            None => {
+                eprintln!("skipped: no linear GBM allocation for dmabuf readback");
+                return;
+            }
+        };
+        let frames = FrameState::new("demo".into());
+        let config = LiveConfig {
+            webrtc: true,
+            fps: 60,
+            ..LiveConfig::default()
+        };
+        let mut captured = omabeam_capture::demo_frame(0);
+        let _ = std::mem::take(&mut captured.image);
+        captured.logical_width = 640;
+        captured.logical_height = 360;
+        captured.gpu = Some(gpu);
+        publish_frame(&frames, captured, &config, Duration::ZERO, None).unwrap();
+        let (jpeg, _, _) = frames.jpeg_frame().unwrap();
+        assert!(!jpeg.is_empty());
+    }
+
+    /// A snapshot of a dmabuf the CPU cannot map (NVIDIA) moves capture to
+    /// shared memory and answers from the next frame instead of failing.
+    /// Where the map works, the snapshot comes from the dmabuf itself.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn a_snapshot_of_an_unmappable_dmabuf_waits_for_shared_memory() {
+        let gpu = match omabeam_capture::demo_gpu_frame() {
+            Some(frame) => frame,
+            None => {
+                eprintln!("skipped: no DRM render node for dmabuf capture");
+                return;
+            }
+        };
+        let frames = Arc::new(FrameState::new("demo".into()));
+        let config = LiveConfig {
+            webrtc: true,
+            fps: 60,
+            ..LiveConfig::default()
+        };
+        let mut captured = omabeam_capture::demo_frame(0);
+        let _ = std::mem::take(&mut captured.image);
+        captured.gpu = Some(gpu.clone());
+        publish_frame(&frames, captured, &config, Duration::ZERO, None).unwrap();
+        let answered = Arc::new(AtomicBool::new(false));
+        // Stands in for capture's next round after the stop.
+        let capture = {
+            let (frames, config, gpu, answered) = (
+                frames.clone(),
+                config.clone(),
+                gpu.clone(),
+                answered.clone(),
+            );
+            thread::spawn(move || {
+                while gpu.gpu_capture_stopped().is_none() {
+                    if answered.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                let frame = omabeam_capture::demo_frame(1);
+                publish_frame(&frames, frame, &config, Duration::ZERO, None).unwrap();
+            })
+        };
+        let (jpeg, generation, _) = frames.jpeg_frame().unwrap();
+        answered.store(true, Ordering::SeqCst);
+        capture.join().unwrap();
+        assert!(jpeg.starts_with(&[0xff, 0xd8]));
+        let stopped = gpu.gpu_capture_stopped();
+        assert_eq!(
+            generation,
+            if stopped.is_some() { 2 } else { 1 },
+            "{stopped:?}"
+        );
     }
 }

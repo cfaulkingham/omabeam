@@ -55,6 +55,12 @@ pub struct StreamDiagnostics {
     /// Failed JPEG encodes, counted once per frame: lazy ones and frames capture skipped.
     #[serde(default)]
     pub encode_errors: u64,
+    /// The latest published frame arrived as a dmabuf instead of pixels.
+    #[serde(default)]
+    pub gpu_active: bool,
+    /// Why capture parked on shared memory, when it did.
+    #[serde(default)]
+    pub gpu_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -80,6 +86,8 @@ pub(super) struct FrameMeasurement {
     pub encode: Duration,
     /// Start of scaling/encoding, after the capturer returned the frame.
     pub encode_started_at: Instant,
+    pub gpu_active: bool,
+    pub gpu_note: Option<String>,
 }
 
 impl Default for FrameMeasurement {
@@ -93,6 +101,8 @@ impl Default for FrameMeasurement {
             capture_wait: Duration::ZERO,
             encode: Duration::ZERO,
             encode_started_at: Instant::now(),
+            gpu_active: false,
+            gpu_note: None,
         }
     }
 }
@@ -321,6 +331,8 @@ impl DiagnosticsState {
             frames_skipped: self.delivery.skipped,
             write_errors: self.write_errors,
             encode_errors: self.encode_errors,
+            gpu_active: self.latest.gpu_active,
+            gpu_note: self.latest.gpu_note.clone(),
         }
     }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::live::h264::{AdaptiveEncoder, YuvConverter};
+use crate::live::h264::{AdaptiveEncoder, ReadbackFailed, YuvConverter};
 pub(super) struct Encoded {
     pub bytes: Arc<[u8]>,
     pub keyframe: bool,
@@ -140,9 +140,22 @@ pub(super) fn run(
         };
         let at = Instant::now();
         let changed = generation != last_generation;
-        let yuv = converter.convert(&raw)?;
-        let converted_at = Instant::now();
-        let (bytes, keyframe) = encoder.encode(yuv, origin.elapsed().as_micros() as i64, force)?;
+        let pts = origin.elapsed().as_micros() as i64;
+        let encoded = match encoder.encode_frame(&mut converter, &raw, pts, force, at) {
+            Ok(encoded) => encoded,
+            Err(error) if error.is::<ReadbackFailed>() => {
+                // The frame's pixels are unreadable; skip it and keep
+                // sharing. Consumed, so the loop waits for the next frame
+                // instead of spinning on this one.
+                last_generation = generation;
+                last_frame = at;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let converted_at = encoded.converted_at;
+        let keyframe = encoded.keyframe;
+        let bytes = encoded.bytes;
         if keyframe {
             // Any IDR satisfies a pending request, not only one it caused.
             keyframes.produced(at);
@@ -157,12 +170,11 @@ pub(super) fn run(
             "H.264 frame exceeds 2 MiB; lower the resolution"
         );
         {
-            use openh264::formats::YUVSource;
             let mut metrics = service.metrics.lock().unwrap();
             metrics.stats.encoder = encoder.name.clone();
             metrics.stats.encoder_note = encoder.note.clone();
-            metrics.stats.width = yuv.dimensions().0 as u32;
-            metrics.stats.height = yuv.dimensions().1 as u32;
+            metrics.stats.width = encoded.width;
+            metrics.stats.height = encoded.height;
             metrics.stats.encoded_frames += 1;
             metrics.stats.keyframes += u64::from(keyframe);
             metrics.encoded.record(Instant::now(), 0, 1);
@@ -247,8 +259,10 @@ mod static_tests {
                 image: image::RgbaImage::from_pixel(width, 32, image::Rgba([80, 140, 200, 255])),
                 logical_width: width,
                 logical_height: 32,
+
+                gpu: None,
             };
-            crate::live::publish_frame(&frames, frame, &config, Duration::ZERO).unwrap();
+            crate::live::publish_frame(&frames, frame, &config, Duration::ZERO, None).unwrap();
         };
         publish(32);
         let stop = Arc::new(AtomicBool::new(false));
@@ -306,6 +320,7 @@ mod static_tests {
             omabeam_capture::demo_frame(0),
             &config,
             Duration::ZERO,
+            None,
         )
         .unwrap();
         let service = service(&frames, &config);
@@ -447,6 +462,7 @@ mod static_tests {
             omabeam_capture::demo_frame(0),
             &config,
             Duration::ZERO,
+            None,
         )
         .unwrap();
         let service = service(&frames, &config);
@@ -508,6 +524,7 @@ mod static_tests {
             omabeam_capture::demo_frame(0),
             &config,
             Duration::ZERO,
+            None,
         )
         .unwrap();
         let service = service(&frames, &config);
@@ -546,6 +563,7 @@ mod static_tests {
             omabeam_capture::demo_frame(1),
             &config,
             Duration::ZERO,
+            None,
         )
         .unwrap();
         // Give the encoder a chance to attempt (and drop) its real encode
@@ -594,6 +612,7 @@ mod static_tests {
                 omabeam_capture::demo_frame(index),
                 &config,
                 Duration::ZERO,
+                None,
             )
             .unwrap();
             let frame = rx.recv_timeout(Duration::from_secs(3)).unwrap();

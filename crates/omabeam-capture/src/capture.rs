@@ -103,6 +103,33 @@ pub(crate) struct Slot {
     /// A replaced wlr frame was destroyed; its buffer stays untouched until
     /// a sync confirms the compositor processed that.
     retiring: bool,
+    /// Claimed ring index of the in-flight dmabuf frame, if any.
+    #[cfg(feature = "dmabuf")]
+    dmabuf: Option<usize>,
+    /// Compositor dmabuf feedback: fourcc plus advertised modifiers, as
+    /// completed by the last `Done`.
+    #[cfg(feature = "dmabuf")]
+    dmabuf_layouts: Vec<(u32, Vec<u64>)>,
+    /// Staging area for the next `Done`, like `constraint_formats`.
+    #[cfg(feature = "dmabuf")]
+    dmabuf_staging: Vec<(u32, Vec<u64>)>,
+    /// Compositor dmabuf device (dev_t bytes), latest event wins.
+    #[cfg(feature = "dmabuf")]
+    dmabuf_device: Option<Vec<u8>>,
+    /// Render node matching `dmabuf_device`, resolved at `Done`.
+    #[cfg(feature = "dmabuf")]
+    dmabuf_node: Option<std::path::PathBuf>,
+    /// The compositor rejected a dmabuf: stay on shared memory until new
+    /// constraints arrive. Never spends the shm retry budget.
+    #[cfg(feature = "dmabuf")]
+    dmabuf_failed: bool,
+    /// Modifiers the compositor failed to capture into. They stay failed
+    /// across constraint batches; the next layout is tried instead.
+    #[cfg(feature = "dmabuf")]
+    dmabuf_rejected: Vec<u64>,
+    /// Published GPU frame awaiting `render`.
+    #[cfg(feature = "dmabuf")]
+    gpu_frame: Option<crate::GpuFrame>,
 }
 impl Slot {
     fn new(output: Option<u32>) -> Self {
@@ -132,10 +159,45 @@ impl Slot {
             wlr_geometry: None,
             waiting_for_damage: false,
             retiring: false,
+            #[cfg(feature = "dmabuf")]
+            dmabuf: None,
+            #[cfg(feature = "dmabuf")]
+            dmabuf_layouts: Vec::new(),
+            #[cfg(feature = "dmabuf")]
+            dmabuf_staging: Vec::new(),
+            #[cfg(feature = "dmabuf")]
+            dmabuf_device: None,
+            #[cfg(feature = "dmabuf")]
+            dmabuf_node: None,
+            #[cfg(feature = "dmabuf")]
+            dmabuf_failed: false,
+            #[cfg(feature = "dmabuf")]
+            dmabuf_rejected: Vec::new(),
+            #[cfg(feature = "dmabuf")]
+            gpu_frame: None,
         }
     }
     fn pending(&self) -> bool {
         self.frame.is_some() || self.wlr_frame.is_some() || self.retiring
+    }
+
+    /// Whether the slot holds a completed frame: decoded pixels, or a
+    /// dmabuf the encoder reads itself.
+    fn complete(&self) -> bool {
+        self.last.is_some() || self.has_gpu_frame()
+    }
+
+    /// Whether the slot holds a dmabuf for the encoder. Always false
+    /// without the `dmabuf` feature, where every frame decodes to pixels.
+    #[cfg(feature = "dmabuf")]
+    fn has_gpu_frame(&self) -> bool {
+        self.gpu_frame.is_some()
+    }
+
+    #[cfg(not(feature = "dmabuf"))]
+    fn has_gpu_frame(&self) -> bool {
+        let _ = self;
+        false
     }
     /// The decoded frame: a copy while later frames can update it in place.
     fn image(&mut self) -> RgbaImage {
@@ -169,6 +231,10 @@ pub struct CaptureOptions {
     /// `Straight` keeps transparency, as PNG needs. Encoders that composite
     /// over black anyway (JPEG, H.264) can take `Opaque` frames.
     pub alpha: AlphaMode,
+    /// Capture full outputs into dmabufs for zero-copy GPU encoding when the
+    /// compositor accepts them. Needs the `dmabuf` feature; anything else
+    /// silently stays on shared memory.
+    pub gpu: bool,
 }
 
 /// Persistent connection, sources, sessions and reusable shared-memory buffers.
@@ -191,6 +257,9 @@ pub struct CaptureSession {
     alpha: AlphaMode,
     /// Captures are stills: no frame follows to update an image in place.
     pub(crate) still: bool,
+    /// Try dmabuf capture for full outputs (see `CaptureOptions::gpu`).
+    #[cfg(feature = "dmabuf")]
+    want_gpu: bool,
 }
 impl CaptureSession {
     pub fn new(target: CaptureTarget) -> Result<Self> {
@@ -227,6 +296,8 @@ impl CaptureSession {
             full_damage: false,
             alpha: options.alpha,
             still: false,
+            #[cfg(feature = "dmabuf")]
+            want_gpu: options.gpu,
         })
     }
 
@@ -250,6 +321,12 @@ impl CaptureSession {
     /// connection with its outputs and window list.
     fn release(&mut self) {
         self.runtime.state.slots.clear();
+        // The ring's sizes belong to the old target; published frames share
+        // the buffers and release them when they drop.
+        #[cfg(feature = "dmabuf")]
+        {
+            self.runtime.state.gpu = None;
+        }
         // Send the destroys now rather than with the next capture; a failure
         // shows then.
         let _ = self.runtime.conn.flush();
@@ -264,6 +341,34 @@ impl CaptureSession {
         let hung_up = PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL;
         poll(&mut fds, Some(&Timespec::default())).is_ok_and(|ready| ready > 0)
             && fds[0].revents().intersects(hung_up)
+    }
+
+    /// Whether frames currently come from dmabufs. Needs `CaptureOptions::gpu`
+    /// and a compositor that accepts the buffers; anything else silently
+    /// captures shared memory instead.
+    #[cfg(feature = "dmabuf")]
+    pub fn gpu_active(&self) -> bool {
+        self.runtime.state.gpu.is_some() && self.runtime.state.gpu_note.is_none()
+    }
+
+    /// Why zero-copy capture is not active, after a session requested it.
+    #[cfg(feature = "dmabuf")]
+    pub fn gpu_note(&self) -> Option<String> {
+        self.runtime.state.gpu_note.clone()
+    }
+
+    /// Without the `dmabuf` feature every session captures shared memory.
+    #[cfg(not(feature = "dmabuf"))]
+    pub fn gpu_active(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// Without the `dmabuf` feature there is never a note to report.
+    #[cfg(not(feature = "dmabuf"))]
+    pub fn gpu_note(&self) -> Option<String> {
+        let _ = self;
+        None
     }
 
     /// Validates `target` and adds its slots, with an ext session each where
@@ -386,7 +491,7 @@ impl CaptureSession {
                 .dispatch_pending(&mut self.runtime.state)?;
             self.runtime.check_error()?;
             let changed = self.consume_ready()?;
-            if changed && self.runtime.state.slots.iter().all(|s| s.last.is_some()) {
+            if changed && self.runtime.state.slots.iter().all(Slot::complete) {
                 return self.render().map(Some);
             }
             self.request_frames()?;
@@ -454,10 +559,24 @@ impl CaptureSession {
             if slot.pending() || slot.await_constraints {
                 continue;
             }
-            if let Some(session) = &slot.session {
+            if slot.session.is_some() {
                 let Some(spec) = slot.spec else {
                     continue;
                 };
+                #[cfg(feature = "dmabuf")]
+                if request_dmabuf_frame(
+                    slot,
+                    i,
+                    &self.target,
+                    self.want_gpu,
+                    &mut state.gpu,
+                    state.dmabuf.as_ref(),
+                    &mut state.gpu_note,
+                    &state.gpu_stop,
+                    &qh,
+                )? {
+                    continue;
+                }
                 if slot.buffer.as_ref().is_none_or(|b| b.spec != spec) {
                     slot.buffer = Some(Buffer::new(state.shm.as_ref().unwrap(), spec, &qh)?);
                 }
@@ -469,7 +588,7 @@ impl CaptureSession {
                 // everything for the safety refresh.
                 slot.refresh = self.full_damage || !buffer.captured || due(slot.refreshed);
                 slot.damage.clear();
-                let frame = session.create_frame(&qh, i);
+                let frame = slot.session.as_ref().unwrap().create_frame(&qh, i);
                 frame.attach_buffer(&buffer.proxy);
                 if slot.refresh {
                     frame.damage_buffer(0, 0, spec.width as i32, spec.height as i32);
@@ -523,6 +642,32 @@ impl CaptureSession {
             }
             slot.ready = false;
             slot.retries = 0;
+            #[cfg(feature = "dmabuf")]
+            if let Some(claimed) = slot.dmabuf.take() {
+                // No decode: the encoder reads the dmabuf itself.
+                let gpu = state
+                    .gpu
+                    .as_ref()
+                    .context("dmabuf frame without a GPU session")?;
+                match gpu.ring.frame(claimed) {
+                    // Not probed for a CPU map: NVIDIA never maps, and the
+                    // zero-copy encoder does not need it. A consumer that
+                    // does need pixels stops dmabuf capture on failure.
+                    Ok(frame) => {
+                        slot.gpu_frame = Some(frame);
+                        slot.last = None;
+                        slot.key = None;
+                        slot.keep = false;
+                        state.gpu_note = None;
+                        changed = true;
+                    }
+                    Err(error) => {
+                        gpu.ring.unclaim(claimed);
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
             let buffer = slot
                 .buffer
                 .as_mut()
@@ -626,14 +771,28 @@ impl CaptureSession {
                     logical_width: image.width(),
                     logical_height: image.height(),
                     image,
+
+                    gpu: None,
                 })
             }
             CaptureTarget::Output(_) => {
+                #[cfg(feature = "dmabuf")]
+                if let Some(gpu) = slot.gpu_frame.take() {
+                    let rect = state.outputs[&slot.output.unwrap()].rect();
+                    return Ok(CapturedFrame {
+                        image: RgbaImage::new(0, 0),
+                        logical_width: rect.width,
+                        logical_height: rect.height,
+                        gpu: Some(gpu),
+                    });
+                }
                 let rect = state.outputs[&slot.output.unwrap()].rect();
                 Ok(CapturedFrame {
                     image: slot.image(),
                     logical_width: rect.width,
                     logical_height: rect.height,
+
+                    gpu: None,
                 })
             }
             CaptureTarget::Region(region) => match slot.wlr_geometry.and_then(|g| g.region) {
@@ -642,6 +801,8 @@ impl CaptureSession {
                     image: slot.image(),
                     logical_width: rect.width,
                     logical_height: rect.height,
+
+                    gpu: None,
                 }),
                 None => pixels::crop(
                     slot.last.as_ref().unwrap(),
@@ -741,9 +902,35 @@ impl Dispatch<session::ExtImageCopyCaptureSessionV1, usize> for State {
             } if pixels::bytes_per_pixel(format).is_some() => {
                 slot.constraint_formats.push(format);
             }
+            #[cfg(feature = "dmabuf")]
+            session::Event::DmabufDevice { device } => {
+                slot.dmabuf_device = Some(device);
+            }
+            #[cfg(feature = "dmabuf")]
+            session::Event::DmabufFormat { format, modifiers } => {
+                // Modifiers arrive as little-endian u64s; a ragged tail is
+                // ignored rather than failing the batch.
+                let modifiers = modifiers
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|chunk| u64::from_le_bytes(*chunk))
+                    .collect();
+                slot.dmabuf_staging.push((format, modifiers));
+            }
             session::Event::Done => {
                 slot.constraints_epoch += 1;
                 slot.await_constraints = false;
+                #[cfg(feature = "dmabuf")]
+                {
+                    // New constraints deserve a fresh dmabuf attempt.
+                    slot.dmabuf_layouts = std::mem::take(&mut slot.dmabuf_staging);
+                    slot.dmabuf_failed = false;
+                    slot.dmabuf_node = slot
+                        .dmabuf_device
+                        .as_deref()
+                        .and_then(crate::dmabuf::node_for_device);
+                }
                 // Each complete constraint batch replaces the previous one.
                 let formats = std::mem::take(&mut slot.constraint_formats);
                 let format = [
@@ -807,26 +994,199 @@ impl Dispatch<frame::ExtImageCopyCaptureFrameV1, usize> for State {
                 proxy.destroy();
             }
             frame::Event::Failed { reason } => {
-                slot.frame = None;
-                proxy.destroy();
-                slot.retries += 1;
-                if matches!(
-                    reason,
-                    WEnum::Value(frame::FailureReason::BufferConstraints)
-                ) && slot.retries <= 3
-                {
-                    slot.buffer = None;
-                    // If the new constraints have not arrived yet, do not
-                    // repeatedly submit the stale buffer while waiting.
-                    slot.await_constraints = slot.requested_epoch == slot.constraints_epoch;
-                    slot.await_since = Some(Instant::now());
-                } else {
-                    state.error = Some(anyhow::anyhow!("screen capture failed: {reason:?}"));
+                #[cfg(feature = "dmabuf")]
+                let dmabuf_rejected = slot.dmabuf.take().is_some_and(|claimed| {
+                    // The compositor refused the dmabuf (layout, size, or a
+                    // device it cannot write). Not for new constraints: a
+                    // layout it cannot render tries the next one. Otherwise
+                    // park this slot on shared memory, without spending the
+                    // shm retry budget or failing the share.
+                    let mut modifier = None;
+                    if let Some(session) = state.gpu.as_ref() {
+                        session.ring.unclaim(claimed);
+                        modifier = Some(session.ring.modifier());
+                    }
+                    let unusable = !matches!(
+                        reason,
+                        WEnum::Value(frame::FailureReason::BufferConstraints)
+                    );
+                    if let Some(modifier) = modifier.filter(|_| unusable) {
+                        slot.dmabuf_rejected.push(modifier);
+                    }
+                    let next = crate::dmabuf::pick_layout(
+                        &slot.dmabuf_layouts,
+                        &slot.dmabuf_rejected,
+                        slot.dmabuf_node.is_some(),
+                    )
+                    .filter(|_| unusable);
+                    slot.dmabuf_failed = next.is_none();
+                    state.gpu_note = Some(match (modifier, next) {
+                        (Some(old), Some((_, new))) => format!(
+                            "compositor rejected the {old:#x} dmabuf ({reason:?}); trying {new:#x}"
+                        ),
+                        _ => format!("compositor rejected the dmabuf: {reason:?}"),
+                    });
+                    slot.frame = None;
+                    proxy.destroy();
+                    true
+                });
+                #[cfg(not(feature = "dmabuf"))]
+                let dmabuf_rejected = false;
+                if !dmabuf_rejected {
+                    slot.frame = None;
+                    proxy.destroy();
+                    slot.retries += 1;
+                    if matches!(
+                        reason,
+                        WEnum::Value(frame::FailureReason::BufferConstraints)
+                    ) && slot.retries <= 3
+                    {
+                        slot.buffer = None;
+                        // If the new constraints have not arrived yet, do not
+                        // repeatedly submit the stale buffer while waiting.
+                        slot.await_constraints = slot.requested_epoch == slot.constraints_epoch;
+                        slot.await_since = Some(Instant::now());
+                    } else {
+                        state.error = Some(anyhow::anyhow!("screen capture failed: {reason:?}"));
+                    }
                 }
             }
             _ => {}
         }
     }
+}
+
+/// Attach a ring dmabuf to the next ext capture. Returns whether shared
+/// memory is off the hook: `true` after requesting, and while every slot is
+/// still with the encoder (the round is skipped, not downgraded, so the
+/// encoder never flip-flops backends). Any refusal degrades to `false`, and
+/// a terminal one records `gpu_note` and parks the slot on shm.
+#[cfg(feature = "dmabuf")]
+#[allow(clippy::too_many_arguments)]
+fn request_dmabuf_frame(
+    slot: &mut Slot,
+    index: usize,
+    target: &CaptureTarget,
+    want_gpu: bool,
+    gpu: &mut Option<crate::dmabuf::GpuSession>,
+    dmabuf: Option<&crate::connection::dmabuf::ZwpLinuxDmabufV1>,
+    gpu_note: &mut Option<String>,
+    stop: &crate::dmabuf::GpuStop,
+    qh: &QueueHandle<State>,
+) -> Result<bool> {
+    if !want_gpu {
+        return Ok(false);
+    }
+    if let Some(reason) = stop.reason() {
+        // Final for the session. Only this slot attaches ring buffers, and
+        // it has no frame in flight; published frames keep their buffers.
+        // A stale claim must go too, or the next shm frame reads as dmabuf.
+        slot.dmabuf = None;
+        *gpu = None;
+        *gpu_note = Some(format!("{reason}; capturing to shared memory"));
+        return Ok(false);
+    }
+    // Rotated outputs need CPU un-rotation, and region/window shares need CPU
+    // cropping: only full untransformed outputs go zero-copy.
+    if slot.dmabuf_failed
+        || !matches!(target, CaptureTarget::Output(_))
+        || slot.transform != wl_output::Transform::Normal
+    {
+        return Ok(false);
+    }
+    let Some(proxy) = dmabuf else {
+        *gpu_note = Some("compositor does not offer dmabuf buffers".into());
+        return Ok(false);
+    };
+    let (width, height) = slot.constraint_size;
+    if width == 0 || height == 0 {
+        return Ok(false);
+    }
+    let layout = crate::dmabuf::pick_layout(
+        &slot.dmabuf_layouts,
+        &slot.dmabuf_rejected,
+        slot.dmabuf_node.is_some(),
+    );
+    let Some((_, modifier)) = layout else {
+        slot.dmabuf_failed = true;
+        let offered: Vec<String> = slot
+            .dmabuf_layouts
+            .iter()
+            .map(|(fourcc, modifiers)| format!("{fourcc:#x}:{}", modifiers.len()))
+            .collect();
+        *gpu_note = Some(if slot.dmabuf_rejected.is_empty() {
+            format!(
+                "compositor offers no linear XRGB8888 dmabuf layout (offered: {})",
+                offered.join(",")
+            )
+        } else {
+            format!(
+                "compositor rejected every usable XRGB8888 dmabuf layout (offered: {})",
+                offered.join(",")
+            )
+        });
+        return Ok(false);
+    };
+    // A stale attachment without a frame (a cancelled request) leaks its
+    // claim unless released here.
+    if slot.frame.is_none()
+        && let Some(claimed) = slot.dmabuf.take()
+        && let Some(session) = gpu.as_ref()
+    {
+        session.ring.unclaim(claimed);
+    }
+    let preferred = slot.dmabuf_node.as_deref();
+    let ensure = match gpu.as_mut() {
+        Some(session) => session.ensure(
+            proxy,
+            width,
+            height,
+            modifier,
+            omabeam_encoder::dmabuf::RING_BUFFERS,
+            preferred,
+            qh,
+        ),
+        None => match crate::dmabuf::GpuSession::open(
+            proxy,
+            width,
+            height,
+            modifier,
+            omabeam_encoder::dmabuf::RING_BUFFERS,
+            preferred,
+            stop,
+            qh,
+        ) {
+            Ok(session) => {
+                *gpu = Some(session);
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
+    };
+    if let Err(error) = ensure {
+        slot.dmabuf_failed = true;
+        *gpu = None;
+        *gpu_note = Some(format!(
+            "dmabuf capture unavailable for XR24 modifier {modifier:#x}: {error:#}"
+        ));
+        return Ok(false);
+    }
+    let session = gpu.as_ref().unwrap();
+    let Some(claimed) = session.ring.claim() else {
+        return Ok(true);
+    };
+    slot.requested_epoch = slot.constraints_epoch;
+    // Ring buffers hold older frames, so the compositor must copy the whole
+    // buffer every time; damage-region copies would leave stale pixels.
+    slot.refresh = true;
+    slot.damage.clear();
+    let frame = slot.session.as_ref().unwrap().create_frame(qh, index);
+    frame.attach_buffer(&gpu.as_ref().unwrap().buffers[claimed]);
+    frame.damage_buffer(0, 0, width as i32, height as i32);
+    frame.capture();
+    slot.frame = Some(frame);
+    slot.dmabuf = Some(claimed);
+    Ok(true)
 }
 
 fn copy_wlr_buffer(
@@ -1051,5 +1411,36 @@ mod tests {
         assert!(bands(&[[0, 0, 10, 100], [40, 0, 5, 100]], region).is_empty());
         assert_eq!(bands(&[[15, 0, 5, 100]], region), [(20, 60)]);
         assert_eq!(bands(&[[39, 59, 5, 5]], region), [(59, 60)]);
+    }
+
+    /// A slot holding a dmabuf completes its frame without decoded pixels;
+    /// without this the capture loop waits out its timeout and the share
+    /// dies on the first GPU frame.
+    #[cfg(feature = "dmabuf")]
+    #[test]
+    fn a_dmabuf_slot_completes_without_decoded_pixels() {
+        let gpu = match crate::dmabuf::demo_gpu_frame() {
+            Some(frame) => frame,
+            None => {
+                eprintln!("skipped: no DRM render node for dmabuf capture");
+                return;
+            }
+        };
+        let mut slot = Slot::new(None);
+        assert!(!slot.complete());
+        slot.gpu_frame = Some(gpu);
+        assert!(slot.complete());
+        slot.last = Some(image::RgbaImage::new(4, 4));
+        slot.gpu_frame = None;
+        assert!(slot.complete());
+    }
+
+    #[cfg(not(feature = "dmabuf"))]
+    #[test]
+    fn a_slot_completes_on_decoded_pixels() {
+        let mut slot = Slot::new(None);
+        assert!(!slot.complete());
+        slot.last = Some(image::RgbaImage::new(4, 4));
+        assert!(slot.complete());
     }
 }
